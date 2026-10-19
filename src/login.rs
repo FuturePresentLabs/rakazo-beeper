@@ -145,6 +145,23 @@ fn save_session(output: &Path, token: &str) -> Result<()> {
     }
     result
 }
+async fn start_login(rk: &Client, rakazo: &Url) -> Result<Url> {
+    let start = body(
+        rk.post(rakazo.join("/api/auth/sign-in/social")?)
+            .header(header::ORIGIN, rakazo.origin().ascii_serialization())
+            .json(&json!({"provider":"oidc","callbackURL":rakazo.as_str(),"disableRedirect":true}))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?,
+    )
+    .await?;
+    Url::parse(
+        start["url"]
+            .as_str()
+            .context("Rakazo returned no authorization URL")?,
+    )
+    .context("invalid authorization URL")
+}
 
 pub async fn login(rakazo: &Url, issuer: &Url, client_id: &str, output: &Path) -> Result<()> {
     crate::config::validate_url(rakazo)?;
@@ -166,20 +183,7 @@ pub async fn login(rakazo: &Url, issuer: &Url, client_id: &str, output: &Path) -
         .redirect(Policy::none())
         .timeout(Duration::from_secs(30))
         .build()?;
-    let start = body(
-        rk.post(rakazo.join("/api/auth/sign-in/social")?)
-            .header(header::ORIGIN, rakazo.origin().ascii_serialization())
-            .json(&json!({"provider":"oidc","callbackURL":rakazo.as_str(),"disableRedirect":true}))
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?,
-    )
-    .await?;
-    let auth = Url::parse(
-        start["url"]
-            .as_str()
-            .context("Rakazo returned no authorization URL")?,
-    )?;
+    let auth = start_login(&rk, rakazo).await?;
     let target = authorization_target(rakazo, issuer, &auth)?;
     let discovery: Discovery = serde_json::from_value(
         body(
@@ -267,6 +271,13 @@ pub async fn login(rakazo: &Url, issuer: &Url, client_id: &str, output: &Path) -
             _ => anyhow::bail!("device token endpoint returned HTTP {status}"),
         }
     };
+    // Rakazo's state cookie may expire before the device approval does. Start
+    // the actual PKCE flow after approval, bound to the same approved client.
+    let auth = start_login(&rk, rakazo).await?;
+    ensure!(
+        authorization_target(rakazo, issuer, &auth)? == target,
+        "Rakazo changed OIDC clients during pairing"
+    );
     let authorized = client
         .get(auth.clone())
         .bearer_auth(access)
@@ -437,7 +448,13 @@ mod tests {
                         (
                             [(
                                 header::SET_COOKIE,
-                                "better-auth.oauth_state=private-login-state; Path=/",
+                                if f.polls.load(Ordering::SeqCst) == 0 {
+                                    // The discovery login's cookie expires while
+                                    // the user approves. Only a fresh login works.
+                                    "better-auth.oauth_state=expired-login-state; Path=/"
+                                } else {
+                                    "better-auth.oauth_state=private-login-state; Path=/"
+                                },
                             )],
                             Json(json!({"url":auth(&f.rk,&f.issuer)})),
                         )
