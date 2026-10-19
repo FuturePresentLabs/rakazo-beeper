@@ -4,6 +4,12 @@ A Rust application-service bridge that exposes selected Rakazo agents as private
 chats in Beeper. One executable supports a personal self-hosted instance and an
 operator-configured multi-tenant instance. Beeper Desktop does not have to stay open.
 
+FPL's Beachhead Shroud deployment is owned by
+[shared-infra](https://github.com/FuturePresentLabs/shared-infra/tree/deploy/rakazo-beeper/projects/rakazo-beeper).
+The source-owned `.fab/pipelines.json` publishes the immutable rootfs consumed by
+that deployment. Beachhead enrollment and live conversation qualification remain
+pending; the native user-service instructions below are for personal self-hosting.
+
 **Initial scope:** new text messages from the configured Beeper owner go to the
 agent's existing Rakazo thread. Completed bot text and questions return to Beeper.
 Existing history stays in Rakazo when an agent is first connected. Messages sent
