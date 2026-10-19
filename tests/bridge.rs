@@ -1684,3 +1684,36 @@ async fn malformed_matrix_media_uris_are_permanent_rejections_without_network_re
     }
     assert!(f.remote.lock().unwrap().requests.is_empty());
 }
+
+#[tokio::test]
+async fn replies_to_unrendered_messages_do_not_stall_later_delivery() {
+    let f = fixture().await;
+    let mut parent = message(0, "bot", "");
+    parent["blocks"] = json!([{"kind":"tool-call","name":"fixture"}]);
+    f.remote.lock().unwrap().messages = vec![parent];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    for (seq, role, text) in [(1, "bot", "reply to tool result"), (2, "user", "👍")] {
+        let mut reply = message(seq, role, text);
+        reply["replyToMessageId"] = json!("message-0");
+        f.remote.lock().unwrap().messages.push(reply);
+    }
+    f.remote
+        .lock()
+        .unwrap()
+        .messages
+        .push(message(3, "bot", "later delivery"));
+    f.runtime.poll_binding(&binding).await.unwrap();
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    for text in ["reply to tool result", "👍", "later delivery"] {
+        let events: Vec<_> = remote
+            .history_events
+            .values()
+            .filter(|e| e["content"]["body"] == text)
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["content"]["m.relates_to"].is_null());
+    }
+}

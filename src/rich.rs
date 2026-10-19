@@ -416,11 +416,13 @@ impl TenantRuntime {
             let target = self
                 .reply_target(binding, message.reply_to_message_id.as_deref().unwrap())
                 .await?;
-            return Ok(vec![Part {
-                key: "reaction".into(),
-                kind: "m.reaction".into(),
-                content: json!({"m.relates_to":{"rel_type":"m.annotation","event_id":target,"key":text}}),
-            }]);
+            if let Some(target) = target {
+                return Ok(vec![Part {
+                    key: "reaction".into(),
+                    kind: "m.reaction".into(),
+                    content: json!({"m.relates_to":{"rel_type":"m.annotation","event_id":target,"key":text}}),
+                }]);
+            }
         }
         for (index, chunk) in text_chunks(&text, 40_000).into_iter().enumerate() {
             parts.push(Part {
@@ -471,8 +473,9 @@ impl TenantRuntime {
             };
             parts.push(Part {key:format!("artifact:{id}"),kind:"m.room.message".into(),content:json!({"msgtype":media::msgtype(&media.mime),"body":media.name,"filename":media.name,"url":uri,"info":{"mimetype":media.mime,"size":media.bytes.len()}})});
         }
-        if let Some(parent) = message.reply_to_message_id.as_deref() {
-            let target = self.reply_target(binding, parent).await?;
+        if let Some(parent) = message.reply_to_message_id.as_deref()
+            && let Some(target) = self.reply_target(binding, parent).await?
+        {
             for part in &mut parts {
                 part.content["m.relates_to"] = json!({"m.in_reply_to":{"event_id":target}});
             }
@@ -497,9 +500,9 @@ impl TenantRuntime {
         Ok(parts)
     }
 
-    async fn reply_target(&self, binding: &Binding, id: &str) -> Result<String> {
+    async fn reply_target(&self, binding: &Binding, id: &str) -> Result<Option<String>> {
         if let Some(link) = self.store.links(binding, id)?.into_iter().next() {
-            return Ok(link.matrix_id);
+            return Ok(Some(link.matrix_id));
         }
         let parent = self.source_message(binding, id).await?;
         if parent.role == "user" {
@@ -509,23 +512,28 @@ impl TenantRuntime {
                 self.store.event_for_seq(binding, parent.seq)?
             };
             if let Some(original) = original {
-                return Ok(original);
+                return Ok(Some(original));
             }
         }
         let baseline = self
             .store
             .baseline(&binding.tenant, &binding.bot, binding.cursor)?;
         let key = if parent.text().is_empty() {
-            let artifact = parent
+            let Some(artifact) = parent
                 .blocks
                 .iter()
                 .find_map(|block| block["artifactId"].as_str())
-                .context("reply target has no bridgeable content")?;
+            else {
+                tracing::warn!(
+                    "Reply target has no bridgeable content; delivering without a quote"
+                );
+                return Ok(None);
+            };
             format!("artifact:{artifact}")
         } else {
             "text:0".into()
         };
-        Ok(self.source_event_id(binding, &parent, &key, baseline))
+        Ok(Some(self.source_event_id(binding, &parent, &key, baseline)))
     }
 
     async fn prepare_message(&self, binding: &Binding, message: &Message) -> Result<Prepared> {
