@@ -5,5 +5,9 @@
 *.db*
 *.lockfile
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 registration*.json
 registration*.yaml

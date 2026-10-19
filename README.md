@@ -4,6 +4,10 @@ A Rust application-service bridge that exposes selected Rakazo agents as private
 chats in Beeper. One executable supports a personal self-hosted instance and an
 operator-configured multi-tenant instance. Beeper Desktop does not have to stay open.
 
+Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting and deployment
+boundaries. Beeper is an external service; this license covers the bridge.
+
 FPL's Beachhead Shroud deployment is owned by
 [shared-infra](https://github.com/FuturePresentLabs/shared-infra/tree/deploy/rakazo-beeper/projects/rakazo-beeper).
 The source-owned `.fab/pipelines.json` publishes the immutable rootfs consumed by

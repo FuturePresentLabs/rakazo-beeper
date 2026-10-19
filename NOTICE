@@ -1,0 +1,17 @@
+Rakazo → Beeper
+Copyright 2026 Future Present Labs and contributors
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+The Rust avatar compatibility renderer, shape data and parity vectors are
+adapted from Rakazo and the FuturePresentLabs/fpl-agents fork:
+  Copyright 2026 Rakazo contributors
+  Apache License, Version 2.0
+  https://github.com/elie222/rakazo
+  https://github.com/FuturePresentLabs/fpl-agents/tree/0d1fb12aa3f3bf9ff0885b9a5c6945ebb96a41f8
+  packages/core/src/avatar-shape.ts
+  packages/ui-web/src/bot-avatar.tsx
+The bridge replaces the frontend renderer with a static Rust rasterizer.
+
+The FPL logo is supplied by Future Present Labs from its existing square mark.
+The Apache license does not grant rights to contributors' trademarks beyond
+the uses permitted by section 6 of LICENSE.
