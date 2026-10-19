@@ -1,0 +1,24 @@
+# Paths resolve relative to this file. Secret values belong in env vars or files,
+# never in this config. KEY_FILE and TOKEN_FILE are alternative env vars.
+database = "data/bridge.db"
+encryption_key_env = "RAKAZO_BEEPER_KEY"
+listen = "127.0.0.1:8080"
+poll_seconds = 5
+
+[[tenants]]
+id = "personal"
+owner = "@YOUR_USER:beeper.com"
+# Full JSON bundle from `bbctl register --json sh-rakazo`.
+registration = "secrets/registration-personal.json"
+# Copy exactly from the bundle's homeserver_url; don't derive it from the owner.
+homeserver = "https://matrix.beeper.com/_hungryserv/YOUR_USER"
+rakazo_url = "https://agents.fpl.dev"
+rakazo_token_env = "RAKAZO_PERSONAL_TOKEN"
+rakazo_space_id = "YOUR_RAKAZO_SPACE_ID"
+# Run `rakazo-beeper bots --tenant personal` to discover IDs, then opt in.
+bot_ids = []
+websocket = true
+
+# For FPL hosting, append another [[tenants]] with a distinct id, registration,
+# owner, session token env name, and explicit space. Each gets its own worker and
+# Beeper connection. An empty bot_ids list never exposes all agents implicitly.

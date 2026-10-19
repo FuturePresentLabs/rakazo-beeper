@@ -1,0 +1,26 @@
+services:
+  bridge:
+    build:
+      context: ..
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RAKAZO_BEEPER_KEY_FILE: /run/secrets/database-key
+      RAKAZO_PERSONAL_TOKEN_FILE: /run/secrets/rakazo-token
+      RUST_LOG: rakazo_beeper=info
+    volumes:
+      - ${BRIDGE_HOME:?Set BRIDGE_HOME}/config.toml:/bridge/config.toml:ro
+      - ${BRIDGE_HOME}/secrets:/bridge/secrets:ro
+      - ${BRIDGE_HOME}/secrets:/run/secrets:ro
+      - ${BRIDGE_HOME}/data:/bridge/data
+    # Outbound websocket mode needs no public port. Local health checks only.
+    ports:
+      - "127.0.0.1:8789:8080"
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 15s
