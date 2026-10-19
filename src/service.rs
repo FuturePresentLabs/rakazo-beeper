@@ -118,32 +118,31 @@ impl TenantRuntime {
             if event["sender"] != self.config.owner || event["sender"] == binding.ghost {
                 continue;
             }
-            if event["type"] != "m.room.message" {
-                continue;
-            }
-            if event["content"]["msgtype"] != "m.text"
-                || event["content"]["m.relates_to"]["rel_type"] == "m.replace"
-            {
-                tracing::warn!(tenant=%self.config.id,"unsupported message type or edit ignored; only new text messages are bridged");
+            if !matches!(
+                event["type"].as_str(),
+                Some("m.room.message" | "m.reaction" | "m.room.redaction" | "m.sticker")
+            ) {
                 continue;
             }
             let id = event["event_id"]
                 .as_str()
                 .context("text event missing event_id")?;
-            let text = event["content"]["body"]
-                .as_str()
-                .context("text event missing body")?;
+            let text = event["content"]["body"].as_str().unwrap_or("");
             ensure!(
                 !id.is_empty() && id.len() <= 1024 && text.len() <= 64_000,
                 "text event exceeds bridge limits"
             );
-            if text.trim().is_empty() {
+            if text.trim().is_empty()
+                && event["type"] == "m.room.message"
+                && event["content"]["msgtype"] == "m.text"
+            {
                 continue;
             }
             incoming.push(Inbound {
                 event_id: id.to_string(),
                 room: room.to_string(),
                 text: text.to_string(),
+                content: event.clone(),
             });
         }
         self.store.ingest(&self.config.id, txn, &incoming)
@@ -155,7 +154,9 @@ impl TenantRuntime {
             return Ok(());
         }
         let bots = self.rakazo.bots().await?;
-        let avatar_style = self.rakazo.avatar_style().await?;
+        let preferences = self.rakazo.preferences().await?;
+        let avatar_style = &preferences.avatar_style;
+        let features = crate::rich::room_features(&preferences);
         let bridge_logo = self.sync_bridge_identity().await?;
         let bindings = self.store.bindings(&self.config.id)?;
         for bot_id in &self.config.bot_ids {
@@ -164,7 +165,7 @@ impl TenantRuntime {
                 .find(|b| &b.id == bot_id)
                 .context("configured bot is not accessible in this Rakazo space")?;
             if let Some(binding) = bindings.iter().find(|b| b.bot == bot.id) {
-                self.sync_profile(binding, bot, &avatar_style, &bridge_logo)
+                self.sync_profile(binding, bot, avatar_style, &bridge_logo, &features)
                     .await?;
                 continue;
             }
@@ -204,7 +205,7 @@ impl TenantRuntime {
                 .into_iter()
                 .find(|binding| binding.bot == bot.id)
                 .context("new binding missing")?;
-            self.sync_profile(&binding, bot, &avatar_style, &bridge_logo)
+            self.sync_profile(&binding, bot, avatar_style, &bridge_logo, &features)
                 .await?;
             tracing::info!(tenant=%self.config.id,"provisioned agent chat");
         }
@@ -218,9 +219,15 @@ impl TenantRuntime {
         bot: &crate::rakazo::Bot,
         style: &str,
         bridge_logo: &str,
+        features: &Value,
     ) -> Result<()> {
         let avatar_hash = stable_id(&["rakazo-avatar-v1", &bot.id, &bot.color, style]);
-        let applied_hash = stable_id(&[&avatar_hash, &bot.name, bridge_logo]);
+        let applied_hash = stable_id(&[
+            &avatar_hash,
+            &bot.name,
+            bridge_logo,
+            features["id"].as_str().unwrap(),
+        ]);
         let cached = self.store.profile(&self.config.id, &bot.id)?;
         if cached
             .as_ref()
@@ -247,6 +254,7 @@ impl TenantRuntime {
         self.matrix
             .bridge_info(binding, &bot.name, bridge_logo, &avatar_uri)
             .await?;
+        self.matrix.room_features(binding, features.clone()).await?;
         self.store
             .applied_profile(&self.config.id, &bot.id, &applied_hash)?;
         tracing::info!(tenant=%self.config.id,"synced agent profile picture");
@@ -297,14 +305,37 @@ impl TenantRuntime {
                 self.matrix
                     .check_room(&binding.room, &binding.ghost, &self.config.owner)
                     .await?;
-                let nonce = stable_id(&[&self.config.id, &pending.event.event_id]);
-                self.rakazo
-                    .send(&binding.bot, &pending.event.text, &nonce)
-                    .await
+                self.bootstrap_links(binding).await?;
+                self.inbound_content(binding, &pending.event).await
             }
             .await;
             match result {
-                Ok(()) => self.store.complete(&self.config.id, pending.id)?,
+                Ok(Some(seq)) => {
+                    self.store
+                        .complete_send(binding, pending.id, &pending.event.event_id, seq)?
+                }
+                Ok(None) => self.store.complete(&self.config.id, pending.id)?,
+                Err(error) if error.downcast_ref::<crate::media::Rejected>().is_some() => {
+                    self.matrix
+                        .check_room(&binding.room, &binding.ghost, &self.config.owner)
+                        .await?;
+                    let text = format!(
+                        "Could not bridge this event: {}",
+                        error.downcast_ref::<crate::media::Rejected>().unwrap()
+                    );
+                    let txn = stable_id(&[&binding.tenant, &pending.event.event_id, "rejected"]);
+                    self.matrix
+                        .send_event(
+                            &binding.room,
+                            &binding.ghost,
+                            &txn,
+                            "m.room.message",
+                            serde_json::json!({"msgtype":"m.notice","body":text}),
+                        )
+                        .await?;
+                    self.store.fail(&self.config.id, pending.id)?;
+                    tracing::warn!(tenant=%self.config.id,"event rejected; owner notified");
+                }
                 Err(error) => {
                     self.store.retry(
                         &self.config.id,
@@ -320,6 +351,14 @@ impl TenantRuntime {
     }
 
     pub async fn poll_binding(&self, binding: &Binding) -> Result<()> {
+        // Recover an ambiguous send receipt before delivering its reply, so a
+        // lost HTTP response cannot drop the original Beeper thread routing.
+        if self.store.pending_room_count(binding)? > 0 {
+            self.matrix
+                .check_room(&binding.room, &binding.ghost, &self.config.owner)
+                .await?;
+            return Ok(());
+        }
         let snapshot = self.rakazo.snapshot(&binding.bot).await?;
         if snapshot.busy() {
             return Ok(());
@@ -338,21 +377,9 @@ impl TenantRuntime {
         self.matrix
             .check_room(&binding.room, &binding.ghost, &self.config.owner)
             .await?;
+        self.bootstrap_links(binding).await?;
         for message in messages.into_iter().filter(|m| m.seq <= through) {
-            if message.role == "bot" {
-                let text = message.text();
-                for (index, chunk) in text_chunks(&text, 40_000).into_iter().enumerate() {
-                    let txn = stable_id(&[
-                        &self.config.id,
-                        &binding.bot,
-                        &message.id,
-                        &index.to_string(),
-                    ]);
-                    self.matrix
-                        .send(&binding.room, &binding.ghost, &txn, chunk)
-                        .await?;
-                }
-            }
+            self.relay_message(binding, &message, true).await?;
             self.store.cursor(binding, message.seq)?;
         }
         Ok(())
@@ -360,58 +387,28 @@ impl TenantRuntime {
 
     pub async fn backfill_binding(&self, binding: &Binding) -> Result<()> {
         let Some(before) = self.store.history_before(binding)? else {
+            // Add media omitted by v1 without replaying its text transcript.
+            let before = self.store.sync_cursor(binding, "rich-history")?.unwrap_or(
+                binding
+                    .cursor
+                    .checked_add(1)
+                    .context("history cursor overflow")?,
+            );
+            if before < 0 {
+                return Ok(());
+            }
+            self.bootstrap_links(binding).await?;
+            let mut page = self.rakazo.history_page(&binding.bot, before).await?;
+            page.messages.sort_by_key(|message| message.seq);
+            self.relay_page(binding, &page.messages).await?;
+            self.store
+                .set_sync_cursor(binding, "rich-history", page.older_cursor.unwrap_or(-1))?;
             return Ok(());
         };
         let mut page = self.rakazo.history_page(&binding.bot, before).await?;
         page.messages.sort_by_key(|message| message.seq);
         page.messages.dedup_by_key(|message| message.seq);
-        let mut events = Vec::new();
-        for message in page.messages {
-            let sender = match message.role.as_str() {
-                "user" => &self.config.owner,
-                "bot" => &binding.ghost,
-                _ => continue,
-            };
-            let text = message.text();
-            if text.is_empty() {
-                continue;
-            }
-            let timestamp = chrono::DateTime::parse_from_rfc3339(
-                message
-                    .created_at
-                    .as_deref()
-                    .context("historical message missing createdAt")?,
-            )?
-            .timestamp_millis();
-            ensure!(timestamp > 0, "historical message has invalid timestamp");
-            for (index, chunk) in text_chunks(&text, 40_000).into_iter().enumerate() {
-                let id = format!(
-                    "${}:{}",
-                    stable_id(&[
-                        "history-v1",
-                        &binding.tenant,
-                        &binding.bot,
-                        &binding.room,
-                        &message.id,
-                        &index.to_string()
-                    ]),
-                    self.matrix.domain
-                );
-                events.push(serde_json::json!({"event_id":id,"room_id":binding.room,"sender":sender,"type":"m.room.message","origin_server_ts":timestamp,"content":{"msgtype":"m.text","body":chunk}}));
-            }
-        }
-        if !events.is_empty() {
-            self.matrix
-                .check_room(&binding.room, &binding.ghost, &self.config.owner)
-                .await?;
-            let ids = events
-                .iter()
-                .map(|event| event["event_id"].as_str().unwrap().to_string())
-                .collect::<Vec<_>>();
-            self.store.reserve_history(&self.config.id, &ids)?;
-            self.matrix.backfill(&binding.room, events).await?;
-            tracing::info!(tenant=%self.config.id,events=ids.len(),"imported conversation history page");
-        }
+        self.relay_page(binding, &page.messages).await?;
         self.store.history_progress(binding, page.older_cursor)?;
         Ok(())
     }

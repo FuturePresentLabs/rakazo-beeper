@@ -208,6 +208,17 @@ impl Matrix {
 
     /// @implements url:https://spec.matrix.org/v1.16/client-server-api/ §Content repository, §Profiles, §m.room.avatar
     pub async fn upload_avatar(&self, user: &str, avatar: crate::avatar::Avatar) -> Result<String> {
+        self.upload_media(user, "avatar", avatar.mime, avatar.bytes)
+            .await
+    }
+
+    pub async fn upload_media(
+        &self,
+        user: &str,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
         let mut url = self.base.clone();
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid Matrix base URL"))?
@@ -215,13 +226,13 @@ impl Matrix {
             .extend(["_matrix", "media", "v3", "upload"]);
         url.query_pairs_mut()
             .append_pair("user_id", user)
-            .append_pair("filename", "avatar");
+            .append_pair("filename", name);
         let response = self
             .client
             .post(url)
             .header(AUTHORIZATION, self.token.clone())
-            .header(reqwest::header::CONTENT_TYPE, avatar.mime)
-            .body(avatar.bytes)
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .body(bytes)
             .send()
             .await
             .map_err(|error| {
@@ -320,6 +331,27 @@ impl Matrix {
         }
         Ok(())
     }
+    pub async fn room_features(
+        &self,
+        binding: &crate::store::Binding,
+        features: Value,
+    ) -> Result<()> {
+        let key = format!("rakazo://{}/{}", binding.tenant, binding.bot);
+        self.ok(
+            Method::PUT,
+            &[
+                "rooms",
+                &binding.room,
+                "state",
+                "com.beeper.room_features",
+                &key,
+            ],
+            &binding.ghost,
+            Some(features),
+        )
+        .await?;
+        Ok(())
+    }
 
     /// Check authoritative state on every delivery, including after a restart.
     pub async fn check_room(&self, room: &str, ghost: &str, owner: &str) -> Result<()> {
@@ -358,18 +390,253 @@ impl Matrix {
             text.len() <= 48_000,
             "message exceeds Matrix text limit; delivery paused"
         );
-        self.ok(
-            Method::PUT,
-            &["rooms", room, "send", "m.room.message", transaction],
+        self.send_event(
+            room,
             ghost,
-            Some(json!({"msgtype":"m.text","body":text})),
+            transaction,
+            "m.room.message",
+            json!({"msgtype":"m.text","body":text}),
         )
         .await?;
         Ok(())
     }
 
+    pub async fn send_event(
+        &self,
+        room: &str,
+        user: &str,
+        transaction: &str,
+        kind: &str,
+        content: Value,
+    ) -> Result<String> {
+        let response = self
+            .ok(
+                Method::PUT,
+                &["rooms", room, "send", kind, transaction],
+                user,
+                Some(content),
+            )
+            .await?;
+        Ok(response["event_id"]
+            .as_str()
+            .context("Matrix send missing event_id")?
+            .to_string())
+    }
+
+    pub async fn event(&self, room: &str, user: &str, id: &str) -> Result<Value> {
+        self.ok(Method::GET, &["rooms", room, "event", id], user, None)
+            .await
+    }
+
+    pub async fn redact(&self, room: &str, user: &str, id: &str, transaction: &str) -> Result<()> {
+        self.ok(
+            Method::PUT,
+            &["rooms", room, "redact", id, transaction],
+            user,
+            Some(json!({})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn room_messages(&self, room: &str, user: &str, from: Option<&str>) -> Result<Value> {
+        let mut url = self.url(&["rooms", room, "messages"])?;
+        url.query_pairs_mut()
+            .append_pair("user_id", user)
+            .append_pair("dir", "b")
+            .append_pair("limit", "1000");
+        if let Some(from) = from {
+            url.query_pairs_mut().append_pair("from", from);
+        }
+        let response = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, self.token.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Matrix history lookup failed: {}", error.without_url())
+            })?;
+        ensure!(
+            response.status().is_success(),
+            "Matrix history lookup returned HTTP {}",
+            response.status()
+        );
+        Ok(response.json().await?)
+    }
+
+    /// @implements url:https://spec.matrix.org/v1.16/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid -- authenticated download, bounded bytes and credential-free CDN redirects
+    pub async fn download_media(
+        &self,
+        user: &str,
+        content: &Value,
+        limit: usize,
+    ) -> Result<crate::media::Media> {
+        use futures_util::StreamExt;
+        let encrypted = content.get("file");
+        let uri = encrypted
+            .map(|file| &file["url"])
+            .unwrap_or(&content["url"])
+            .as_str()
+            .ok_or(crate::media::Rejected(
+                "Attachment is missing its Matrix media URI.",
+            ))?;
+        let uri = Url::parse(uri).map_err(|_| crate::media::Rejected("Invalid attachment URI."))?;
+        ensure!(
+            uri.scheme() == "mxc"
+                && uri.username().is_empty()
+                && uri.password().is_none()
+                && uri.query().is_none()
+                && uri.fragment().is_none(),
+            crate::media::Rejected("Attachment must use a Matrix media URI.")
+        );
+        let server = uri.host_str().context("attachment media server missing")?;
+        let server = if let Some(port) = uri.port() {
+            format!("{server}:{port}")
+        } else {
+            server.to_string()
+        };
+        let id = uri
+            .path()
+            .strip_prefix('/')
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .context("invalid media identifier")?;
+        let name = crate::media::filename(
+            content["filename"]
+                .as_str()
+                .or(content["body"].as_str())
+                .unwrap_or("attachment"),
+        )?;
+        let mime = crate::media::mime(
+            content["info"]["mimetype"]
+                .as_str()
+                .unwrap_or("application/octet-stream"),
+        )?;
+        if let Some(size) = content["info"]["size"].as_u64() {
+            ensure!(
+                size <= limit as u64,
+                crate::media::Rejected("Attachment exceeds the bridge's 10 MiB limit.")
+            );
+        }
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .pop_if_empty()
+            .extend(["_matrix", "client", "v1", "media", "download", &server, id]);
+        url.query_pairs_mut()
+            .append_pair("user_id", user)
+            .append_pair("allow_redirect", "false");
+        let mut response = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, self.token.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Matrix media download failed: {}", error.without_url())
+            })?;
+        // Hungryserv serves authenticated media through expiring R2 URLs. Follow
+        // only this provider's signed CDN or the configured homeserver origin,
+        // with no appservice credentials/cookies on the redirected request.
+        for _ in 0..3 {
+            if !response.status().is_redirection() {
+                break;
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(crate::media::Rejected(
+                    "Media redirect is missing its destination.",
+                ))?;
+            let location = response
+                .url()
+                .join(location)
+                .map_err(|_| crate::media::Rejected("Invalid media redirect."))?;
+            ensure!(
+                self.media_redirect_allowed(&location),
+                crate::media::Rejected("Media redirected to an untrusted destination.")
+            );
+            response = self.client.get(location).send().await.map_err(|error| {
+                anyhow::anyhow!("Media CDN download failed: {}", error.without_url())
+            })?;
+        }
+        ensure!(
+            !response.status().is_redirection(),
+            crate::media::Rejected("Too many media redirects.")
+        );
+        if matches!(response.status().as_u16(), 400 | 404 | 410 | 413 | 415) {
+            return Err(crate::media::Rejected(
+                "Attachment is unavailable or exceeds the media limit.",
+            )
+            .into());
+        }
+        ensure!(
+            response.status().is_success(),
+            "Matrix media download returned HTTP {}",
+            response.status()
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            crate::media::Rejected("Attachment exceeds the bridge's 10 MiB limit.")
+        );
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("Matrix media stream failed"))?;
+            ensure!(
+                chunk.len() <= limit.saturating_sub(bytes.len()),
+                crate::media::Rejected("Attachment exceeds the bridge's 10 MiB limit.")
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(file) = encrypted {
+            crate::media::decrypt(&mut bytes, file)
+                .map_err(|_| crate::media::Rejected("Encrypted attachment failed verification."))?;
+        }
+        ensure!(
+            !bytes.is_empty(),
+            crate::media::Rejected("Empty attachments cannot be sent to Rakazo.")
+        );
+        ensure!(
+            content["info"]["size"]
+                .as_u64()
+                .is_none_or(|size| size == bytes.len() as u64),
+            crate::media::Rejected("Attachment download size did not match its metadata.")
+        );
+        Ok(crate::media::Media { name, mime, bytes })
+    }
+
+    fn media_redirect_allowed(&self, destination: &Url) -> bool {
+        if !destination.username().is_empty()
+            || destination.password().is_some()
+            || destination.fragment().is_some()
+        {
+            return false;
+        }
+        if destination.origin() == self.base.origin() {
+            return true;
+        }
+        let beeper = self
+            .base
+            .host_str()
+            .is_some_and(|host| host == "matrix.beeper.com");
+        beeper
+            && destination.scheme() == "https"
+            && destination.port_or_known_default() == Some(443)
+            && destination
+                .host_str()
+                .is_some_and(|host| host.ends_with(".r2.cloudflarestorage.com"))
+    }
+
     /// @implements github:mautrix/go@v0.28.1 requests.go ReqBeeperBatchSend, bridgev2/portalbackfill.go -- timestamped, silent, deterministic backfill
     pub async fn backfill(&self, room: &str, events: Vec<Value>) -> Result<()> {
+        self.batch_send(room, events, false).await
+    }
+
+    pub async fn batch_send(&self, room: &str, events: Vec<Value>, forward: bool) -> Result<()> {
         let expected: Vec<_> = events
             .iter()
             .map(|event| event["event_id"].clone())
@@ -389,7 +656,7 @@ impl Matrix {
             ]);
         url.query_pairs_mut().append_pair("user_id", &self.sender);
         let response = self.client.post(url).header(AUTHORIZATION,self.token.clone())
-            .json(&json!({"forward":false,"forward_if_no_messages":true,"send_notification":false,"events":events}))
+            .json(&json!({"forward":forward,"forward_if_no_messages":true,"send_notification":forward,"events":events}))
             .send().await.map_err(|error| anyhow::anyhow!("Matrix history transport failed: {}", error.without_url()))?;
         ensure!(
             response.status().is_success(),

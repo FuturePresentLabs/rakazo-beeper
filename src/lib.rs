@@ -1,7 +1,9 @@
 pub mod config;
 pub mod login;
 pub mod matrix;
+pub mod media;
 pub mod rakazo;
+pub mod rich;
 pub mod service;
 pub mod store;
 pub mod transport;

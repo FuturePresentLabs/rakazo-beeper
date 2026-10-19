@@ -3,7 +3,8 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, Method, Request, StatusCode, Uri},
-    routing::any,
+    response::{IntoResponse, Response},
+    routing::{any, get},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rakazo_beeper::{
@@ -16,6 +17,7 @@ use rakazo_beeper::{
     transport,
 };
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -34,6 +36,7 @@ fn key() -> String {
 struct Remote {
     fail_backfill: bool,
     history_events: HashMap<String, Value>,
+    timeline: Vec<String>,
     avatar_color: Option<String>,
     bot_name: Option<String>,
     fail_profile: bool,
@@ -43,13 +46,53 @@ struct Remote {
     encryption: bool,
     intruder: bool,
     fail_send: bool,
+    fail_after_commit: bool,
     fail_matrix_send: bool,
     fail_create: bool,
     created_room: Option<Value>,
     rakazo_nonces: HashSet<String>,
     matrix_transactions: HashMap<String, String>,
+    incoming_events: HashMap<String, Value>,
+    artifacts: HashMap<String, Value>,
 }
 type Shared = Arc<Mutex<Remote>>;
+
+async fn mock_media(State(remote): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
+    assert_eq!(
+        headers["authorization"],
+        "Bearer appservice-token-at-least-20-chars"
+    );
+    assert!(uri.query().unwrap().contains("allow_redirect=false"));
+    remote
+        .lock()
+        .unwrap()
+        .requests
+        .push((uri.to_string(), Value::Null, headers));
+    if uri.path().ends_with("/redirect") {
+        return Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("location", "/media-cdn/fixture")
+            .body(Body::empty())
+            .unwrap();
+    }
+    if uri.path().ends_with("/untrusted") {
+        return Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("location", "https://127.0.0.1/private")
+            .body(Body::empty())
+            .unwrap();
+    }
+    (StatusCode::OK, b"attachment fixture".to_vec()).into_response()
+}
+
+async fn mock_media_cdn(headers: HeaderMap) -> Vec<u8> {
+    assert!(
+        !headers.contains_key("authorization"),
+        "CDN request must not receive appservice credentials"
+    );
+    assert!(!headers.contains_key("cookie"));
+    b"attachment fixture".to_vec()
+}
 
 async fn mock(
     State(remote): State<Shared>,
@@ -59,9 +102,10 @@ async fn mock(
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     let input: Value = if uri.path().contains("/media/v3/upload") {
-        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
-        assert_eq!(headers["content-type"], "image/png");
-        json!({"bytes":body.len()})
+        if headers["content-type"] == "image/png" {
+            assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+        json!({"bytes":body.len(),"digest":hex::encode(sha2::Sha256::digest(&body))})
     } else if body.is_empty() {
         Value::Null
     } else {
@@ -96,6 +140,11 @@ async fn mock(
                 )
             }
             "/rpc/threads/messages" => {
+                if let Some(id) = args["around"]["messageId"].as_str() {
+                    return ok(
+                        json!({"json":{"messages":state.messages.iter().filter(|message|message["id"]==id).collect::<Vec<_>>(),"olderCursor":null}}),
+                    );
+                }
                 let before = args["before"].as_i64().unwrap_or(i64::MAX);
                 let mut rows = state
                     .messages
@@ -122,8 +171,60 @@ async fn mock(
                 if std::mem::take(&mut state.fail_send) {
                     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
                 } else {
-                    ok(json!({"json":{"taskId":"task-a","runId":"run-a","seq":2}}))
+                    let seq=state.messages.iter().find(|message|message["clientNonce"]==args["clientNonce"]).and_then(|message|message["seq"].as_i64()).unwrap_or_else(|| {
+                        let seq=state.messages.iter().filter_map(|message|message["seq"].as_i64()).max().unwrap_or(-1)+1;
+                        let mut row=message(seq,"user",args["text"].as_str().unwrap_or(""));
+                        if let Some(ids)=args["artifactIds"].as_array() {
+                            let mut blocks=if args["text"].as_str().is_some_and(|text|!text.is_empty()) {row["blocks"].as_array().unwrap().clone()} else {vec![]};
+                            for id in ids {let artifact=state.artifacts.get(id.as_str().unwrap()).unwrap();blocks.push(json!({"kind":if artifact["mimeType"].as_str().unwrap().starts_with("image/") {"image"} else {"file"},"artifactId":id,"mimeType":artifact["mimeType"],"name":artifact["name"],"size":artifact["size"]}));}
+                            row["blocks"]=json!(blocks);
+                        }
+                        row["clientNonce"]=args["clientNonce"].clone();
+                        if let Some(reply)=args.get("replyToMessageId") {row["replyToMessageId"]=reply.clone();}
+                        state.messages.push(row);seq
+                    });
+                    if std::mem::take(&mut state.fail_after_commit) {
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                    } else {
+                        ok(json!({"json":{"taskId":"task-a","runId":"run-a","seq":seq}}))
+                    }
                 }
+            }
+            "/rpc/artifacts/create" => {
+                let id = format!("artifact-{}", args["clientNonce"].as_str().unwrap());
+                let bytes = STANDARD
+                    .decode(args["contentBase64"].as_str().unwrap())
+                    .unwrap();
+                let artifact = json!({"id":id,"name":args["name"],"mimeType":args["mimeType"],"contentBase64":args["contentBase64"],"size":bytes.len()});
+                state.artifacts.insert(id.clone(), artifact.clone());
+                ok(json!({"json":artifact}))
+            }
+            "/rpc/artifacts/get" => {
+                if let Some(artifact) = state.artifacts.get(args["artifactId"].as_str().unwrap()) {
+                    ok(json!({"json":artifact}))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({})))
+                }
+            }
+            "/rpc/threads/react" => {
+                if !state
+                    .messages
+                    .iter()
+                    .any(|message| message["clientNonce"] == args["clientNonce"])
+                {
+                    let seq = state
+                        .messages
+                        .iter()
+                        .filter_map(|message| message["seq"].as_i64())
+                        .max()
+                        .unwrap_or(-1)
+                        + 1;
+                    let mut row = message(seq, "user", args["reaction"].as_str().unwrap());
+                    row["clientNonce"] = args["clientNonce"].clone();
+                    row["replyToMessageId"] = args["messageId"].clone();
+                    state.messages.push(row);
+                }
+                ok(json!({"json":{"ok":true}}))
             }
             _ => panic!("unexpected RPC route {path}"),
         };
@@ -134,24 +235,63 @@ async fn mock(
     );
     if path.ends_with("/batch_send") {
         assert!(path.contains("/unstable/com.beeper.backfill/rooms/"));
-        assert_eq!(input["send_notification"], false);
-        assert_eq!(input["forward"], false);
+        assert_eq!(input["send_notification"], input["forward"]);
         let events = input["events"].as_array().unwrap();
         let ids: Vec<_> = events
             .iter()
             .map(|event| event["event_id"].clone())
             .collect();
+        let fresh = events
+            .iter()
+            .filter_map(|event| {
+                let id = event["event_id"].as_str().unwrap();
+                (!state.history_events.contains_key(id)).then(|| id.to_string())
+            })
+            .collect::<Vec<_>>();
+        if input["forward"] == true {
+            state.timeline.extend(fresh);
+        } else {
+            state.timeline.splice(0..0, fresh);
+        }
         for event in events {
+            if input["forward"] == true
+                && event["type"] == "m.room.message"
+                && event["sender"]
+                    .as_str()
+                    .is_some_and(|sender| sender.starts_with("@sh-rakazo_"))
+            {
+                state.matrix_transactions.insert(
+                    event["event_id"].as_str().unwrap().to_string(),
+                    event["content"]["body"].as_str().unwrap().to_string(),
+                );
+            }
             state.history_events.insert(
                 event["event_id"].as_str().unwrap().to_string(),
                 event.clone(),
             );
         }
         // Simulate a committed request whose successful response was lost.
-        if std::mem::take(&mut state.fail_backfill) {
+        if std::mem::take(&mut state.fail_backfill)
+            || (input["forward"] == true && std::mem::take(&mut state.fail_matrix_send))
+        {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
         }
         return ok(json!({"event_ids":ids}));
+    }
+    if path.ends_with("/messages") {
+        return ok(json!({"chunk":state.history_events.values().collect::<Vec<_>>() }));
+    }
+    if path.contains("/event/") {
+        let id = path.rsplit('/').next().unwrap();
+        let id = percent_encoding::percent_decode_str(id)
+            .decode_utf8()
+            .unwrap();
+        return ok(state
+            .incoming_events
+            .get(id.as_ref())
+            .or_else(|| state.history_events.get(id.as_ref()))
+            .cloned()
+            .unwrap_or_else(|| event(&id, "@owner:beeper.com")));
     }
     if path.ends_with("/register") {
         return ok(json!({"user_id":"@ghost:beeper.local"}));
@@ -172,6 +312,7 @@ async fn mock(
         || path.contains("/state/m.room.name/")
         || path.contains("/state/m.bridge/")
         || path.contains("/state/uk.half-shot.bridge/")
+        || path.contains("/state/com.beeper.room_features/")
     {
         if std::mem::take(&mut state.fail_profile) {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
@@ -261,7 +402,14 @@ async fn fixture() -> Fixture {
     let remote: Shared = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new().fallback(any(mock)).with_state(remote.clone());
+    let app = Router::new()
+        .route(
+            "/_matrix/client/v1/media/download/{server}/{id}",
+            get(mock_media),
+        )
+        .route("/media-cdn/fixture", get(mock_media_cdn))
+        .fallback(any(mock))
+        .with_state(remote.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -308,6 +456,495 @@ fn message(seq: i64, role: &str, text: &str) -> Value {
 }
 fn event(id: &str, sender: &str) -> Value {
     json!({"event_id":id,"room_id":"!agent-a:beeper.local","sender":sender,"type":"m.room.message","content":{"msgtype":"m.text","body":"Hello Ada"}})
+}
+
+#[test]
+fn room_capabilities_follow_server_limits_and_do_not_advertise_edits_or_removals() {
+    let preferences = rakazo_beeper::rakazo::Preferences {
+        avatar_style: "organic".into(),
+        max_upload_size_bytes: Some(1024),
+        attachment_mime_types: Some(vec!["audio/ogg".into(), "image/png".into()]),
+    };
+    let features = rakazo_beeper::rich::room_features(&preferences);
+    assert_eq!(features["edit"], -2);
+    assert_eq!(features["delete"], -2);
+    assert_eq!(features["file"]["m.audio"]["mime_types"]["audio/ogg"], 2);
+    assert_eq!(features["file"]["m.image"]["max_size"], 1024);
+    assert!(features["file"]["m.video"].is_null());
+    assert_eq!(features["allowed_reactions"].as_array().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn unavailable_source_attachments_are_visible_and_do_not_block_later_replies() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let mut missing = message(0, "bot", "");
+    missing["blocks"] = json!([{"kind":"file","artifactId":"missing","name":"missing.txt","mimeType":"text/plain","size":18}]);
+    f.remote.lock().unwrap().messages = vec![missing, message(1, "bot", "later reply")];
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert!(
+        remote
+            .history_events
+            .values()
+            .any(|event| event["content"]["msgtype"] == "m.notice")
+    );
+    assert!(
+        remote
+            .history_events
+            .values()
+            .any(|event| event["content"]["body"] == "later reply")
+    );
+    assert_eq!(f.runtime.store.bindings("tenant-a").unwrap()[0].cursor, 1);
+}
+
+#[tokio::test]
+async fn threaded_agent_reply_waits_for_an_ambiguous_send_receipt_and_keeps_its_thread() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "thread root")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let root = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+    let raw = json!({"event_id":"$thread-input","room_id":binding.room,"type":"m.room.message","sender":"@owner:beeper.com","content":{"msgtype":"m.text","body":"threaded input","m.relates_to":{"rel_type":"m.thread","event_id":root,"m.in_reply_to":{"event_id":root}}}});
+    f.remote
+        .lock()
+        .unwrap()
+        .incoming_events
+        .insert("$thread-input".into(), raw.clone());
+    f.runtime
+        .ingest("thread-txn", &json!({"events":[raw]}))
+        .unwrap();
+    f.remote.lock().unwrap().fail_after_commit = true;
+    assert!(f.runtime.deliver_inbound().await.is_err());
+    let mut reply = message(2, "bot", "threaded output");
+    reply["runId"] = json!("run-a");
+    f.remote.lock().unwrap().messages.push(reply);
+    f.runtime.poll_binding(&binding).await.unwrap();
+    assert!(f.remote.lock().unwrap().matrix_transactions.is_empty());
+    let pending = f.runtime.store.next("tenant-a", i64::MAX).unwrap().unwrap();
+    let seq = f
+        .runtime
+        .inbound_content(&binding, &pending.event)
+        .await
+        .unwrap()
+        .unwrap();
+    f.runtime
+        .store
+        .complete_send(&binding, pending.id, "$thread-input", seq)
+        .unwrap();
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.rakazo_nonces.len(), 1);
+    let reply = remote
+        .history_events
+        .values()
+        .find(|event| event["content"]["body"] == "threaded output")
+        .unwrap();
+    assert_eq!(reply["content"]["m.relates_to"]["rel_type"], "m.thread");
+    assert_eq!(reply["content"]["m.relates_to"]["event_id"], root);
+    assert_eq!(
+        reply["content"]["m.relates_to"]["m.in_reply_to"]["event_id"],
+        "$thread-input"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_media_redirects_strip_credentials_and_reject_untrusted_targets() {
+    let f = fixture().await;
+    let content = json!({"msgtype":"m.file","body":"notes.txt","url":"mxc://media.example.test/redirect","info":{"mimetype":"text/plain","size":18}});
+    let media = f
+        .runtime
+        .matrix
+        .download_media(&f.runtime.matrix.sender, &content, 1024)
+        .await
+        .unwrap();
+    assert_eq!(media.bytes, b"attachment fixture");
+    let mut untrusted = content;
+    untrusted["url"] = json!("mxc://media.example.test/untrusted");
+    let error = f
+        .runtime
+        .matrix
+        .download_media(&f.runtime.matrix.sender, &untrusted, 1024)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .downcast_ref::<rakazo_beeper::media::Rejected>()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn attachments_upload_once_and_survive_a_lost_send_response_without_echoes() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let raw = json!({"event_id":"$file","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.file","filename":"notes.txt","body":"A caption","url":"mxc://media.example.test/fixture","info":{"mimetype":"text/plain","size":18}}});
+    f.remote
+        .lock()
+        .unwrap()
+        .incoming_events
+        .insert("$file".into(), raw.clone());
+    f.runtime
+        .ingest("file-txn", &json!({"events":[raw.clone()]}))
+        .unwrap();
+    f.remote.lock().unwrap().fail_send = true;
+    assert!(f.runtime.deliver_inbound().await.is_err());
+    let pending = f.runtime.store.next("tenant-a", i64::MAX).unwrap().unwrap();
+    let seq = f
+        .runtime
+        .inbound_content(&binding, &pending.event)
+        .await
+        .unwrap()
+        .unwrap();
+    f.runtime
+        .store
+        .complete_send(&binding, pending.id, "$file", seq)
+        .unwrap();
+    f.runtime
+        .ingest("file-txn-retry", &json!({"events":[raw]}))
+        .unwrap();
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.artifacts.len(), 1);
+    assert_eq!(
+        remote.artifacts.values().next().unwrap()["contentBase64"],
+        STANDARD.encode(b"attachment fixture")
+    );
+    assert_eq!(remote.rakazo_nonces.len(), 1);
+    assert_eq!(remote.messages.len(), 1);
+    assert_eq!(remote.messages[0]["blocks"][0]["text"], "A caption");
+    assert_eq!(remote.messages[0]["blocks"][1]["kind"], "file");
+    assert!(
+        remote.history_events.is_empty(),
+        "source echo must use the original Beeper attachment"
+    );
+    assert_eq!(f.runtime.store.pending_count().unwrap(), 0);
+    assert_eq!(
+        f.runtime.store.links(&binding, "message-0").unwrap()[0].matrix_id,
+        "$file"
+    );
+}
+
+#[tokio::test]
+async fn source_media_preserves_types_and_replies_without_duplicate_uploads() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "parent")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let parent = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+    let types = [
+        ("image/jpeg", "m.image"),
+        ("video/mp4", "m.video"),
+        ("audio/ogg", "m.audio"),
+        ("application/pdf", "m.file"),
+    ];
+    for (index, (mime, _)) in types.iter().enumerate() {
+        let id = format!("file-{index}");
+        let mut message = message(index as i64 + 1, "bot", "");
+        message["replyToMessageId"] = json!("message-0");
+        message["blocks"] =
+            json!([{"kind":"file","artifactId":id,"name":"fixture.bin","mimeType":mime,"size":18}]);
+        let mut remote = f.remote.lock().unwrap();
+        remote.artifacts.insert(id,json!({"name":"fixture.bin","mimeType":mime,"size":18,"contentBase64":STANDARD.encode(b"attachment fixture")}));
+        remote.messages.push(message);
+    }
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let upload_count = || {
+        f.remote
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+            .count()
+    };
+    assert_eq!(upload_count(), 6); // Bridge logo, agent picture, four attachments.
+    f.runtime.poll_binding(&binding).await.unwrap();
+    assert_eq!(upload_count(), 6);
+    let remote = f.remote.lock().unwrap();
+    for (_, expected_type) in types {
+        let event = remote
+            .history_events
+            .values()
+            .find(|event| event["content"]["msgtype"] == expected_type)
+            .unwrap();
+        assert_eq!(
+            event["content"]["m.relates_to"]["m.in_reply_to"]["event_id"],
+            parent
+        );
+        assert!(
+            event["content"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("mxc://")
+        );
+    }
+    for (_, body, _) in remote
+        .requests
+        .iter()
+        .filter(|(path, body, _)| path.contains("/media/v3/upload") && body["bytes"] == 18)
+    {
+        assert_eq!(
+            body["digest"],
+            hex::encode(sha2::Sha256::digest(b"attachment fixture"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_runs() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "parent")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let parent = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+    let reaction = json!({"event_id":"$reaction","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":parent,"key":"❤️"}}});
+    f.remote
+        .lock()
+        .unwrap()
+        .incoming_events
+        .insert("$reaction".into(), reaction.clone());
+    f.runtime
+        .ingest("reaction-txn", &json!({"events":[reaction]}))
+        .unwrap();
+    f.runtime.deliver_inbound().await.unwrap();
+    f.runtime.poll_binding(&binding).await.unwrap();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        assert!(
+            remote.rakazo_nonces.is_empty(),
+            "react must never invoke threads/send"
+        );
+        let mut reply = message(2, "user", "👍");
+        reply["replyToMessageId"] = json!("message-0");
+        remote.messages.push(reply);
+    }
+    f.runtime.poll_binding(&binding).await.unwrap();
+    {
+        let remote = f.remote.lock().unwrap();
+        let reaction = remote
+            .history_events
+            .values()
+            .find(|event| event["type"] == "m.reaction")
+            .unwrap();
+        assert_eq!(reaction["content"]["m.relates_to"]["event_id"], parent);
+    }
+    let reply = json!({"event_id":"$reply","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.text","body":"> <@agent:example.test> parent\n\nReal reply","m.relates_to":{"m.in_reply_to":{"event_id":parent}}}});
+    f.runtime
+        .ingest("reply-txn", &json!({"events":[reply]}))
+        .unwrap();
+    f.runtime.deliver_inbound().await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    let (_, body, _) = remote
+        .requests
+        .iter()
+        .rev()
+        .find(|(path, _, _)| path == "/rpc/threads/send")
+        .unwrap();
+    assert_eq!(body["json"]["text"], "Real reply");
+    assert_eq!(body["json"]["replyToMessageId"], "message-0");
+}
+
+#[tokio::test]
+async fn invalid_media_and_cross_room_targets_are_rejected_without_blocking_the_queue() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let raw = json!({"event_id":"$bad-file","room_id":"!agent-a:beeper.local","sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.file","body":"notes.txt","url":"https://untrusted.example.test/steal","info":{"mimetype":"text/plain"}}});
+    let cross = json!({"event_id":"$cross-reply","room_id":"!agent-a:beeper.local","sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.text","body":"hello","m.relates_to":{"m.in_reply_to":{"event_id":"$different-room"}}}});
+    f.runtime
+        .ingest(
+            "bad-txn",
+            &json!({"events":[raw,cross,event("$valid","@owner:beeper.com")]}),
+        )
+        .unwrap();
+    f.runtime.deliver_inbound().await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.rakazo_nonces.len(), 1);
+    assert_eq!(f.runtime.store.pending_count().unwrap(), 0);
+    assert!(
+        !remote
+            .requests
+            .iter()
+            .any(|(path, _, _)| path.contains("/media/download/"))
+    );
+    assert_eq!(
+        remote
+            .requests
+            .iter()
+            .filter(|(path, body, _)| path.contains("/send/m.room.message/")
+                && body["msgtype"] == "m.notice")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn upgrade_recovers_old_live_ids_and_imports_only_previously_omitted_media() {
+    let f = fixture().await;
+    let mut old = message(0, "bot", "old text");
+    old["blocks"].as_array_mut().unwrap().push(json!({"kind":"file","artifactId":"old-file","name":"notes.txt","mimeType":"text/plain","size":18}));
+    f.remote.lock().unwrap().messages = vec![old.clone()];
+    f.runtime.discover().await.unwrap();
+    let mut binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.store.history_before(&binding).unwrap();
+    f.runtime.store.history_progress(&binding, None).unwrap();
+    let history_id =
+        f.runtime
+            .source_event_id(&binding, &serde_json::from_value(old).unwrap(), "text:0", 0);
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.push(message(1, "bot", "old live reply"));
+        remote.artifacts.insert("old-file".into(),json!({"name":"notes.txt","mimeType":"text/plain","size":18,"contentBase64":STANDARD.encode(b"attachment fixture")}));
+        remote.history_events.insert(history_id.clone(),json!({"event_id":history_id,"room_id":binding.room,"sender":binding.ghost,"type":"m.room.message","content":{"msgtype":"m.text","body":"old text"}}));
+        remote.history_events.insert("$legacy-live".into(),json!({"event_id":"$legacy-live","room_id":binding.room,"sender":binding.ghost,"type":"m.room.message","content":{"msgtype":"m.text","body":"old live reply"},"unsigned":{"transaction_id":stable_id(&["tenant-a","agent-a","message-1","0"])}}));
+    }
+    f.runtime.store.cursor(&binding, 1).unwrap();
+    binding.cursor = 1;
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    assert_eq!(
+        f.runtime.store.links(&binding, "message-1").unwrap()[0].matrix_id,
+        "$legacy-live"
+    );
+    assert_eq!(
+        f.runtime.store.links(&binding, "message-0").unwrap().len(),
+        2
+    );
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.history_events.len(), 3);
+    assert_eq!(
+        remote
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+            .count(),
+        3
+    );
+    assert!(
+        remote
+            .history_events
+            .values()
+            .any(|event| event["content"]["body"] == "notes.txt")
+    );
+}
+
+#[tokio::test]
+async fn missing_legacy_live_events_pause_upgrade_instead_of_resurrecting_messages() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let mut binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.remote
+        .lock()
+        .unwrap()
+        .messages
+        .push(message(0, "bot", "possibly removed"));
+    f.runtime.store.cursor(&binding, 0).unwrap();
+    binding.cursor = 0;
+    assert!(f.runtime.bootstrap_links(&binding).await.is_err());
+    assert!(!f.runtime.store.links_initialized(&binding).unwrap());
+    assert!(f.remote.lock().unwrap().history_events.is_empty());
+}
+
+#[test]
+fn rich_queue_keys_receipts_links_and_media_cache_survive_restart_without_cross_tenant_access() {
+    use rakazo_beeper::store::{Binding, MessageLink};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bridge.db");
+    let store = Store::open(&path, &key()).unwrap();
+    let binding = Binding {
+        tenant: "a".into(),
+        bot: "agent".into(),
+        room: "!room".into(),
+        ghost: "@ghost".into(),
+        cursor: 0,
+    };
+    store
+        .ingest(
+            "a",
+            "txn",
+            &[Inbound {
+                event_id: "$file".into(),
+                room: "!room".into(),
+                text: "private caption".into(),
+                content: json!({"file":{"key":{"k":"PRIVATE_ATTACHMENT_KEY"}}}),
+            }],
+        )
+        .unwrap();
+    store
+        .link(
+            &binding,
+            &MessageLink {
+                rakazo_id: "source-id".into(),
+                matrix_id: "$file".into(),
+                part: "text:0".into(),
+                role: "user".into(),
+                kind: "m.room.message".into(),
+                hash: "hash".into(),
+            },
+        )
+        .unwrap();
+    store
+        .cache_media(&binding, "artifact-id", "mxc://media.example.test/id")
+        .unwrap();
+    let nonce = stable_id(&["a", "$file"]);
+    store
+        .save_run_route(&binding, "run", "$file", Some("$root"))
+        .unwrap();
+    drop(store);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        !bytes
+            .windows(b"PRIVATE_ATTACHMENT_KEY".len())
+            .any(|window| window == b"PRIVATE_ATTACHMENT_KEY")
+    );
+    let store = Store::open(&path, &key()).unwrap();
+    assert_eq!(
+        store.next("a", 0).unwrap().unwrap().event.content["file"]["key"]["k"],
+        "PRIVATE_ATTACHMENT_KEY"
+    );
+    assert_eq!(
+        store.event_for_nonce(&binding, &nonce).unwrap().as_deref(),
+        Some("$file")
+    );
+    assert_eq!(
+        store
+            .cached_media(&binding, "artifact-id")
+            .unwrap()
+            .as_deref(),
+        Some("mxc://media.example.test/id")
+    );
+    let other = Binding {
+        tenant: "b".into(),
+        ..binding.clone()
+    };
+    assert!(store.matrix_link(&other, "$file").unwrap().is_none());
+    assert!(store.event_for_nonce(&other, &nonce).unwrap().is_none());
+    assert_eq!(
+        store.run_route(&binding, "run").unwrap(),
+        Some(("$file".into(), Some("$root".into())))
+    );
+    assert!(store.run_route(&other, "run").unwrap().is_none());
+    assert!(store.cached_media(&other, "artifact-id").unwrap().is_none());
+    let pending = store.next("a", 0).unwrap().unwrap();
+    store
+        .complete_send(&binding, pending.id, "$file", 7)
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path, &key()).unwrap();
+    assert_eq!(store.receipt(&binding, "$file").unwrap(), Some(7));
+    assert_eq!(store.pending_count().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -431,10 +1068,7 @@ async fn round_trip_retries_use_stable_remote_idempotency_keys() {
     assert_eq!(f.remote.lock().unwrap().rakazo_nonces.len(), 1);
     {
         let mut remote = f.remote.lock().unwrap();
-        remote.messages.extend([
-            message(1, "user", "Hello Ada"),
-            message(2, "bot", "Hello Avery"),
-        ]);
+        remote.messages.push(message(2, "bot", "Hello Avery"));
         remote.fail_matrix_send = true;
     }
     assert!(f.runtime.poll_binding(&binding).await.is_err());
@@ -459,7 +1093,7 @@ async fn historical_backfill_preserves_senders_dates_and_frozen_boundary_without
         .map(|seq| {
             message(
                 seq,
-                if seq % 2 == 0 { "user" } else { "bot" },
+                if seq % 2 == 0 { "bot" } else { "user" },
                 &format!("old {seq}"),
             )
         })
@@ -496,6 +1130,17 @@ async fn historical_backfill_preserves_senders_dates_and_frozen_boundary_without
     {
         let remote = f.remote.lock().unwrap();
         assert_eq!(remote.history_events.len(), 5);
+        let bodies = remote
+            .timeline
+            .iter()
+            .map(|id| {
+                remote.history_events[id]["content"]["body"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, ["old 0", "old 1", "old 2", "old 3", "old 4"]);
+
         for event in remote.history_events.values() {
             assert_eq!(event["origin_server_ts"], 1792282584962_i64);
             let seq: i64 = event["content"]["body"]
@@ -508,9 +1153,9 @@ async fn historical_backfill_preserves_senders_dates_and_frozen_boundary_without
             assert_eq!(
                 event["sender"],
                 if seq % 2 == 0 {
-                    "@owner:beeper.com"
-                } else {
                     binding.ghost.as_str()
+                } else {
+                    "@owner:beeper.com"
                 }
             );
         }
@@ -558,6 +1203,7 @@ fn history_progress_and_echo_reservations_survive_restart_and_isolate_tenants() 
         event_id: "$history".into(),
         room: "!room".into(),
         text: "old prompt".into(),
+        content: Value::Null,
     };
     store
         .ingest("a", "echo", std::slice::from_ref(&echo))
@@ -622,8 +1268,9 @@ async fn history_pagination_recovers_every_message_in_order_and_waits_for_comple
     let bodies: Vec<_> = state
         .requests
         .iter()
-        .filter(|(p, _, _)| p.contains("/send/m.room.message/"))
-        .map(|(_, v, _)| v["body"].as_str().unwrap())
+        .filter(|(p, v, _)| p.contains("/batch_send") && v["forward"] == true)
+        .flat_map(|(_, v, _)| v["events"].as_array().unwrap().iter())
+        .map(|event| event["content"]["body"].as_str().unwrap())
         .collect();
     assert_eq!(
         bodies,
@@ -672,9 +1319,7 @@ async fn strangers_ghost_echoes_unknown_rooms_and_disabled_bots_cannot_trigger_a
         .clone();
     let mut unknown = event("$unknown", "@owner:beeper.com");
     unknown["room_id"] = json!("!another-room");
-    let mut edit = event("$edit", "@owner:beeper.com");
-    edit["content"]["m.relates_to"] = json!({"rel_type":"m.replace"});
-    f.runtime.ingest("txn",&json!({"events":[event("$stranger","@stranger:beeper.com"),event("$echo",&ghost),unknown,edit]})).unwrap();
+    f.runtime.ingest("txn",&json!({"events":[event("$stranger","@stranger:beeper.com"),event("$echo",&ghost),unknown]})).unwrap();
     assert_eq!(f.runtime.store.pending_count().unwrap(), 0);
     let mut encrypted = event("$encrypted", "@owner:beeper.com");
     encrypted["type"] = json!("m.room.encrypted");
@@ -828,6 +1473,7 @@ fn queue_survives_restart_is_encrypted_and_tenant_scoped() {
         event_id: "$same".into(),
         room: "!room".into(),
         text: "TOP SECRET MESSAGE BODY".into(),
+        content: Value::Null,
     };
     {
         let store = Store::open(&path, &key()).unwrap();
@@ -846,6 +1492,7 @@ fn queue_survives_restart_is_encrypted_and_tenant_scoped() {
                     event_id: "$same".into(),
                     room: "!room".into(),
                     text: "different tenant".into(),
+                    content: Value::Null,
                 }],
             )
             .unwrap();

@@ -20,6 +20,15 @@ pub struct Bot {
     #[serde(default)]
     pub color: String,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    pub avatar_style: String,
+    #[serde(default)]
+    pub max_upload_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub attachment_mime_types: Option<Vec<String>>,
+}
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -29,6 +38,22 @@ pub struct Message {
     pub blocks: Vec<Value>,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub client_nonce: Option<String>,
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default)]
+    pub reply_quote: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendReceipt {
+    pub seq: i64,
+    pub run_id: String,
+    #[serde(default)]
+    pub run_ids: Vec<String>,
 }
 impl Message {
     pub fn text(&self) -> String {
@@ -107,12 +132,41 @@ impl Rakazo {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Rakazo transport failed: {}", e.without_url()))?;
+        if response.status().as_u16() == 404 {
+            return Err(
+                crate::media::Rejected("That Rakazo resource is no longer available.").into(),
+            );
+        }
+        if matches!(response.status().as_u16(), 400 | 413 | 415 | 422) {
+            return Err(crate::media::Rejected(
+                "Rakazo rejected this message or attachment format.",
+            )
+            .into());
+        }
         ensure!(
             response.status().is_success(),
             "Rakazo RPC returned HTTP {}",
             response.status()
         );
-        let body: Value = response.json().await.context("invalid Rakazo response")?;
+        use futures_util::StreamExt;
+        let limit = crate::media::MAX_BYTES.div_ceil(3) * 4 + 1024 * 1024;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= limit as u64),
+            crate::media::Rejected("Rakazo response exceeds the bridge size limit.")
+        );
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("Rakazo response stream failed"))?;
+            ensure!(
+                chunk.len() <= limit.saturating_sub(bytes.len()),
+                crate::media::Rejected("Rakazo response exceeds the bridge size limit.")
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&bytes).context("invalid Rakazo response")?;
         let value = body.get("json").context("missing oRPC json envelope")?;
         serde_json::from_value(value.clone()).context("Rakazo contract mismatch")
     }
@@ -122,26 +176,108 @@ impl Rakazo {
         self.rpc(&["bots", "list"], Value::Null).await
     }
     pub async fn avatar_style(&self) -> Result<String> {
-        let me: Value = self.rpc(&["me"], Value::Null).await?;
-        let style = me["avatarStyle"]
-            .as_str()
-            .context("Rakazo avatar style missing")?;
+        Ok(self.preferences().await?.avatar_style)
+    }
+    pub async fn preferences(&self) -> Result<Preferences> {
+        let me: Preferences = self.rpc(&["me"], Value::Null).await?;
         ensure!(
-            matches!(style, "organic" | "robot"),
+            matches!(me.avatar_style.as_str(), "organic" | "robot"),
             "unknown Rakazo avatar style"
         );
-        Ok(style.to_string())
+        ensure!(
+            me.max_upload_size_bytes.is_none_or(|limit| limit > 0),
+            "Rakazo advertised an invalid upload limit"
+        );
+        Ok(me)
     }
     pub async fn snapshot(&self, bot: &str) -> Result<Snapshot> {
         self.rpc(&["threads", "get"], json!({"botId": bot})).await
     }
-    pub async fn send(&self, bot: &str, text: &str, nonce: &str) -> Result<()> {
+    pub async fn send_content(
+        &self,
+        bot: &str,
+        text: &str,
+        artifacts: &[String],
+        reply: Option<&str>,
+        nonce: &str,
+    ) -> Result<i64> {
+        Ok(self
+            .send_routed(bot, text, artifacts, reply, nonce)
+            .await?
+            .seq)
+    }
+    pub async fn send_routed(
+        &self,
+        bot: &str,
+        text: &str,
+        artifacts: &[String],
+        reply: Option<&str>,
+        nonce: &str,
+    ) -> Result<SendReceipt> {
+        let mut input =
+            json!({"botId":bot,"text":text,"artifactIds":artifacts,"clientNonce":nonce});
+        if let Some(reply) = reply {
+            input["replyToMessageId"] = json!(reply);
+        }
+        self.rpc(&["threads", "send"], input).await
+    }
+    pub async fn react(&self, bot: &str, message: &str, reaction: &str, nonce: &str) -> Result<()> {
         let _: Value = self
             .rpc(
-                &["threads", "send"],
-                json!({"botId": bot, "text": text, "clientNonce": nonce}),
+                &["threads", "react"],
+                json!({"botId":bot,"messageId":message,"reaction":reaction,"clientNonce":nonce}),
             )
             .await?;
+        Ok(())
+    }
+    pub async fn create_artifact(
+        &self,
+        bot: &str,
+        media: &crate::media::Media,
+        nonce: &str,
+    ) -> Result<String> {
+        use base64::Engine;
+        let result:Value=self.rpc(&["artifacts","create"],json!({"botId":bot,"name":media.name,"mimeType":media.mime,"contentBase64":base64::engine::general_purpose::STANDARD.encode(&media.bytes),"clientNonce":nonce})).await?;
+        Ok(result["id"]
+            .as_str()
+            .context("Rakazo artifact missing id")?
+            .to_string())
+    }
+    pub async fn artifact(&self, bot: &str, id: &str) -> Result<crate::media::Media> {
+        use base64::Engine;
+        let result: Value = self
+            .rpc(&["artifacts", "get"], json!({"botId":bot,"artifactId":id}))
+            .await?;
+        let encoded = result["contentBase64"]
+            .as_str()
+            .context("Rakazo artifact missing content")?;
+        ensure!(
+            encoded.len() <= crate::media::MAX_BYTES.div_ceil(3) * 4,
+            crate::media::Rejected("Attachment exceeds the bridge's 10 MiB limit.")
+        );
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        ensure!(
+            bytes.len() <= crate::media::MAX_BYTES,
+            crate::media::Rejected("Attachment exceeds the bridge's 10 MiB limit.")
+        );
+        ensure!(
+            result["size"].as_u64() == Some(bytes.len() as u64),
+            "invalid artifact size"
+        );
+        Ok(crate::media::Media {
+            name: crate::media::filename(
+                result["name"].as_str().context("artifact name missing")?,
+            )?,
+            mime: crate::media::mime(
+                result["mimeType"]
+                    .as_str()
+                    .context("artifact MIME type missing")?,
+            )?,
+            bytes,
+        })
+    }
+    pub async fn send(&self, bot: &str, text: &str, nonce: &str) -> Result<()> {
+        self.send_content(bot, text, &[], None, nonce).await?;
         Ok(())
     }
     pub async fn history_page(&self, bot: &str, before: i64) -> Result<Page> {

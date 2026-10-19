@@ -32,6 +32,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 resvg = { version = "0.45", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+aes = "0.8"
+ctr = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

@@ -49,6 +49,17 @@ pub struct Inbound {
     pub event_id: String,
     pub room: String,
     pub text: String,
+    #[serde(default)]
+    pub content: serde_json::Value,
+}
+
+pub struct MessageLink {
+    pub rakazo_id: String,
+    pub matrix_id: String,
+    pub part: String,
+    pub role: String,
+    pub kind: String,
+    pub hash: String,
 }
 pub struct Pending {
     pub id: i64,
@@ -92,6 +103,14 @@ impl Store {
             CREATE TABLE IF NOT EXISTS backfills (tenant TEXT NOT NULL, bot TEXT NOT NULL, before_seq INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(tenant,bot));
             CREATE TABLE IF NOT EXISTS historical_events (tenant TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(tenant,event_id));
             CREATE TABLE IF NOT EXISTS profiles (tenant TEXT NOT NULL, bot TEXT NOT NULL, avatar_hash TEXT NOT NULL, avatar_uri TEXT NOT NULL, applied_hash TEXT NOT NULL DEFAULT '', PRIMARY KEY(tenant,bot));
+            CREATE TABLE IF NOT EXISTS message_links (tenant TEXT NOT NULL,bot TEXT NOT NULL,rakazo_id TEXT NOT NULL,part TEXT NOT NULL,matrix_id TEXT NOT NULL,role TEXT NOT NULL,kind TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(tenant,bot,rakazo_id,part));
+            CREATE INDEX IF NOT EXISTS message_links_matrix ON message_links(tenant,bot,matrix_id);
+            CREATE TABLE IF NOT EXISTS send_receipts (tenant TEXT NOT NULL,bot TEXT NOT NULL,event_id TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(tenant,bot,event_id));
+            CREATE TABLE IF NOT EXISTS event_nonces (tenant TEXT NOT NULL,nonce TEXT NOT NULL,event_id TEXT NOT NULL,room TEXT NOT NULL,PRIMARY KEY(tenant,nonce));
+            CREATE TABLE IF NOT EXISTS run_routes (tenant TEXT NOT NULL,bot TEXT NOT NULL,run_id TEXT NOT NULL,event_id TEXT NOT NULL,thread_root TEXT,PRIMARY KEY(tenant,bot,run_id));
+            CREATE TABLE IF NOT EXISTS media_cache (tenant TEXT NOT NULL,bot TEXT NOT NULL,source_id TEXT NOT NULL,uri TEXT NOT NULL,PRIMARY KEY(tenant,bot,source_id));
+            CREATE TABLE IF NOT EXISTS link_bootstraps (tenant TEXT NOT NULL,bot TEXT NOT NULL,PRIMARY KEY(tenant,bot));
+            CREATE TABLE IF NOT EXISTS sync_cursors (tenant TEXT NOT NULL,bot TEXT NOT NULL,kind TEXT NOT NULL,cursor INTEGER NOT NULL,PRIMARY KEY(tenant,bot,kind));
             CREATE TABLE IF NOT EXISTS transactions (tenant TEXT NOT NULL, txn TEXT NOT NULL, PRIMARY KEY(tenant,txn));
             CREATE TABLE IF NOT EXISTS inbox (
               id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, event_id TEXT NOT NULL, room TEXT NOT NULL,
@@ -125,11 +144,182 @@ impl Store {
                 [store.encrypt("key-check", b"rakazo-beeper-v1")?],
             )?;
         }
+        // Upgrade old queue metadata without retaining any completed message body.
+        {
+            let mut db = store.db.lock().unwrap();
+            let rows = {
+                let mut query=db.prepare("SELECT tenant,event_id,room FROM inbox WHERE NOT EXISTS(SELECT 1 FROM event_nonces WHERE event_nonces.tenant=inbox.tenant AND event_nonces.event_id=inbox.event_id)")?;
+                query
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let tx = db.transaction()?;
+            for (tenant, id, room) in rows {
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_nonces VALUES(?1,?2,?3,?4)",
+                    params![tenant, crate::stable_id(&[&tenant, &id]), id, room],
+                )?;
+            }
+            tx.commit()?;
+        }
         Ok(store)
     }
 
     pub fn profile(&self, tenant: &str, bot: &str) -> Result<Option<Profile>> {
         Ok(self.db.lock().unwrap().query_row("SELECT avatar_hash,avatar_uri,applied_hash FROM profiles WHERE tenant=?1 AND bot=?2", params![tenant,bot], |row| Ok(Profile {avatar_hash:row.get(0)?,avatar_uri:row.get(1)?,applied_hash:row.get(2)?})).optional()?)
+    }
+    pub fn link(&self, binding: &Binding, link: &MessageLink) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO message_links VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(tenant,bot,rakazo_id,part) DO UPDATE SET matrix_id=excluded.matrix_id,role=excluded.role,kind=excluded.kind,hash=excluded.hash",params![binding.tenant,binding.bot,link.rakazo_id,link.part,link.matrix_id,link.role,link.kind,link.hash])?;
+        Ok(())
+    }
+    pub fn links(&self, binding: &Binding, id: &str) -> Result<Vec<MessageLink>> {
+        let db = self.db.lock().unwrap();
+        let mut query=db.prepare("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND rakazo_id=?3 ORDER BY part")?;
+        Ok(query
+            .query_map(params![binding.tenant, binding.bot, id], |row| {
+                Ok(MessageLink {
+                    rakazo_id: row.get(0)?,
+                    matrix_id: row.get(1)?,
+                    part: row.get(2)?,
+                    role: row.get(3)?,
+                    kind: row.get(4)?,
+                    hash: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn matrix_link(&self, binding: &Binding, id: &str) -> Result<Option<MessageLink>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND matrix_id=?3 LIMIT 1",params![binding.tenant,binding.bot,id],|row|Ok(MessageLink {rakazo_id:row.get(0)?,matrix_id:row.get(1)?,part:row.get(2)?,role:row.get(3)?,kind:row.get(4)?,hash:row.get(5)?})).optional()?)
+    }
+    pub fn receipt(&self, binding: &Binding, id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT seq FROM send_receipts WHERE tenant=?1 AND bot=?2 AND event_id=?3",
+                params![binding.tenant, binding.bot, id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn run_route(
+        &self,
+        binding: &Binding,
+        run: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT event_id,thread_root FROM run_routes WHERE tenant=?1 AND bot=?2 AND run_id=?3",params![binding.tenant,binding.bot,run],|row|Ok((row.get(0)?,row.get(1)?))).optional()?)
+    }
+    pub fn save_run_route(
+        &self,
+        binding: &Binding,
+        run: &str,
+        event: &str,
+        thread: Option<&str>,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO run_routes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tenant,bot,run_id) DO UPDATE SET event_id=excluded.event_id,thread_root=excluded.thread_root",params![binding.tenant,binding.bot,run,event,thread])?;
+        Ok(())
+    }
+    pub fn pending_room_count(&self, binding: &Binding) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM inbox WHERE tenant=?1 AND room=?2 AND state='pending'",
+            params![binding.tenant, binding.room],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn event_for_seq(&self, binding: &Binding, seq: i64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT event_id FROM send_receipts WHERE tenant=?1 AND bot=?2 AND seq=?3",
+                params![binding.tenant, binding.bot, seq],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn event_for_nonce(&self, binding: &Binding, nonce: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT event_id FROM event_nonces WHERE tenant=?1 AND nonce=?2 AND room=?3",
+                params![binding.tenant, nonce, binding.room],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn complete_send(&self, binding: &Binding, id: i64, event: &str, seq: i64) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO send_receipts VALUES(?1,?2,?3,?4)",
+            params![binding.tenant, binding.bot, event, seq],
+        )?;
+        tx.execute(
+            "UPDATE inbox SET state='sent',payload=NULL,error=NULL WHERE tenant=?1 AND id=?2",
+            params![binding.tenant, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn cached_media(&self, binding: &Binding, source: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT uri FROM media_cache WHERE tenant=?1 AND bot=?2 AND source_id=?3",
+                params![binding.tenant, binding.bot, source],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn cache_media(&self, binding: &Binding, source: &str, uri: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO media_cache VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,source_id) DO UPDATE SET uri=excluded.uri",params![binding.tenant,binding.bot,source,uri])?;
+        Ok(())
+    }
+    pub fn links_initialized(&self, binding: &Binding) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM link_bootstraps WHERE tenant=?1 AND bot=?2)",
+            params![binding.tenant, binding.bot],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn initialize_links(&self, binding: &Binding) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO link_bootstraps VALUES(?1,?2)",
+            params![binding.tenant, binding.bot],
+        )?;
+        Ok(())
+    }
+    pub fn sync_cursor(&self, binding: &Binding, kind: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor FROM sync_cursors WHERE tenant=?1 AND bot=?2 AND kind=?3",
+                params![binding.tenant, binding.bot, kind],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn set_sync_cursor(&self, binding: &Binding, kind: &str, cursor: i64) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO sync_cursors VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot,kind) DO UPDATE SET cursor=excluded.cursor",params![binding.tenant,binding.bot,kind,cursor])?;
+        Ok(())
+    }
+    pub fn fail(&self, tenant: &str, id: i64) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE inbox SET state='failed',payload=NULL,error='unsupported event; owner notified' WHERE tenant=?1 AND id=?2",params![tenant,id])?;
+        Ok(())
     }
     pub fn cache_avatar(&self, tenant: &str, bot: &str, hash: &str, uri: &str) -> Result<()> {
         self.db.lock().unwrap().execute("INSERT INTO profiles(tenant,bot,avatar_hash,avatar_uri) VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot) DO UPDATE SET avatar_hash=excluded.avatar_hash,avatar_uri=excluded.avatar_uri",params![tenant,bot,hash,uri])?;
@@ -290,6 +480,10 @@ impl Store {
                 continue;
             }
             let aad = crate::stable_id(&[tenant, &event.event_id]);
+            tx.execute(
+                "INSERT OR IGNORE INTO event_nonces VALUES(?1,?2,?3,?4)",
+                params![tenant, aad, event.event_id, event.room],
+            )?;
             let payload = self.encrypt(&aad, &serde_json::to_vec(event)?)?;
             tx.execute(
                 "INSERT OR IGNORE INTO inbox(tenant,event_id,room,payload) VALUES (?1,?2,?3,?4)",

@@ -15,20 +15,36 @@ that deployment. The personal Beachhead tenant is live with six agent chats;
 an owner message, assistant reply and restart without duplicate delivery were
 verified. The native user-service instructions below are for personal self-hosting.
 
-**Initial scope:** new text messages from the configured Beeper owner go to the
-agent's existing Rakazo thread. Completed bot text and questions return to Beeper.
-Existing text history is imported automatically, including chats connected before
-history support was installed. Messages sent
-through Rakazo's web interface are not echoed as the owner's Beeper messages.
+Text and supported attachments from the configured Beeper owner go to the
+agent's existing Rakazo thread. Completed replies, attachments and questions return
+to Beeper. New messages sent through Rakazo's web interface also appear in Beeper;
+messages that originated in Beeper reuse their original events instead of echoing.
+
+Quoted replies retain their targets. Agent replies to messages sent in a Beeper
+thread return to that thread, using the run ID returned by Rakazo. Threads still
+share the agent's Rakazo conversation and context. Quiet reactions support Rakazo's
+six emoji: 👍 👎 ❤️ 😂 🎉 😮. Adding a reaction does not start an agent run.
+
+Photos, GIFs, MP4 video and files use the authenticated artifact API and Matrix
+media repository. The bridge enforces a 10 MiB per-file limit and follows Rakazo's
+upload MIME allowlist. The current legacy allowlist accepts JPEG, PNG, WebP, GIF,
+MP4, PDF, text, Markdown, CSV, HTML, JSON and ZIP. Audio is rendered when received
+from Rakazo, but uploading audio from Beeper requires a Rakazo version whose upload
+allowlist accepts it. The bridge advertises supported formats and limits to Beeper.
+Invalid or unsupported incoming content produces a notice instead of blocking the
+queue. Encrypted attachment blobs are verified and decrypted; this does not add
+support for encrypted rooms.
 
 History uses Beeper's native batch backfill API, preserving original timestamps
 and attributing old prompts to the owner and replies to the agent. It imports all
 available text before the chat's saved initial baseline, one page per sync, without
 notifications or changing read markers. Durable progress and deterministic event
 IDs make retries and restarts safe. Imported prompts cannot trigger the agent.
-Attachments, tool output and internal reasoning are excluded, as with live messages.
-Homeservers without Beeper's batch API cannot import history; failures remain
-visible and retry without advancing the history cursor.
+History includes available attachments. An upgrade pass recovers existing event
+IDs and imports media omitted by older bridge versions without replaying their
+text. Old flattened reaction bubbles are preserved. Tool output and internal
+reasoning are excluded. Beeper's batch API is required for historical and live
+delivery; failures remain visible and retry without advancing the cursor.
 
 Agent profile pictures and chat icons follow Rakazo, including uploaded PNG,
 JPEG, WebP and GIF avatars and static PNGs of its generated mascots. The renderer
@@ -223,10 +239,12 @@ credentials. Deploy separate instances when a process isolation boundary is need
 - Each delivery checks authoritative room membership and encryption state. Rooms
   are private, non-federated, and grant the owner message-sending permission while
   reserving invites and state changes for the ghost.
-- Unsupported attachments, edits, and reactions produce warnings and are not
-  forwarded. Tool output and internal reasoning are not forwarded. Questions are
-  text only; approve agent actions in Rakazo. Rich cards and editing already-sent
-  messages are not synchronized. Failed agent runs are visible in Rakazo; there
+- Edits, message removals and reaction removals are not synchronized: changing
+  a Beeper message cannot undo what an agent already read or acted on. Clients
+  receive capability metadata disabling edits and removals. Unsupported operations
+  from other clients produce a notice. Send a new message to correct the agent.
+  Tool output and internal reasoning are not forwarded. Questions are
+  text only; approve agent actions in Rakazo. Rich cards are not synchronized. Failed agent runs are visible in Rakazo; there
   is no dedicated Beeper run-failure notification yet.
 - `/healthz` reports process liveness; `/readyz` checks recent successful sync and
   WebSocket connectivity; `/metrics` exposes aggregate readiness and queue depth.
