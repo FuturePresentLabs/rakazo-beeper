@@ -24,13 +24,16 @@ Quoted replies retain their targets. Agent replies to messages sent in a Beeper
 thread return to that thread, using the run ID returned by Rakazo. Threads still
 share the agent's Rakazo conversation and context. Quiet reactions support Rakazo's
 six emoji: 👍 👎 ❤️ 😂 🎉 😮. Adding a reaction does not start an agent run.
+If a reply targets source content that has no visible Beeper message, the reply
+is delivered without a quote; an emoji reply to that content remains text.
 
 Photos, GIFs, MP4 video and files use the authenticated artifact API and Matrix
 media repository. The bridge enforces a 10 MiB per-file limit and follows Rakazo's
 upload MIME allowlist. The current legacy allowlist accepts JPEG, PNG, WebP, GIF,
 MP4, PDF, text, Markdown, CSV, HTML, JSON and ZIP. Audio is rendered when received
 from Rakazo, but uploading audio from Beeper requires a Rakazo version whose upload
-allowlist accepts it. The FPL deployment includes the audio allowlist extension. Automatic transcription\nis not enabled. The bridge advertises supported formats and limits to Beeper.
+allowlist accepts it. The FPL deployment includes the audio allowlist extension. Automatic transcription
+is not enabled. The bridge advertises supported formats and limits to Beeper.
 Invalid or unsupported incoming content produces a notice instead of blocking the
 queue. Encrypted attachment blobs are verified and decrypted; this does not add
 support for encrypted rooms.
