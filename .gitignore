@@ -1,0 +1,9 @@
+/target/
+/config.toml
+/secrets/
+/data/
+*.db*
+*.lockfile
+.env
+registration*.json
+registration*.yaml
