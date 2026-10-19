@@ -7,6 +7,8 @@ license = "Apache-2.0"
 description = "Self-hosted and multi-tenant Rakazo to Beeper bridge"
 
 [dependencies]
+ammonia = "4.2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"

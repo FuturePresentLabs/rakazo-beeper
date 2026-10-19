@@ -27,6 +27,15 @@ six emoji: 👍 👎 ❤️ 😂 🎉 😮. Adding a reaction does not start an 
 If a reply targets source content that has no visible Beeper message, the reply
 is delivered without a quote; an emoji reply to that content remains text.
 
+Agent messages render Markdown as sanitized Matrix HTML: headings, emphasis,
+links, lists, quotes, tables and fenced code blocks. The original Markdown remains
+the plain-text fallback. Large messages split within the event size budget,
+preserving fenced code formatting and existing message identities. Existing
+imported text is retained without replay. External Markdown images become links.
+
+Rooms use normal timeline messaging permissions for Beeper iOS compatibility;
+invites, room state and moderation remain restricted to the bridge.
+
 Photos, GIFs, MP4 video and files use the authenticated artifact API and Matrix
 media repository. The bridge enforces a 10 MiB per-file limit and follows Rakazo's
 upload MIME allowlist. The current legacy allowlist accepts JPEG, PNG, WebP, GIF,

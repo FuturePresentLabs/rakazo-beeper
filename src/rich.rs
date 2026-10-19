@@ -424,11 +424,22 @@ impl TenantRuntime {
                 }]);
             }
         }
-        for (index, chunk) in text_chunks(&text, 40_000).into_iter().enumerate() {
+        for chunk in crate::markdown::chunks(&text) {
+            let key = format!("text:{}", chunk.source_index);
+            // An existing primary part belongs to the old immutable transcript.
+            // Never append formatting continuations to an already imported message.
+            if existing.iter().any(|link| link.part == key) {
+                continue;
+            }
+            let key = if chunk.continuation == 0 {
+                key
+            } else {
+                format!("{key}:{}", chunk.continuation)
+            };
             parts.push(Part {
-                key: format!("text:{index}"),
+                key,
                 kind: "m.room.message".into(),
-                content: json!({"msgtype":"m.text","body":chunk}),
+                content: chunk.content,
             });
         }
         for block in &message.blocks {

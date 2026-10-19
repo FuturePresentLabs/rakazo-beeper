@@ -188,7 +188,7 @@ impl Matrix {
             "visibility":"private", "preset":"private_chat", "invite":[owner],
             "creation_content":{"m.federate":false},
             "power_level_content_override":{
-                "users":{ghost:100,owner:0},"users_default":0,"events_default":100,"state_default":100,
+                "users":{ghost:100,owner:0},"users_default":0,"events_default":0,"state_default":100,
                 "invite":100,"kick":100,"ban":100,"redact":100,
                 "events":{"m.room.message":0,"m.reaction":0,"m.sticker":0,"m.room.encryption":100}
             },
@@ -439,8 +439,8 @@ impl Matrix {
         Ok(())
     }
 
-    /// Permit only the newly supported owner timeline events, preserving all
-    /// existing membership, state and moderation restrictions in old rooms.
+    /// Permit owner timeline events using the default checked by Beeper iOS,
+    /// preserving membership, state and moderation restrictions in old rooms.
     pub async fn rich_permissions(&self, binding: &crate::store::Binding) -> Result<()> {
         let path = [
             "rooms",
@@ -460,6 +460,12 @@ impl Matrix {
                 events.insert(kind.into(), json!(0));
                 changed = true;
             }
+        }
+        // Beeper iOS treats events_default as the messaging permission even when
+        // m.room.message has a lower explicit override. State uses state_default.
+        if levels["events_default"] != 0 {
+            levels["events_default"] = json!(0);
+            changed = true;
         }
         if changed {
             self.ok(Method::PUT, &path, &binding.ghost, Some(levels))

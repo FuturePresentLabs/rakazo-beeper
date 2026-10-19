@@ -1,5 +1,6 @@
 pub mod config;
 pub mod login;
+pub mod markdown;
 pub mod matrix;
 pub mod media;
 pub mod rakazo;

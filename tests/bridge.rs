@@ -1634,6 +1634,7 @@ async fn rich_permissions_upgrade_legacy_rooms_without_relaxing_state_or_members
     let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
     let before = {
         let mut remote = f.remote.lock().unwrap();
+        remote.power_levels["events_default"] = json!(100);
         remote.power_levels["events"]
             .as_object_mut()
             .unwrap()
@@ -1646,6 +1647,7 @@ async fn rich_permissions_upgrade_legacy_rooms_without_relaxing_state_or_members
     };
     f.runtime.matrix.rich_permissions(&binding).await.unwrap();
     let mut expected = before;
+    expected["events_default"] = json!(0);
     expected["events"]["m.reaction"] = json!(0);
     expected["events"]["m.sticker"] = json!(0);
     assert_eq!(f.remote.lock().unwrap().power_levels, expected);
@@ -1716,4 +1718,69 @@ async fn replies_to_unrendered_messages_do_not_stall_later_delivery() {
         assert_eq!(events.len(), 1);
         assert!(events[0]["content"]["m.relates_to"].is_null());
     }
+}
+
+#[tokio::test]
+async fn created_rooms_allow_mobile_messaging_without_granting_room_control() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    let levels = &remote.created_room.as_ref().unwrap()["power_level_content_override"];
+    assert_eq!(levels["events_default"], 0);
+    assert_eq!(levels["events"]["m.room.message"], 0);
+    assert_eq!(levels["state_default"], 100);
+    assert_eq!(levels["invite"], 100);
+    assert_eq!(levels["kick"], 100);
+    assert_eq!(levels["ban"], 100);
+    assert_eq!(levels["redact"], 100);
+    assert_eq!(levels["events"]["m.room.encryption"], 100);
+    assert_eq!(levels["users"]["@owner:beeper.com"], 0);
+}
+
+#[tokio::test]
+async fn markdown_history_uses_bounded_formatted_events_and_does_not_replay_old_text() {
+    let f = fixture().await;
+    let text = "`<&>` ".repeat(3000);
+    let source = message(0, "bot", &text);
+    f.remote.lock().unwrap().messages = vec![source.clone()];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let decoded = serde_json::from_value(source).unwrap();
+    let parts = f.runtime.message_parts(&binding, &decoded).await.unwrap();
+    assert!(parts.len() > 1);
+    assert_eq!(parts[0].key, "text:0");
+    assert_eq!(parts[1].key, "text:0:1");
+    assert_eq!(
+        parts
+            .iter()
+            .map(|p| p.content["body"].as_str().unwrap())
+            .collect::<String>(),
+        text
+    );
+    for part in &parts {
+        assert_eq!(part.content["format"], "org.matrix.custom.html");
+        assert!(serde_json::to_vec(&part.content).unwrap().len() <= 48_000);
+    }
+    f.runtime
+        .store
+        .link(
+            &binding,
+            &rakazo_beeper::store::MessageLink {
+                rakazo_id: "message-0".into(),
+                matrix_id: "$legacy".into(),
+                part: "text:0".into(),
+                role: "bot".into(),
+                kind: "m.room.message".into(),
+                hash: stable_id(&[&text]),
+            },
+        )
+        .unwrap();
+    assert!(
+        f.runtime
+            .message_parts(&binding, &decoded)
+            .await
+            .unwrap()
+            .is_empty(),
+        "formatting must not append duplicate continuations to old text"
+    );
 }
