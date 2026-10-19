@@ -170,6 +170,8 @@ async fn mock(
     if path.ends_with("/avatar_url")
         || path.contains("/state/m.room.avatar/")
         || path.contains("/state/m.room.name/")
+        || path.contains("/state/m.bridge/")
+        || path.contains("/state/uk.half-shot.bridge/")
     {
         if std::mem::take(&mut state.fail_profile) {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
@@ -321,16 +323,16 @@ async fn profile_pictures_sync_without_duplicate_uploads_and_retry_partial_updat
             .filter(|(path, _, _)| path.contains("/media/v3/upload"))
             .count()
     };
-    assert_eq!(uploads(), 1);
+    assert_eq!(uploads(), 2); // One bridge logo and one agent picture.
     let profile = f
         .runtime
         .store
         .profile("tenant-a", "agent-a")
         .unwrap()
         .unwrap();
-    assert_eq!(profile.avatar_uri, "mxc://beeper.local/avatar-1");
+    assert_eq!(profile.avatar_uri, "mxc://beeper.local/avatar-2");
     f.runtime.discover().await.unwrap();
-    assert_eq!(uploads(), 1);
+    assert_eq!(uploads(), 2);
     {
         let mut remote = f.remote.lock().unwrap();
         remote.bot_name = Some("Ada Lovelace".into());
@@ -340,19 +342,37 @@ async fn profile_pictures_sync_without_duplicate_uploads_and_retry_partial_updat
     f.runtime.discover().await.unwrap();
     assert_eq!(
         uploads(),
-        1,
+        2,
         "renames and profile retries reuse uploaded media"
     );
     f.remote.lock().unwrap().avatar_color = Some("#D9508A::shape_3".into());
     f.runtime.discover().await.unwrap();
-    assert_eq!(uploads(), 2);
+    assert_eq!(uploads(), 3);
     let state = f.remote.lock().unwrap();
+    for event_type in ["m.bridge", "uk.half-shot.bridge"] {
+        let (_, content, _) = state
+            .requests
+            .iter()
+            .rev()
+            .find(|(path, _, _)| path.contains(&format!("/state/{event_type}/")))
+            .unwrap();
+        assert_eq!(
+            content["protocol"]["avatar_url"],
+            "mxc://beeper.local/avatar-1"
+        );
+        assert_eq!(content["protocol"]["displayname"], "FPL Agents");
+        assert_eq!(
+            content["channel"]["avatar_url"],
+            "mxc://beeper.local/avatar-3"
+        );
+        assert_eq!(content["bridgebot"], "@sh-rakazobot:beeper.local");
+    }
     assert!(
         state
             .requests
             .iter()
             .any(|(path, body, _)| path.contains("/state/m.room.avatar/")
-                && body["url"] == "mxc://beeper.local/avatar-2")
+                && body["url"] == "mxc://beeper.local/avatar-3")
     );
     assert!(
         state

@@ -156,6 +156,7 @@ impl TenantRuntime {
         }
         let bots = self.rakazo.bots().await?;
         let avatar_style = self.rakazo.avatar_style().await?;
+        let bridge_logo = self.sync_bridge_identity().await?;
         let bindings = self.store.bindings(&self.config.id)?;
         for bot_id in &self.config.bot_ids {
             let bot = bots
@@ -163,7 +164,8 @@ impl TenantRuntime {
                 .find(|b| &b.id == bot_id)
                 .context("configured bot is not accessible in this Rakazo space")?;
             if let Some(binding) = bindings.iter().find(|b| b.bot == bot.id) {
-                self.sync_profile(binding, bot, &avatar_style).await?;
+                self.sync_profile(binding, bot, &avatar_style, &bridge_logo)
+                    .await?;
                 continue;
             }
             let snapshot = self.rakazo.snapshot(&bot.id).await?;
@@ -202,7 +204,8 @@ impl TenantRuntime {
                 .into_iter()
                 .find(|binding| binding.bot == bot.id)
                 .context("new binding missing")?;
-            self.sync_profile(&binding, bot, &avatar_style).await?;
+            self.sync_profile(&binding, bot, &avatar_style, &bridge_logo)
+                .await?;
             tracing::info!(tenant=%self.config.id,"provisioned agent chat");
         }
         self.initialized.store(true, Ordering::Relaxed);
@@ -214,9 +217,10 @@ impl TenantRuntime {
         binding: &Binding,
         bot: &crate::rakazo::Bot,
         style: &str,
+        bridge_logo: &str,
     ) -> Result<()> {
         let avatar_hash = stable_id(&["rakazo-avatar-v1", &bot.id, &bot.color, style]);
-        let applied_hash = stable_id(&[&avatar_hash, &bot.name]);
+        let applied_hash = stable_id(&[&avatar_hash, &bot.name, bridge_logo]);
         let cached = self.store.profile(&self.config.id, &bot.id)?;
         if cached
             .as_ref()
@@ -240,10 +244,44 @@ impl TenantRuntime {
         self.matrix
             .sync_profile(&binding.ghost, &binding.room, &bot.name, &avatar_uri)
             .await?;
+        self.matrix
+            .bridge_info(binding, &bot.name, bridge_logo, &avatar_uri)
+            .await?;
         self.store
             .applied_profile(&self.config.id, &bot.id, &applied_hash)?;
         tracing::info!(tenant=%self.config.id,"synced agent profile picture");
         Ok(())
+    }
+
+    async fn sync_bridge_identity(&self) -> Result<String> {
+        // Empty bot ID is reserved for tenant-level branding; configured bot IDs are nonempty.
+        let bytes = include_bytes!("../assets/fpl-logo.png");
+        let hash = stable_id(&["fpl-bridge-logo-v1", &hex::encode(bytes)]);
+        let cached = self.store.profile(&self.config.id, "")?;
+        let uri = if let Some(profile) = cached
+            .as_ref()
+            .filter(|profile| profile.avatar_hash == hash)
+        {
+            profile.avatar_uri.clone()
+        } else {
+            let uri = self
+                .matrix
+                .upload_avatar(
+                    &self.matrix.sender,
+                    crate::avatar::Avatar {
+                        mime: "image/png",
+                        bytes: bytes.to_vec(),
+                    },
+                )
+                .await?;
+            self.store.cache_avatar(&self.config.id, "", &hash, &uri)?;
+            uri
+        };
+        if !cached.is_some_and(|profile| profile.applied_hash == hash) {
+            self.matrix.bridge_identity(&uri).await?;
+            self.store.applied_profile(&self.config.id, "", &hash)?;
+        }
+        Ok(uri)
     }
 
     pub async fn deliver_inbound(&self) -> Result<()> {

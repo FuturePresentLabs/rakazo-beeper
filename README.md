@@ -32,6 +32,9 @@ uses Rakazo's geometry and palette with source-derived parity vectors; the API
 does not expose rendered mascot images. The bridge copies no external image URL.
 Changed pictures and names sync automatically. Uploaded media references and
 successful profile updates are cached per tenant and agent across restarts.
+The FPL logo identifies the bridge bot and protocol in Beeper; individual agent
+pictures remain the chat icons. The bundled logo is the existing FPL square mark
+from `waitlist/web/public/images/fpl_square.png`.
 
 **Current limitation:** agent rooms are intentionally unencrypted. End-to-bridge
 encryption is not implemented. Beeper's servers and the bridge operator can read

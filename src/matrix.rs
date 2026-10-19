@@ -287,6 +287,40 @@ impl Matrix {
         Ok(())
     }
 
+    pub async fn bridge_identity(&self, avatar: &str) -> Result<()> {
+        self.register(&self.sender, "FPL Agents").await?;
+        self.ok(
+            Method::PUT,
+            &["profile", &self.sender, "avatar_url"],
+            &self.sender,
+            Some(json!({"avatar_url":avatar})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// @implements github:mautrix/go@v0.28.1 bridgev2/portal.go UpdateBridgeInfo -- protocol icon in both bridge state event formats
+    pub async fn bridge_info(
+        &self,
+        binding: &crate::store::Binding,
+        name: &str,
+        logo: &str,
+        avatar: &str,
+    ) -> Result<()> {
+        let key = format!("rakazo://{}/{}", binding.tenant, binding.bot);
+        let content = json!({"bridgebot":self.sender,"creator":binding.ghost,"protocol":{"id":"rakazo","displayname":"FPL Agents","avatar_url":logo},"channel":{"id":binding.bot,"displayname":name,"avatar_url":avatar}});
+        for event_type in ["m.bridge", "uk.half-shot.bridge"] {
+            self.ok(
+                Method::PUT,
+                &["rooms", &binding.room, "state", event_type, &key],
+                &binding.ghost,
+                Some(content.clone()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Check authoritative state on every delivery, including after a restart.
     pub async fn check_room(&self, room: &str, ghost: &str, owner: &str) -> Result<()> {
         let state = self
