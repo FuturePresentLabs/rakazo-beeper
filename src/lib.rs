@@ -1,4 +1,5 @@
 pub mod config;
+pub mod login;
 pub mod matrix;
 pub mod rakazo;
 pub mod service;

@@ -17,7 +17,19 @@ use std::{
 pub struct Store {
     db: Mutex<Connection>,
     cipher: XChaCha20Poly1305,
-    _lock: File,
+    _lock: DatabaseLock,
+}
+
+struct DatabaseLock(File);
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        // Closing alone can leave flock held briefly by a concurrent fork
+        // before exec closes inherited descriptors. Release the owned lease
+        // explicitly, after SQLite (the first Store field) has closed.
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::error!(%error, "could not release database process lock");
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -60,6 +72,7 @@ impl Store {
         let lock = options.open(path.with_extension("lockfile"))?;
         lock.try_lock_exclusive()
             .context("another bridge process owns this database")?;
+        let lock = DatabaseLock(lock);
         // Create with restrictive permissions before SQLite opens WAL files.
         let _ = options.open(path)?;
         let db = Connection::open(path)?;

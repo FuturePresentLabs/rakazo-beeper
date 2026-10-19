@@ -31,6 +31,17 @@ enum Command {
     },
     /// Generate a random database encryption key. Save to your secret manager.
     GenerateKey,
+    /// Pair through FPL device approval and save a new Rakazo session privately.
+    Login {
+        #[arg(long, default_value = "https://agents.fpl.dev")]
+        rakazo_url: url::Url,
+        #[arg(long, default_value = "https://sso.fpl.dev")]
+        issuer: url::Url,
+        #[arg(long, default_value = "rakazo-beeper")]
+        client_id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -63,6 +74,15 @@ async fn run() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut key);
         println!("{}", STANDARD.encode(key));
         return Ok(());
+    }
+    if let Command::Login {
+        rakazo_url,
+        issuer,
+        client_id,
+        output,
+    } = &cli.command
+    {
+        return rakazo_beeper::login::login(rakazo_url, issuer, client_id, output).await;
     }
     let config = Config::load(&cli.config)?;
     // Read-only commands do not acquire the database lock or create database state.

@@ -65,10 +65,23 @@ Node, Python, bridge framework, or proxy process is required to run this service
    export RAKAZO_PERSONAL_TOKEN_FILE="$PWD/secrets/rakazo-token"
    ```
 
+   For an issuer enrolled for device authorization, obtain a dedicated session:
+
+   ```sh
+   target/release/rakazo-beeper login --output secrets/rakazo-token
+   ```
+
+   Open the displayed FPL verification URL, enter the code, and approve the
+   named Rakazo login. The Rust client completes Rakazo's existing OIDC flow,
+   preserving state, nonce, and S256 PKCE, then saves its new session atomically
+   with mode 0600. It reads no browser cookies. Its temporary issuer credential
+   stays at the issuer and is discarded after login. No FPL refresh credential
+   is stored. Issuer enrollment is described in the shared-infra deployment.
+
    The token is a Better Auth session for this Rakazo installation, not a model
    API key, FPL OIDC access token, or Beeper access token. Use a dedicated session;
-   expired/revoked sessions fail visibly and delivery remains queued. Automatic
-   OAuth enrollment and refresh are future work. Each configured secret env name
+   expired/revoked sessions fail visibly and delivery remains queued. Run login
+   again and restart the service to replace a revoked session. Each configured secret env name
    accepts either its direct value or a corresponding `*_FILE` variable, never
    both. Secret files must be owner-readable only on Unix.
 
