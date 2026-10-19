@@ -50,6 +50,7 @@ struct Remote {
     fail_matrix_send: bool,
     fail_create: bool,
     created_room: Option<Value>,
+    power_levels: Value,
     rakazo_nonces: HashSet<String>,
     matrix_transactions: HashMap<String, String>,
     incoming_events: HashMap<String, Value>,
@@ -319,6 +320,12 @@ async fn mock(
         }
         return ok(json!({}));
     }
+    if path.contains("/state/m.room.power_levels/") {
+        if method == Method::PUT {
+            state.power_levels = input;
+        }
+        return ok(state.power_levels.clone());
+    }
     if path.ends_with("/joined_rooms") {
         return ok(
             json!({"joined_rooms":if state.created_room.is_some(){vec!["!agent-a:beeper.local"]}else{vec![]}}),
@@ -345,6 +352,9 @@ async fn mock(
                 .all(|e| e["type"] != "m.room.encryption")
         );
         assert!(input.get("room_alias_name").is_none());
+        state.power_levels = input["power_level_content_override"].clone();
+        assert_eq!(state.power_levels["events"]["m.reaction"], 0);
+        assert_eq!(state.power_levels["events"]["m.sticker"], 0);
         state.created_room = Some(input.clone());
         if std::mem::take(&mut state.fail_create) {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
@@ -1615,4 +1625,36 @@ async fn native_beeper_websocket_commits_before_acknowledging() {
             .is_err()
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn rich_permissions_upgrade_legacy_rooms_without_relaxing_state_or_membership() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let before = {
+        let mut remote = f.remote.lock().unwrap();
+        remote.power_levels["events"]
+            .as_object_mut()
+            .unwrap()
+            .remove("m.reaction");
+        remote.power_levels["events"]
+            .as_object_mut()
+            .unwrap()
+            .remove("m.sticker");
+        remote.power_levels.clone()
+    };
+    f.runtime.matrix.rich_permissions(&binding).await.unwrap();
+    let mut expected = before;
+    expected["events"]["m.reaction"] = json!(0);
+    expected["events"]["m.sticker"] = json!(0);
+    assert_eq!(f.remote.lock().unwrap().power_levels, expected);
+    let requests = f.remote.lock().unwrap().requests.len();
+    f.runtime.matrix.rich_permissions(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(
+        remote.requests.len(),
+        requests + 1,
+        "unchanged permissions need only a GET"
+    );
 }

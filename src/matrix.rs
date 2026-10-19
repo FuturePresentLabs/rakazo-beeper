@@ -190,7 +190,7 @@ impl Matrix {
             "power_level_content_override":{
                 "users":{ghost:100,owner:0},"users_default":0,"events_default":100,"state_default":100,
                 "invite":100,"kick":100,"ban":100,"redact":100,
-                "events":{"m.room.message":0,"m.room.encryption":100}
+                "events":{"m.room.message":0,"m.reaction":0,"m.sticker":0,"m.room.encryption":100}
             },
             "initial_state":[
                 {"type":"m.room.history_visibility","state_key":"","content":{"history_visibility":"joined"}},
@@ -436,6 +436,35 @@ impl Matrix {
             Some(json!({})),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Permit only the newly supported owner timeline events, preserving all
+    /// existing membership, state and moderation restrictions in old rooms.
+    pub async fn rich_permissions(&self, binding: &crate::store::Binding) -> Result<()> {
+        let path = [
+            "rooms",
+            binding.room.as_str(),
+            "state",
+            "m.room.power_levels",
+            "",
+        ];
+        let mut levels = self.ok(Method::GET, &path, &binding.ghost, None).await?;
+        let events = levels
+            .get_mut("events")
+            .and_then(Value::as_object_mut)
+            .context("managed room power levels missing event restrictions")?;
+        let mut changed = false;
+        for kind in ["m.reaction", "m.sticker"] {
+            if events.get(kind) != Some(&json!(0)) {
+                events.insert(kind.into(), json!(0));
+                changed = true;
+            }
+        }
+        if changed {
+            self.ok(Method::PUT, &path, &binding.ghost, Some(levels))
+                .await?;
+        }
         Ok(())
     }
 

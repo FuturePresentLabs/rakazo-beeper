@@ -254,6 +254,7 @@ impl TenantRuntime {
         self.matrix
             .bridge_info(binding, &bot.name, bridge_logo, &avatar_uri)
             .await?;
+        self.matrix.rich_permissions(binding).await?;
         self.matrix.room_features(binding, features.clone()).await?;
         self.store
             .applied_profile(&self.config.id, &bot.id, &applied_hash)?;
