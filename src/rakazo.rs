@@ -52,10 +52,12 @@ pub struct Snapshot {
 }
 impl Snapshot {
     pub fn busy(&self) -> bool {
-        self.run
-            .iter()
-            .chain(self.active_runs.iter())
-            .any(|r| matches!(r["status"].as_str(), Some("queued" | "running" | "pending")))
+        self.run.iter().chain(self.active_runs.iter()).any(|r| {
+            !matches!(
+                r["status"].as_str(),
+                Some("completed" | "failed" | "cancelled" | "waiting_input" | "waiting_takeover")
+            )
+        })
     }
 }
 

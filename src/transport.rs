@@ -163,7 +163,8 @@ pub async fn websocket_session(tenant: Arc<TenantRuntime>) -> Result<()> {
                     Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await?,
                     Message::Pong(_) => {},
                     Message::Close(close) => {
-                        if close.as_ref().is_some_and(|c| u16::from(c.code) == 4001) {
+                        if close.as_ref().is_some_and(|c| u16::from(c.code) == 4001
+                            || serde_json::from_str::<Value>(&c.reason).ok().is_some_and(|reason| reason["status"] == "conn_replaced")) {
                             return Err(ConnectionReplaced.into());
                         }
                         bail!("Beeper websocket closed");

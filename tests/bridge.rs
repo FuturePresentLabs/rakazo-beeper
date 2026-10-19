@@ -429,11 +429,81 @@ async fn strangers_ghost_echoes_unknown_rooms_and_disabled_bots_cannot_trigger_a
 }
 
 #[tokio::test]
+async fn cli_accepts_private_secret_files_and_rejects_ambiguous_credentials() {
+    let f = fixture().await;
+    let root = f._temp.path();
+    let token_path = root.join("rakazo-token");
+    std::fs::write(&token_path, "test-rakazo-session\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let config_path = root.join("config.toml");
+    let value = json!({"database":"data/bridge.db","encryption_key_env":"BRIDGE_TEST_KEY","tenants":[{
+        "id":"tenant-a","owner":f.runtime.config.owner,"registration":"registration.json",
+        "homeserver":f.runtime.config.homeserver,"rakazo_url":f.runtime.config.rakazo_url,
+        "rakazo_token_env":"BRIDGE_TEST_TOKEN","rakazo_space_id":"space-a","bot_ids":["agent-a"],"websocket":false
+    }]});
+    std::fs::write(&config_path, toml::to_string(&value).unwrap()).unwrap();
+    let output = tokio::task::spawn_blocking({
+        let config_path = config_path.clone();
+        let token_path = token_path.clone();
+        move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_rakazo-beeper"))
+                .args(["--config", config_path.to_str().unwrap(), "check"])
+                .env_remove("BRIDGE_TEST_TOKEN")
+                .env_remove("BRIDGE_TEST_KEY_FILE")
+                .env("BRIDGE_TEST_TOKEN_FILE", token_path)
+                .env("BRIDGE_TEST_KEY", key())
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join("data/bridge.db").exists());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rakazo-beeper"))
+        .args(["--config", config_path.to_str().unwrap(), "check"])
+        .env("BRIDGE_TEST_TOKEN", "another-token")
+        .env("BRIDGE_TEST_TOKEN_FILE", &token_path)
+        .env("BRIDGE_TEST_KEY", key())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("set only one"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rakazo-beeper"))
+            .args(["--config", config_path.to_str().unwrap(), "check"])
+            .env_remove("BRIDGE_TEST_TOKEN")
+            .env("BRIDGE_TEST_TOKEN_FILE", &token_path)
+            .env("BRIDGE_TEST_KEY", key())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("accessible only to its owner"));
+    }
+}
+
+#[tokio::test]
 async fn http_requires_tenant_specific_homeserver_token_and_does_not_ack_invalid_payloads() {
     let f = fixture().await;
     f.runtime.discover().await.unwrap();
+    let mut other = fixture().await;
+    let other_runtime = Arc::get_mut(&mut other.runtime).unwrap();
+    other_runtime.config.id = "tenant-b".into();
+    other_runtime.hs_token = "different-tenant-homeserver-token".into();
+    other.runtime.discover().await.unwrap();
     let app = transport::router(Arc::new(Runtime {
-        tenants: vec![f.runtime.clone()],
+        tenants: vec![f.runtime.clone(), other.runtime.clone()],
         poll_seconds: 5,
         store: f.runtime.store.clone(),
     }));
@@ -561,6 +631,26 @@ fn chunking_preserves_unicode_and_identifiers_cannot_collide_by_concatenation() 
         stable_id(&["tenant-a", "bot"]),
         stable_id(&["tenant-b", "bot"])
     );
+}
+
+#[test]
+fn thread_run_states_keep_leased_and_unknown_runs_out_of_the_transcript() {
+    for status in ["queued", "leased", "running", "unknown-future-state"] {
+        let snapshot: rakazo_beeper::rakazo::Snapshot =
+            serde_json::from_value(json!({"messages":[],"run":{"status":status}})).unwrap();
+        assert!(snapshot.busy(), "{status}");
+    }
+    for status in [
+        "completed",
+        "failed",
+        "cancelled",
+        "waiting_input",
+        "waiting_takeover",
+    ] {
+        let snapshot: rakazo_beeper::rakazo::Snapshot =
+            serde_json::from_value(json!({"messages":[],"run":{"status":status}})).unwrap();
+        assert!(!snapshot.busy(), "{status}");
+    }
 }
 
 #[tokio::test]
