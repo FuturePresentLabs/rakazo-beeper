@@ -12,8 +12,8 @@ FPL's Beachhead Shroud deployment is owned by
 [shared-infra](https://github.com/FuturePresentLabs/shared-infra/tree/deploy/rakazo-beeper/projects/rakazo-beeper).
 The source-owned `.fab/pipelines.json` publishes the immutable rootfs consumed by
 that deployment. The personal Beachhead tenant is live with six agent chats;
-an owner message, assistant reply and restart without duplicate delivery were
-verified. The native user-service instructions below are for personal self-hosting.
+text, attachments, audio files, quiet tapbacks, quoted replies, thread routing
+and restart without duplicate delivery were verified. The native user-service instructions below are for personal self-hosting.
 
 Text and supported attachments from the configured Beeper owner go to the
 agent's existing Rakazo thread. Completed replies, attachments and questions return
@@ -30,7 +30,7 @@ media repository. The bridge enforces a 10 MiB per-file limit and follows Rakazo
 upload MIME allowlist. The current legacy allowlist accepts JPEG, PNG, WebP, GIF,
 MP4, PDF, text, Markdown, CSV, HTML, JSON and ZIP. Audio is rendered when received
 from Rakazo, but uploading audio from Beeper requires a Rakazo version whose upload
-allowlist accepts it. The bridge advertises supported formats and limits to Beeper.
+allowlist accepts it. The FPL deployment includes the audio allowlist extension. Automatic transcription\nis not enabled. The bridge advertises supported formats and limits to Beeper.
 Invalid or unsupported incoming content produces a notice instead of blocking the
 queue. Encrypted attachment blobs are verified and decrypted; this does not add
 support for encrypted rooms.
