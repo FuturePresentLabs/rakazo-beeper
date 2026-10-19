@@ -17,6 +17,8 @@ pub struct Rakazo {
 pub struct Bot {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub color: String,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +118,17 @@ impl Rakazo {
     /// @see github:elie222/rakazo@535de9600bdd90530aa7cd954bf2d29b4a083aaf packages/contracts/src/rpc.ts
     pub async fn bots(&self) -> Result<Vec<Bot>> {
         self.rpc(&["bots", "list"], Value::Null).await
+    }
+    pub async fn avatar_style(&self) -> Result<String> {
+        let me: Value = self.rpc(&["me"], Value::Null).await?;
+        let style = me["avatarStyle"]
+            .as_str()
+            .context("Rakazo avatar style missing")?;
+        ensure!(
+            matches!(style, "organic" | "robot"),
+            "unknown Rakazo avatar style"
+        );
+        Ok(style.to_string())
     }
     pub async fn snapshot(&self, bot: &str) -> Result<Snapshot> {
         self.rpc(&["threads", "get"], json!({"botId": bot})).await

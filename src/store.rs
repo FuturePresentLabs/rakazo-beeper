@@ -39,6 +39,11 @@ pub struct Binding {
     pub ghost: String,
     pub cursor: i64,
 }
+pub struct Profile {
+    pub avatar_hash: String,
+    pub avatar_uri: String,
+    pub applied_hash: String,
+}
 #[derive(Serialize, Deserialize)]
 pub struct Inbound {
     pub event_id: String,
@@ -84,6 +89,7 @@ impl Store {
               tenant TEXT NOT NULL, bot TEXT NOT NULL, room TEXT NOT NULL, ghost TEXT NOT NULL, cursor INTEGER NOT NULL,
               PRIMARY KEY(tenant,bot), UNIQUE(tenant,room));
             CREATE TABLE IF NOT EXISTS provisions (tenant TEXT NOT NULL, bot TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY(tenant,bot));
+            CREATE TABLE IF NOT EXISTS profiles (tenant TEXT NOT NULL, bot TEXT NOT NULL, avatar_hash TEXT NOT NULL, avatar_uri TEXT NOT NULL, applied_hash TEXT NOT NULL DEFAULT '', PRIMARY KEY(tenant,bot));
             CREATE TABLE IF NOT EXISTS transactions (tenant TEXT NOT NULL, txn TEXT NOT NULL, PRIMARY KEY(tenant,txn));
             CREATE TABLE IF NOT EXISTS inbox (
               id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, event_id TEXT NOT NULL, room TEXT NOT NULL,
@@ -120,6 +126,20 @@ impl Store {
         Ok(store)
     }
 
+    pub fn profile(&self, tenant: &str, bot: &str) -> Result<Option<Profile>> {
+        Ok(self.db.lock().unwrap().query_row("SELECT avatar_hash,avatar_uri,applied_hash FROM profiles WHERE tenant=?1 AND bot=?2", params![tenant,bot], |row| Ok(Profile {avatar_hash:row.get(0)?,avatar_uri:row.get(1)?,applied_hash:row.get(2)?})).optional()?)
+    }
+    pub fn cache_avatar(&self, tenant: &str, bot: &str, hash: &str, uri: &str) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO profiles(tenant,bot,avatar_hash,avatar_uri) VALUES(?1,?2,?3,?4) ON CONFLICT(tenant,bot) DO UPDATE SET avatar_hash=excluded.avatar_hash,avatar_uri=excluded.avatar_uri",params![tenant,bot,hash,uri])?;
+        Ok(())
+    }
+    pub fn applied_profile(&self, tenant: &str, bot: &str, hash: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE profiles SET applied_hash=?3 WHERE tenant=?1 AND bot=?2",
+            params![tenant, bot, hash],
+        )?;
+        Ok(())
+    }
     fn encrypt(&self, aad: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; 24];
         rand::thread_rng().fill_bytes(&mut nonce);

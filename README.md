@@ -7,13 +7,21 @@ operator-configured multi-tenant instance. Beeper Desktop does not have to stay 
 FPL's Beachhead Shroud deployment is owned by
 [shared-infra](https://github.com/FuturePresentLabs/shared-infra/tree/deploy/rakazo-beeper/projects/rakazo-beeper).
 The source-owned `.fab/pipelines.json` publishes the immutable rootfs consumed by
-that deployment. Beachhead enrollment and live conversation qualification remain
-pending; the native user-service instructions below are for personal self-hosting.
+that deployment. The personal Beachhead tenant is live with six agent chats;
+an owner message, assistant reply and restart without duplicate delivery were
+verified. The native user-service instructions below are for personal self-hosting.
 
 **Initial scope:** new text messages from the configured Beeper owner go to the
 agent's existing Rakazo thread. Completed bot text and questions return to Beeper.
 Existing history stays in Rakazo when an agent is first connected. Messages sent
 through Rakazo's web interface are not echoed as the owner's Beeper messages.
+
+Agent profile pictures and chat icons follow Rakazo, including uploaded PNG,
+JPEG, WebP and GIF avatars and static PNGs of its generated mascots. The renderer
+uses Rakazo's geometry and palette with source-derived parity vectors; the API
+does not expose rendered mascot images. The bridge copies no external image URL.
+Changed pictures and names sync automatically. Uploaded media references and
+successful profile updates are cached per tenant and agent across restarts.
 
 **Current limitation:** agent rooms are intentionally unencrypted. End-to-bridge
 encryption is not implemented. Beeper's servers and the bridge operator can read

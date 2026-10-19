@@ -155,13 +155,15 @@ impl TenantRuntime {
             return Ok(());
         }
         let bots = self.rakazo.bots().await?;
+        let avatar_style = self.rakazo.avatar_style().await?;
         let bindings = self.store.bindings(&self.config.id)?;
         for bot_id in &self.config.bot_ids {
             let bot = bots
                 .iter()
                 .find(|b| &b.id == bot_id)
                 .context("configured bot is not accessible in this Rakazo space")?;
-            if bindings.iter().any(|b| b.bot == bot.id) {
+            if let Some(binding) = bindings.iter().find(|b| b.bot == bot.id) {
+                self.sync_profile(binding, bot, &avatar_style).await?;
                 continue;
             }
             let snapshot = self.rakazo.snapshot(&bot.id).await?;
@@ -194,9 +196,53 @@ impl TenantRuntime {
                 ghost,
                 cursor,
             })?;
+            let binding = self
+                .store
+                .bindings(&self.config.id)?
+                .into_iter()
+                .find(|binding| binding.bot == bot.id)
+                .context("new binding missing")?;
+            self.sync_profile(&binding, bot, &avatar_style).await?;
             tracing::info!(tenant=%self.config.id,"provisioned agent chat");
         }
         self.initialized.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn sync_profile(
+        &self,
+        binding: &Binding,
+        bot: &crate::rakazo::Bot,
+        style: &str,
+    ) -> Result<()> {
+        let avatar_hash = stable_id(&["rakazo-avatar-v1", &bot.id, &bot.color, style]);
+        let applied_hash = stable_id(&[&avatar_hash, &bot.name]);
+        let cached = self.store.profile(&self.config.id, &bot.id)?;
+        if cached
+            .as_ref()
+            .is_some_and(|profile| profile.applied_hash == applied_hash)
+        {
+            return Ok(());
+        }
+        self.matrix
+            .check_room(&binding.room, &binding.ghost, &self.config.owner)
+            .await?;
+        let avatar_uri =
+            if let Some(profile) = cached.filter(|profile| profile.avatar_hash == avatar_hash) {
+                profile.avatar_uri
+            } else {
+                let avatar = crate::avatar::render(&bot.id, &bot.color, style)?;
+                let uri = self.matrix.upload_avatar(&binding.ghost, avatar).await?;
+                self.store
+                    .cache_avatar(&self.config.id, &bot.id, &avatar_hash, &uri)?;
+                uri
+            };
+        self.matrix
+            .sync_profile(&binding.ghost, &binding.room, &bot.name, &avatar_uri)
+            .await?;
+        self.store
+            .applied_profile(&self.config.id, &bot.id, &applied_hash)?;
+        tracing::info!(tenant=%self.config.id,"synced agent profile picture");
         Ok(())
     }
 

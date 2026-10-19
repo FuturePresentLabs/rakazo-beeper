@@ -32,6 +32,9 @@ fn key() -> String {
 
 #[derive(Default)]
 struct Remote {
+    avatar_color: Option<String>,
+    bot_name: Option<String>,
+    fail_profile: bool,
     requests: Vec<(String, Value, HeaderMap)>,
     messages: Vec<Value>,
     busy: bool,
@@ -53,7 +56,11 @@ async fn mock(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
-    let input: Value = if body.is_empty() {
+    let input: Value = if uri.path().contains("/media/v3/upload") {
+        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(headers["content-type"], "image/png");
+        json!({"bytes":body.len()})
+    } else if body.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&body).unwrap()
@@ -70,9 +77,10 @@ async fn mock(
         assert!(input.get("json").is_some());
         let args = &input["json"];
         return match path.as_str() {
-            "/rpc/bots/list" => {
-                ok(json!({"json":[{"id":"agent-a","name":"Ada"},{"id":"agent-b","name":"Grace"}]}))
-            }
+            "/rpc/bots/list" => ok(
+                json!({"json":[{"id":"agent-a","name":state.bot_name.as_deref().unwrap_or("Ada"),"color":state.avatar_color.as_deref().unwrap_or("#3EC5A8")},{"id":"agent-b","name":"Grace","color":"#9B5CF6"}]}),
+            ),
+            "/rpc/me" => ok(json!({"json":{"avatarStyle":"organic"}})),
             "/rpc/threads/get" => {
                 let latest = state
                     .messages
@@ -126,6 +134,23 @@ async fn mock(
         return ok(json!({"user_id":"@ghost:beeper.local"}));
     }
     if path.ends_with("/displayname") {
+        return ok(json!({}));
+    }
+    if path.ends_with("/media/v3/upload") {
+        let count = state
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+            .count();
+        return ok(json!({"content_uri":format!("mxc://beeper.local/avatar-{count}")}));
+    }
+    if path.ends_with("/avatar_url")
+        || path.contains("/state/m.room.avatar/")
+        || path.contains("/state/m.room.name/")
+    {
+        if std::mem::take(&mut state.fail_profile) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+        }
         return ok(json!({}));
     }
     if path.ends_with("/joined_rooms") {
@@ -258,6 +283,75 @@ fn message(seq: i64, role: &str, text: &str) -> Value {
 }
 fn event(id: &str, sender: &str) -> Value {
     json!({"event_id":id,"room_id":"!agent-a:beeper.local","sender":sender,"type":"m.room.message","content":{"msgtype":"m.text","body":"Hello Ada"}})
+}
+
+#[tokio::test]
+async fn profile_pictures_sync_without_duplicate_uploads_and_retry_partial_updates() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let uploads = || {
+        f.remote
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+            .count()
+    };
+    assert_eq!(uploads(), 1);
+    let profile = f
+        .runtime
+        .store
+        .profile("tenant-a", "agent-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(profile.avatar_uri, "mxc://beeper.local/avatar-1");
+    f.runtime.discover().await.unwrap();
+    assert_eq!(uploads(), 1);
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.bot_name = Some("Ada Lovelace".into());
+        remote.fail_profile = true;
+    }
+    assert!(f.runtime.discover().await.is_err());
+    f.runtime.discover().await.unwrap();
+    assert_eq!(
+        uploads(),
+        1,
+        "renames and profile retries reuse uploaded media"
+    );
+    f.remote.lock().unwrap().avatar_color = Some("#D9508A::shape_3".into());
+    f.runtime.discover().await.unwrap();
+    assert_eq!(uploads(), 2);
+    let state = f.remote.lock().unwrap();
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|(path, body, _)| path.contains("/state/m.room.avatar/")
+                && body["url"] == "mxc://beeper.local/avatar-2")
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|(path, body, _)| path.contains("/state/m.room.name/")
+                && body["name"] == "Ada Lovelace · Rakazo")
+    );
+    let profile = f
+        .runtime
+        .store
+        .profile("tenant-a", "agent-a")
+        .unwrap()
+        .unwrap();
+    assert!(!profile.applied_hash.is_empty());
+    assert!(
+        f.runtime
+            .store
+            .profile("another-tenant", "agent-a")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -576,6 +670,10 @@ fn queue_survives_restart_is_encrypted_and_tenant_scoped() {
     {
         let store = Store::open(&path, &key()).unwrap();
         store.bind_tenant("a", "identity-a").unwrap();
+        store
+            .cache_avatar("a", "agent", "avatar-hash", "mxc://beeper.local/picture")
+            .unwrap();
+        store.applied_profile("a", "agent", "profile-hash").unwrap();
         assert!(store.bind_tenant("a", "identity-b").is_err());
         store.ingest("a", "same-txn", &[event]).unwrap();
         store
@@ -605,6 +703,10 @@ fn queue_survives_restart_is_encrypted_and_tenant_scoped() {
     );
     assert!(Store::open(&path, &STANDARD.encode([7; 32])).is_err());
     let store = Store::open(&path, &key()).unwrap();
+    let profile = store.profile("a", "agent").unwrap().unwrap();
+    assert_eq!(profile.avatar_uri, "mxc://beeper.local/picture");
+    assert_eq!(profile.applied_hash, "profile-hash");
+    assert!(store.profile("b", "agent").unwrap().is_none());
     assert_eq!(store.pending_count().unwrap(), 2);
     let pending = store.next("a", 0).unwrap().unwrap();
     store.retry("a", pending.id, 0, 10).unwrap();

@@ -206,6 +206,87 @@ impl Matrix {
             .to_string())
     }
 
+    /// @implements url:https://spec.matrix.org/v1.16/client-server-api/ §Content repository, §Profiles, §m.room.avatar
+    pub async fn upload_avatar(&self, user: &str, avatar: crate::avatar::Avatar) -> Result<String> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Matrix base URL"))?
+            .pop_if_empty()
+            .extend(["_matrix", "media", "v3", "upload"]);
+        url.query_pairs_mut()
+            .append_pair("user_id", user)
+            .append_pair("filename", "avatar");
+        let response = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, self.token.clone())
+            .header(reqwest::header::CONTENT_TYPE, avatar.mime)
+            .body(avatar.bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Matrix avatar upload failed: {}", error.without_url())
+            })?;
+        ensure!(
+            response.status().is_success(),
+            "Matrix avatar upload returned HTTP {}",
+            response.status()
+        );
+        let result: Value = response.json().await?;
+        let uri = result["content_uri"]
+            .as_str()
+            .context("Matrix upload missing content_uri")?;
+        let parsed = Url::parse(uri)?;
+        ensure!(
+            parsed.scheme() == "mxc"
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "Matrix upload returned invalid media URI"
+        );
+        Ok(uri.to_string())
+    }
+
+    pub async fn sync_profile(
+        &self,
+        user: &str,
+        room: &str,
+        name: &str,
+        avatar: &str,
+    ) -> Result<()> {
+        self.ok(
+            Method::PUT,
+            &["profile", user, "displayname"],
+            user,
+            Some(json!({"displayname":name})),
+        )
+        .await?;
+        self.ok(
+            Method::PUT,
+            &["profile", user, "avatar_url"],
+            user,
+            Some(json!({"avatar_url":avatar})),
+        )
+        .await?;
+        self.ok(
+            Method::PUT,
+            &["rooms", room, "state", "m.room.avatar", ""],
+            user,
+            Some(json!({"url":avatar})),
+        )
+        .await?;
+        self.ok(
+            Method::PUT,
+            &["rooms", room, "state", "m.room.name", ""],
+            user,
+            Some(json!({"name":format!("{name} · Rakazo")})),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Check authoritative state on every delivery, including after a restart.
     pub async fn check_room(&self, room: &str, ghost: &str, owner: &str) -> Result<()> {
         let state = self

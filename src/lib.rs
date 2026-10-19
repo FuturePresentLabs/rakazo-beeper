@@ -17,3 +17,4 @@ pub fn stable_id(parts: &[&str]) -> String {
     }
     hex::encode(hash.finalize())
 }
+pub mod avatar;
