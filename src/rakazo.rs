@@ -27,6 +27,8 @@ pub struct Message {
     pub seq: i64,
     pub role: String,
     pub blocks: Vec<Value>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 impl Message {
     pub fn text(&self) -> String {
@@ -141,6 +143,25 @@ impl Rakazo {
             )
             .await?;
         Ok(())
+    }
+    pub async fn history_page(&self, bot: &str, before: i64) -> Result<Page> {
+        let page: Page = self
+            .rpc(
+                &["threads", "messages"],
+                json!({"botId":bot,"before":before}),
+            )
+            .await?;
+        ensure!(
+            page.messages.iter().all(|message| message.seq < before),
+            "Rakazo history crossed its frozen boundary"
+        );
+        if let Some(next) = page.older_cursor {
+            ensure!(
+                next < before && page.messages.iter().all(|message| message.seq >= next),
+                "Rakazo history pagination did not progress"
+            );
+        }
+        Ok(page)
     }
     /// Paginate backwards to the committed message sequence; never advance across a gap.
     pub async fn after(&self, bot: &str, seq: i64) -> Result<Vec<Message>> {

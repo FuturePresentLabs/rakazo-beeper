@@ -13,8 +13,18 @@ verified. The native user-service instructions below are for personal self-hosti
 
 **Initial scope:** new text messages from the configured Beeper owner go to the
 agent's existing Rakazo thread. Completed bot text and questions return to Beeper.
-Existing history stays in Rakazo when an agent is first connected. Messages sent
+Existing text history is imported automatically, including chats connected before
+history support was installed. Messages sent
 through Rakazo's web interface are not echoed as the owner's Beeper messages.
+
+History uses Beeper's native batch backfill API, preserving original timestamps
+and attributing old prompts to the owner and replies to the agent. It imports all
+available text before the chat's saved initial baseline, one page per sync, without
+notifications or changing read markers. Durable progress and deterministic event
+IDs make retries and restarts safe. Imported prompts cannot trigger the agent.
+Attachments, tool output and internal reasoning are excluded, as with live messages.
+Homeservers without Beeper's batch API cannot import history; failures remain
+visible and retry without advancing the history cursor.
 
 Agent profile pictures and chat icons follow Rakazo, including uploaded PNG,
 JPEG, WebP and GIF avatars and static PNGs of its generated mascots. The renderer

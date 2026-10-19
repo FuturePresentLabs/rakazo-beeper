@@ -320,6 +320,64 @@ impl TenantRuntime {
         Ok(())
     }
 
+    pub async fn backfill_binding(&self, binding: &Binding) -> Result<()> {
+        let Some(before) = self.store.history_before(binding)? else {
+            return Ok(());
+        };
+        let mut page = self.rakazo.history_page(&binding.bot, before).await?;
+        page.messages.sort_by_key(|message| message.seq);
+        page.messages.dedup_by_key(|message| message.seq);
+        let mut events = Vec::new();
+        for message in page.messages {
+            let sender = match message.role.as_str() {
+                "user" => &self.config.owner,
+                "bot" => &binding.ghost,
+                _ => continue,
+            };
+            let text = message.text();
+            if text.is_empty() {
+                continue;
+            }
+            let timestamp = chrono::DateTime::parse_from_rfc3339(
+                message
+                    .created_at
+                    .as_deref()
+                    .context("historical message missing createdAt")?,
+            )?
+            .timestamp_millis();
+            ensure!(timestamp > 0, "historical message has invalid timestamp");
+            for (index, chunk) in text_chunks(&text, 40_000).into_iter().enumerate() {
+                let id = format!(
+                    "${}:{}",
+                    stable_id(&[
+                        "history-v1",
+                        &binding.tenant,
+                        &binding.bot,
+                        &binding.room,
+                        &message.id,
+                        &index.to_string()
+                    ]),
+                    self.matrix.domain
+                );
+                events.push(serde_json::json!({"event_id":id,"room_id":binding.room,"sender":sender,"type":"m.room.message","origin_server_ts":timestamp,"content":{"msgtype":"m.text","body":chunk}}));
+            }
+        }
+        if !events.is_empty() {
+            self.matrix
+                .check_room(&binding.room, &binding.ghost, &self.config.owner)
+                .await?;
+            let ids = events
+                .iter()
+                .map(|event| event["event_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            self.store.reserve_history(&self.config.id, &ids)?;
+            self.matrix.backfill(&binding.room, events).await?;
+            tracing::info!(tenant=%self.config.id,events=ids.len(),"imported conversation history page");
+        }
+        self.store.history_progress(binding, page.older_cursor)?;
+        Ok(())
+    }
+
     pub async fn tick(&self) -> Result<()> {
         // A failing agent must not starve other agents or inbound delivery.
         let mut failure = None;
@@ -335,6 +393,10 @@ impl TenantRuntime {
             .iter()
             .filter(|b| self.config.bot_ids.contains(&b.bot))
         {
+            if let Err(error) = self.backfill_binding(binding).await {
+                tracing::warn!(tenant=%self.config.id,error=%error,"history import failed; cursor retained");
+                failure = Some(error);
+            }
             if let Err(error) = self.poll_binding(binding).await {
                 tracing::warn!(tenant=%self.config.id,error=%error,"agent sync failed; cursor retained");
                 failure = Some(error);

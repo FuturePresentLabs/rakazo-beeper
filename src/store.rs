@@ -89,6 +89,8 @@ impl Store {
               tenant TEXT NOT NULL, bot TEXT NOT NULL, room TEXT NOT NULL, ghost TEXT NOT NULL, cursor INTEGER NOT NULL,
               PRIMARY KEY(tenant,bot), UNIQUE(tenant,room));
             CREATE TABLE IF NOT EXISTS provisions (tenant TEXT NOT NULL, bot TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY(tenant,bot));
+            CREATE TABLE IF NOT EXISTS backfills (tenant TEXT NOT NULL, bot TEXT NOT NULL, before_seq INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(tenant,bot));
+            CREATE TABLE IF NOT EXISTS historical_events (tenant TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(tenant,event_id));
             CREATE TABLE IF NOT EXISTS profiles (tenant TEXT NOT NULL, bot TEXT NOT NULL, avatar_hash TEXT NOT NULL, avatar_uri TEXT NOT NULL, applied_hash TEXT NOT NULL DEFAULT '', PRIMARY KEY(tenant,bot));
             CREATE TABLE IF NOT EXISTS transactions (tenant TEXT NOT NULL, txn TEXT NOT NULL, PRIMARY KEY(tenant,txn));
             CREATE TABLE IF NOT EXISTS inbox (
@@ -232,6 +234,41 @@ impl Store {
         Ok(())
     }
 
+    pub fn history_before(&self, binding: &Binding) -> Result<Option<i64>> {
+        let baseline = self.baseline(&binding.tenant, &binding.bot, binding.cursor)?;
+        let before = baseline
+            .checked_add(1)
+            .context("history baseline overflow")?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO backfills(tenant,bot,before_seq) VALUES(?1,?2,?3)",
+            params![binding.tenant, binding.bot, before],
+        )?;
+        let (before, done): (i64, bool) = db.query_row(
+            "SELECT before_seq,done FROM backfills WHERE tenant=?1 AND bot=?2",
+            params![binding.tenant, binding.bot],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((!done).then_some(before))
+    }
+    pub fn history_progress(&self, binding: &Binding, before: Option<i64>) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE backfills SET before_seq=COALESCE(?3,before_seq),done=(?3 IS NULL) WHERE tenant=?1 AND bot=?2",params![binding.tenant,binding.bot,before])?;
+        Ok(())
+    }
+    // Reserve before the HTTP request: its websocket echo may precede its response.
+    pub fn reserve_history(&self, tenant: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for id in ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO historical_events VALUES(?1,?2)",
+                params![tenant, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Commit the dedupe marker and all messages before acknowledging the homeserver.
     pub fn ingest(&self, tenant: &str, txn: &str, events: &[Inbound]) -> Result<()> {
         let mut db = self.db.lock().unwrap();
@@ -244,6 +281,14 @@ impl Store {
             return Ok(());
         }
         for event in events {
+            let historical: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM historical_events WHERE tenant=?1 AND event_id=?2)",
+                params![tenant, event.event_id],
+                |row| row.get(0),
+            )?;
+            if historical {
+                continue;
+            }
             let aad = crate::stable_id(&[tenant, &event.event_id]);
             let payload = self.encrypt(&aad, &serde_json::to_vec(event)?)?;
             tx.execute(

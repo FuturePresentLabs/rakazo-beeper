@@ -32,6 +32,8 @@ fn key() -> String {
 
 #[derive(Default)]
 struct Remote {
+    fail_backfill: bool,
+    history_events: HashMap<String, Value>,
     avatar_color: Option<String>,
     bot_name: Option<String>,
     fail_profile: bool,
@@ -130,6 +132,27 @@ async fn mock(
         headers["authorization"],
         "Bearer appservice-token-at-least-20-chars"
     );
+    if path.ends_with("/batch_send") {
+        assert!(path.contains("/unstable/com.beeper.backfill/rooms/"));
+        assert_eq!(input["send_notification"], false);
+        assert_eq!(input["forward"], false);
+        let events = input["events"].as_array().unwrap();
+        let ids: Vec<_> = events
+            .iter()
+            .map(|event| event["event_id"].clone())
+            .collect();
+        for event in events {
+            state.history_events.insert(
+                event["event_id"].as_str().unwrap().to_string(),
+                event.clone(),
+            );
+        }
+        // Simulate a committed request whose successful response was lost.
+        if std::mem::take(&mut state.fail_backfill) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+        }
+        return ok(json!({"event_ids":ids}));
+    }
     if path.ends_with("/register") {
         return ok(json!({"user_id":"@ghost:beeper.local"}));
     }
@@ -279,7 +302,7 @@ async fn fixture() -> Fixture {
 }
 
 fn message(seq: i64, role: &str, text: &str) -> Value {
-    json!({"id":format!("message-{seq}"),"seq":seq,"role":role,"blocks":[{"kind":"text","text":text}]})
+    json!({"id":format!("message-{seq}"),"seq":seq,"role":role,"createdAt":"2026-10-18T00:16:24.962Z","blocks":[{"kind":"text","text":text}]})
 }
 fn event(id: &str, sender: &str) -> Value {
     json!({"event_id":id,"room_id":"!agent-a:beeper.local","sender":sender,"type":"m.room.message","content":{"msgtype":"m.text","body":"Hello Ada"}})
@@ -360,7 +383,7 @@ async fn round_trip_retries_use_stable_remote_idempotency_keys() {
     f.remote.lock().unwrap().messages = vec![message(0, "bot", "old history")];
     f.runtime.discover().await.unwrap();
     let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
-    assert_eq!(binding.cursor, 0); // Never replay old history into a newly connected room.
+    assert_eq!(binding.cursor, 0); // Live polling has a separate cursor from historical import.
     let payload = json!({"events":[event("$hello","@owner:beeper.com")]});
     f.runtime.ingest("txn-1", &payload).unwrap();
     f.runtime.ingest("txn-1", &payload).unwrap();
@@ -407,6 +430,125 @@ async fn round_trip_retries_use_stable_remote_idempotency_keys() {
         "Hello Avery"
     );
     assert_eq!(binding.cursor, 2);
+}
+
+#[tokio::test]
+async fn historical_backfill_preserves_senders_dates_and_frozen_boundary_without_echoes() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = (0..5)
+        .map(|seq| {
+            message(
+                seq,
+                if seq % 2 == 0 { "user" } else { "bot" },
+                &format!("old {seq}"),
+            )
+        })
+        .collect();
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.remote
+        .lock()
+        .unwrap()
+        .messages
+        .push(message(5, "bot", "new reply"));
+    f.remote.lock().unwrap().fail_backfill = true;
+    assert!(f.runtime.backfill_binding(&binding).await.is_err());
+    assert_eq!(f.runtime.store.history_before(&binding).unwrap(), Some(5));
+    let echo = f
+        .remote
+        .lock()
+        .unwrap()
+        .history_events
+        .values()
+        .find(|event| event["sender"] == "@owner:beeper.com")
+        .unwrap()
+        .clone();
+    f.runtime
+        .ingest("early-history-echo", &json!({"events":[echo]}))
+        .unwrap();
+    assert_eq!(f.runtime.store.pending_count().unwrap(), 0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    assert_eq!(f.runtime.store.history_before(&binding).unwrap(), Some(3));
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    assert_eq!(f.runtime.store.history_before(&binding).unwrap(), None);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    {
+        let remote = f.remote.lock().unwrap();
+        assert_eq!(remote.history_events.len(), 5);
+        for event in remote.history_events.values() {
+            assert_eq!(event["origin_server_ts"], 1792282584962_i64);
+            let seq: i64 = event["content"]["body"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("old ")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                event["sender"],
+                if seq % 2 == 0 {
+                    "@owner:beeper.com"
+                } else {
+                    binding.ghost.as_str()
+                }
+            );
+        }
+        assert!(remote.rakazo_nonces.is_empty());
+    }
+    f.runtime.poll_binding(&binding).await.unwrap();
+    assert_eq!(f.remote.lock().unwrap().matrix_transactions.len(), 1);
+}
+
+#[tokio::test]
+async fn history_import_fails_closed_for_shared_rooms_and_invalid_dates() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "user", "private history")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.remote.lock().unwrap().intruder = true;
+    assert!(f.runtime.backfill_binding(&binding).await.is_err());
+    assert!(f.remote.lock().unwrap().history_events.is_empty());
+    f.remote.lock().unwrap().intruder = false;
+    f.remote.lock().unwrap().messages[0]["createdAt"] = json!("bad-date");
+    assert!(f.runtime.backfill_binding(&binding).await.is_err());
+    assert_eq!(f.runtime.store.history_before(&binding).unwrap(), Some(1));
+    assert!(f.remote.lock().unwrap().history_events.is_empty());
+}
+
+#[test]
+fn history_progress_and_echo_reservations_survive_restart_and_isolate_tenants() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bridge.db");
+    let binding = rakazo_beeper::store::Binding {
+        tenant: "a".into(),
+        bot: "bot".into(),
+        room: "!room".into(),
+        ghost: "@ghost".into(),
+        cursor: 10,
+    };
+    let store = Store::open(&path, &key()).unwrap();
+    assert_eq!(store.history_before(&binding).unwrap(), Some(11));
+    store.reserve_history("a", &["$history".into()]).unwrap();
+    store.history_progress(&binding, Some(5)).unwrap();
+    drop(store);
+    let store = Store::open(&path, &key()).unwrap();
+    assert_eq!(store.history_before(&binding).unwrap(), Some(5));
+    let echo = Inbound {
+        event_id: "$history".into(),
+        room: "!room".into(),
+        text: "old prompt".into(),
+    };
+    store
+        .ingest("a", "echo", std::slice::from_ref(&echo))
+        .unwrap();
+    assert_eq!(store.pending_count().unwrap(), 0);
+    store.ingest("b", "echo", &[echo]).unwrap();
+    assert_eq!(store.pending_count().unwrap(), 1);
+    store.history_progress(&binding, None).unwrap();
+    drop(store);
+    let store = Store::open(&path, &key()).unwrap();
+    assert_eq!(store.history_before(&binding).unwrap(), None);
 }
 
 #[tokio::test]

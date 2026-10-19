@@ -333,4 +333,40 @@ impl Matrix {
         .await?;
         Ok(())
     }
+
+    /// @implements github:mautrix/go@v0.28.1 requests.go ReqBeeperBatchSend, bridgev2/portalbackfill.go -- timestamped, silent, deterministic backfill
+    pub async fn backfill(&self, room: &str, events: Vec<Value>) -> Result<()> {
+        let expected: Vec<_> = events
+            .iter()
+            .map(|event| event["event_id"].clone())
+            .collect();
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Matrix base URL"))?
+            .pop_if_empty()
+            .extend([
+                "_matrix",
+                "client",
+                "unstable",
+                "com.beeper.backfill",
+                "rooms",
+                room,
+                "batch_send",
+            ]);
+        url.query_pairs_mut().append_pair("user_id", &self.sender);
+        let response = self.client.post(url).header(AUTHORIZATION,self.token.clone())
+            .json(&json!({"forward":false,"forward_if_no_messages":true,"send_notification":false,"events":events}))
+            .send().await.map_err(|error| anyhow::anyhow!("Matrix history transport failed: {}", error.without_url()))?;
+        ensure!(
+            response.status().is_success(),
+            "Matrix history import returned HTTP {}",
+            response.status()
+        );
+        let body: Value = response.json().await?;
+        ensure!(
+            body["event_ids"] == json!(expected),
+            "Matrix history import returned unexpected event IDs; cursor retained"
+        );
+        Ok(())
+    }
 }
