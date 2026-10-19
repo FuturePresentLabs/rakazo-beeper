@@ -519,7 +519,9 @@ impl Matrix {
                 && uri.fragment().is_none(),
             crate::media::Rejected("Attachment must use a Matrix media URI.")
         );
-        let server = uri.host_str().context("attachment media server missing")?;
+        let server = uri.host_str().ok_or(crate::media::Rejected(
+            "Attachment is missing its Matrix media server.",
+        ))?;
         let server = if let Some(port) = uri.port() {
             format!("{server}:{port}")
         } else {
@@ -529,7 +531,7 @@ impl Matrix {
             .path()
             .strip_prefix('/')
             .filter(|id| !id.is_empty() && !id.contains('/'))
-            .context("invalid media identifier")?;
+            .ok_or(crate::media::Rejected("Invalid Matrix media identifier."))?;
         let name = crate::media::filename(
             content["filename"]
                 .as_str()

@@ -1658,3 +1658,29 @@ async fn rich_permissions_upgrade_legacy_rooms_without_relaxing_state_or_members
         "unchanged permissions need only a GET"
     );
 }
+
+#[tokio::test]
+async fn malformed_matrix_media_uris_are_permanent_rejections_without_network_requests() {
+    let f = fixture().await;
+    for uri in [
+        "mxc:///missing-server",
+        "mxc://beeper.local/",
+        "mxc://beeper.local/one/two",
+    ] {
+        let content = json!({"msgtype":"m.file","filename":"fixture.txt","url":uri,"info":{"mimetype":"text/plain"}});
+        let error = f
+            .runtime
+            .matrix
+            .download_media("@owner:beeper.com", &content, 1024)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<rakazo_beeper::media::Rejected>()
+                .is_some(),
+            "malformed media must not retry indefinitely: {uri}"
+        );
+    }
+    assert!(f.remote.lock().unwrap().requests.is_empty());
+}
