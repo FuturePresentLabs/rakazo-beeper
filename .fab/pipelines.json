@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "pipelines": [{
+    "id": "rakazo-beeper-image",
+    "watchPaths": [".fab/", "Dockerfile", "Cargo.toml", "Cargo.lock", "src/"],
+    "pipeline": {
+      "type": "oci_image",
+      "registry": "registry.fpl.dev",
+      "image": "fpl/rakazo-beeper",
+      "context": ".",
+      "dockerfile": "Dockerfile",
+      "tags": ["dev"],
+      "secretEnv": {
+        "SHROUD_ARTIFACT_ENDPOINT": "r2-artifact-endpoint",
+        "SHROUD_ARTIFACT_BUCKET": "r2-artifact-bucket",
+        "SHROUD_ARTIFACT_REGION": "r2-artifact-region",
+        "SHROUD_ARTIFACT_ACCESS_KEY_ID": "r2-artifact-access-key-id",
+        "SHROUD_ARTIFACT_SECRET_ACCESS_KEY": "r2-artifact-secret-access-key"
+      },
+      "push": true,
+      "tlsVerify": true,
+      "rootfsPublish": true,
+      "rootfsName": "fpl/rakazo-beeper"
+    }
+  }],
+  "services": []
+}
