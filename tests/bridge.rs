@@ -1784,3 +1784,62 @@ async fn markdown_history_uses_bounded_formatted_events_and_does_not_replay_old_
         "formatting must not append duplicate continuations to old text"
     );
 }
+
+#[tokio::test]
+async fn mobile_permission_upgrade_invalidates_legacy_profile_cache_without_reuploading_avatars() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let profile = f
+        .runtime
+        .store
+        .profile("tenant-a", &binding.bot)
+        .unwrap()
+        .unwrap();
+    let logo = f
+        .runtime
+        .store
+        .profile("tenant-a", "")
+        .unwrap()
+        .unwrap()
+        .avatar_uri;
+    let mut legacy_features = f
+        .remote
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|(path, _, _)| path.contains("/state/com.beeper.room_features/"))
+        .unwrap()
+        .1
+        .clone();
+    legacy_features.as_object_mut().unwrap().remove("id");
+    let legacy_features_id = stable_id(&["rakazo-rich-v2", &legacy_features.to_string()]);
+    let legacy_hash = stable_id(&[&profile.avatar_hash, "Ada", &logo, &legacy_features_id]);
+    f.runtime
+        .store
+        .applied_profile("tenant-a", &binding.bot, &legacy_hash)
+        .unwrap();
+    f.remote.lock().unwrap().power_levels["events_default"] = json!(100);
+    let uploads = f
+        .remote
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+        .count();
+    f.runtime.discover().await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.power_levels["events_default"], 0);
+    assert_eq!(remote.power_levels["state_default"], 100);
+    assert_eq!(remote.power_levels["invite"], 100);
+    assert_eq!(
+        remote
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path.contains("/media/v3/upload"))
+            .count(),
+        uploads
+    );
+}

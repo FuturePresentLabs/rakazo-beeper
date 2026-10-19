@@ -73,7 +73,7 @@ pub fn room_features(preferences: &crate::rakazo::Preferences) -> Value {
         }
     }
     let mut features = json!({"file":files,"max_text_length":64000,"reply":2,"thread":1,"reaction":1,"allowed_reactions":["👍","👎","❤️","😂","🎉","😮"],"edit":-2,"delete":-2,"location_message":-2,"poll":-2});
-    features["id"] = json!(stable_id(&["rakazo-rich-v2", &features.to_string()]));
+    features["id"] = json!(stable_id(&["rakazo-rich-v3", &features.to_string()]));
     features
 }
 
