@@ -93,6 +93,9 @@ action for both surfaces, where logs live, restart and rollback rules.
 [`docs/logging.md`](docs/logging.md) says which build is running and gives the
 LogQL and Shroud VM log path for each surface.
 
+[`docs/monitoring.md`](docs/monitoring.md) installs the 5-minute systemd timer that
+runs the health check, and states its single-machine limits.
+
 [`docs/postmortems/`](docs/postmortems/README.md) holds the postmortem habit:
 when one is required, the template, and the index of past incidents.
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Rakazo app uptime check (agents.fpl.dev)
+Documentation=file://%h/.local/share/rakazo-beeper/docs/monitoring.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Read-only check. The only environment input is the target URL: no secrets.
+Environment=HEALTHCHECK_BASE=https://agents.fpl.dev
+ExecStart=%h/.local/share/rakazo-beeper/scripts/monitor.sh
+StateDirectory=rakazo-beeper
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=30
