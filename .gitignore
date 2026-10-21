@@ -11,3 +11,4 @@
 *.key
 registration*.json
 registration*.yaml
+.worktrees/
