@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fleet;
 pub mod login;
 pub mod markdown;
 pub mod matrix;
