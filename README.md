@@ -90,6 +90,9 @@ the private bridge endpoint, and its exit codes.
 [`docs/runbook.md`](docs/runbook.md) is the operator runbook: symptom → check →
 action for both surfaces, where logs live, restart and rollback rules.
 
+[`docs/postmortems/`](docs/postmortems/README.md) holds the postmortem habit:
+when one is required, the template, and the index of past incidents.
+
 The implementation and runtime are Rust. SQLite is bundled through its existing
 Rust binding; TLS and authenticated payload encryption use established libraries.
 `bbctl` is Beeper's external registration utility, used once for enrollment. No Go,
