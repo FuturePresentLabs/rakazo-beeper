@@ -87,6 +87,9 @@ bash scripts/healthcheck.sh --base https://agents.fpl.dev
 [`docs/healthcheck.md`](docs/healthcheck.md) documents the script's two surfaces,
 the private bridge endpoint, and its exit codes.
 
+[`docs/runbook.md`](docs/runbook.md) is the operator runbook: symptom → check →
+action for both surfaces, where logs live, restart and rollback rules.
+
 The implementation and runtime are Rust. SQLite is bundled through its existing
 Rust binding; TLS and authenticated payload encryption use established libraries.
 `bbctl` is Beeper's external registration utility, used once for enrollment. No Go,
