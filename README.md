@@ -90,6 +90,9 @@ the private bridge endpoint, and its exit codes.
 [`docs/runbook.md`](docs/runbook.md) is the operator runbook: symptom → check →
 action for both surfaces, where logs live, restart and rollback rules.
 
+[`docs/guest-rules.md`](docs/guest-rules.md) states the no-compiles-in-guests rule
+and the runtime image check that enforces it.
+
 [`docs/logging.md`](docs/logging.md) says which build is running and gives the
 LogQL and Shroud VM log path for each surface.
 

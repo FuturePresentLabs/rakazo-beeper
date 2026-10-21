@@ -5,6 +5,12 @@ on:
 permissions:
   contents: read
 jobs:
+  no-toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject compilers in the runtime guest
+        run: bash scripts/check-no-toolchain.sh --selftest
   secrets:
     runs-on: ubuntu-latest
     steps:
