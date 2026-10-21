@@ -81,7 +81,11 @@ public SaaS onboarding product.
 cargo check --locked
 cargo test --locked
 cargo build --release --locked
+bash scripts/healthcheck.sh --base https://agents.fpl.dev
 ```
+
+[`docs/healthcheck.md`](docs/healthcheck.md) documents the script's two surfaces,
+the private bridge endpoint, and its exit codes.
 
 The implementation and runtime are Rust. SQLite is bundled through its existing
 Rust binding; TLS and authenticated payload encryption use established libraries.
