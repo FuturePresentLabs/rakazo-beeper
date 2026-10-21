@@ -957,6 +957,291 @@ fn rich_queue_keys_receipts_links_and_media_cache_survive_restart_without_cross_
     assert_eq!(store.pending_count().unwrap(), 0);
 }
 
+// Idempotent delivery across restarts is already proven by
+// `rich_queue_keys_receipts_links_and_media_cache_survive_restart_without_cross_tenant_access`
+// and `queue_survives_restart_is_encrypted_and_tenant_scoped`. The tests below
+// cover only the tenant-safety guards those tests do not exercise directly.
+
+const HOMESERVER: &str = "http://127.0.0.1:9";
+
+fn registration_bundle(
+    temp: &TempDir,
+    file: &str,
+    id: &str,
+    owner: &str,
+    homeserver: &str,
+    hs_token: &str,
+    as_token: &str,
+) {
+    let bundle = json!({
+        "homeserver_url": homeserver,
+        "homeserver_domain": "beeper.local",
+        "your_user_id": owner,
+        "registration": {
+            "id": id,
+            "sender_localpart": format!("sh-{id}"),
+            "as_token": as_token,
+            "hs_token": hs_token,
+            "namespaces": {"users": [{"regex": "@sh-rakazo_.+:beeper.local", "exclusive": true}]}
+        }
+    });
+    std::fs::write(temp.path().join(file), bundle.to_string()).unwrap();
+}
+
+fn tenant(
+    id: &str,
+    owner: &str,
+    registration: &str,
+    homeserver: &str,
+    space: &str,
+    bots: &[&str],
+) -> Value {
+    json!({
+        "id": id,
+        "owner": owner,
+        "registration": registration,
+        "homeserver": homeserver,
+        "rakazo_url": homeserver,
+        "rakazo_token_env": "TENANT_ISOLATION_TOKEN",
+        "rakazo_space_id": space,
+        "bot_ids": bots,
+        "websocket": false
+    })
+}
+
+/// Two tenants that are valid on their own: distinct ids, owners, registrations,
+/// tokens, spaces, and bots. Each collision test mutates exactly one field so the
+/// rejection is attributable.
+fn distinct_tenants(temp: &TempDir) -> (Value, Value) {
+    registration_bundle(
+        temp,
+        "reg-a.json",
+        "registration-a",
+        "@owner-a:beeper.local",
+        HOMESERVER,
+        "hs-token-aaaaaaaaaaaaaaaaaaaa",
+        "as-token-aaaaaaaaaaaaaaaaaaaa",
+    );
+    registration_bundle(
+        temp,
+        "reg-b.json",
+        "registration-b",
+        "@owner-b:beeper.local",
+        HOMESERVER,
+        "hs-token-bbbbbbbbbbbbbbbbbbbb",
+        "as-token-bbbbbbbbbbbbbbbbbbbb",
+    );
+    (
+        tenant(
+            "tenant-a",
+            "@owner-a:beeper.local",
+            "reg-a.json",
+            HOMESERVER,
+            "space-a",
+            &["agent-a"],
+        ),
+        tenant(
+            "tenant-b",
+            "@owner-b:beeper.local",
+            "reg-b.json",
+            HOMESERVER,
+            "space-b",
+            &["agent-b"],
+        ),
+    )
+}
+
+/// Run the read-only `check` command on a two-tenant config and return its stderr.
+/// Config validation happens inside `Config::load` before any secret or network
+/// access, so this exercises the real guard via a subprocess rather than mutating
+/// this test process's environment (which parallel tests share).
+fn config_rejection(temp: &TempDir, tenants: Vec<Value>) -> String {
+    let config = json!({
+        "database": "data/bridge.db",
+        "encryption_key_env": "TENANT_ISOLATION_KEY",
+        "tenants": tenants
+    });
+    let path = temp.path().join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rakazo-beeper"))
+        .args(["--config", path.to_str().unwrap(), "check"])
+        .env("TENANT_ISOLATION_TOKEN", "tenant-isolation-token-20-chars")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "config must be rejected: {config:?}"
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn config_rejects_a_duplicate_tenant_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, mut b) = distinct_tenants(&temp);
+    b["id"] = a["id"].clone();
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(error.contains("duplicate tenant id"), "{error}");
+}
+
+#[test]
+fn config_rejects_a_shared_homeserver_and_registration_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, b) = distinct_tenants(&temp);
+    // A second registration file with the same id on the same homeserver is the
+    // same appservice registration, so two tenants would race on one registration.
+    registration_bundle(
+        &temp,
+        "reg-b.json",
+        "registration-a",
+        "@owner-b:beeper.local",
+        HOMESERVER,
+        "hs-token-bbbbbbbbbbbbbbbbbbbb",
+        "as-token-bbbbbbbbbbbbbbbbbbbb",
+    );
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(
+        error.contains("duplicate appservice registration"),
+        "{error}"
+    );
+}
+
+#[test]
+fn config_rejects_a_shared_hs_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, b) = distinct_tenants(&temp);
+    registration_bundle(
+        &temp,
+        "reg-b.json",
+        "registration-b",
+        "@owner-b:beeper.local",
+        HOMESERVER,
+        "hs-token-aaaaaaaaaaaaaaaaaaaa",
+        "as-token-bbbbbbbbbbbbbbbbbbbb",
+    );
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(
+        error.contains("separate registration tokens"),
+        "hs_token collision must be named: {error}"
+    );
+}
+
+#[test]
+fn config_rejects_a_shared_as_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, b) = distinct_tenants(&temp);
+    registration_bundle(
+        &temp,
+        "reg-b.json",
+        "registration-b",
+        "@owner-b:beeper.local",
+        HOMESERVER,
+        "hs-token-bbbbbbbbbbbbbbbbbbbb",
+        "as-token-aaaaaaaaaaaaaaaaaaaa",
+    );
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(
+        error.contains("separate appservice tokens"),
+        "as_token collision must be named: {error}"
+    );
+}
+
+#[test]
+fn config_requires_an_explicit_non_empty_rakazo_space_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, mut b) = distinct_tenants(&temp);
+    b["rakazo_space_id"] = json!("");
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(
+        error.contains("explicit Rakazo space id required"),
+        "{error}"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let (a, mut b) = distinct_tenants(&temp);
+    b.as_object_mut().unwrap().remove("rakazo_space_id");
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(
+        error.contains("rakazo_space_id"),
+        "missing field must be named: {error}"
+    );
+}
+
+#[test]
+fn config_rejects_an_empty_bot_id_instead_of_selecting_all_agents() {
+    let temp = tempfile::tempdir().unwrap();
+    let (a, mut b) = distinct_tenants(&temp);
+    b["bot_ids"] = json!(["agent-b", ""]);
+    let error = config_rejection(&temp, vec![a, b]);
+    assert!(error.contains("empty bot id"), "{error}");
+}
+
+#[test]
+fn store_refuses_rebinding_a_tenant_id_to_a_different_identity_fingerprint() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bridge.db");
+    let fingerprint = "owner=@owner-a:beeper.local|hs=http://127.0.0.1:9|space=space-a";
+    {
+        let store = Store::open(&path, &key()).unwrap();
+        store.bind_tenant("tenant-a", fingerprint).unwrap();
+    }
+    let store = Store::open(&path, &key()).unwrap();
+    // The same identity fingerprint is idempotent across restarts.
+    store.bind_tenant("tenant-a", fingerprint).unwrap();
+    let error = store
+        .bind_tenant(
+            "tenant-a",
+            "owner=@owner-b:beeper.local|hs=http://127.0.0.1:9|space=space-b",
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("tenant identity changed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn per_bot_store_keys_are_tenant_scoped_even_with_the_same_bot_id() {
+    use rakazo_beeper::store::{Binding, MessageLink};
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(&temp.path().join("bridge.db"), &key()).unwrap();
+    let a = Binding {
+        tenant: "tenant-a".into(),
+        bot: "agent".into(),
+        room: "!room-a".into(),
+        ghost: "@ghost-a".into(),
+        cursor: 0,
+    };
+    let b = Binding {
+        tenant: "tenant-b".into(),
+        ..a.clone()
+    };
+    // provisions: PRIMARY KEY(tenant,bot), so the same bot id has an independent cursor.
+    assert_eq!(store.baseline("tenant-a", "agent", 10).unwrap(), 10);
+    assert_eq!(store.baseline("tenant-b", "agent", 20).unwrap(), 20);
+    // sync_cursors: PRIMARY KEY(tenant,bot,kind).
+    store.set_sync_cursor(&a, "timeline", 7).unwrap();
+    assert_eq!(store.sync_cursor(&a, "timeline").unwrap(), Some(7));
+    assert_eq!(store.sync_cursor(&b, "timeline").unwrap(), None);
+    // message_links: PRIMARY KEY(tenant,bot,rakazo_id,part).
+    store
+        .link(
+            &a,
+            &MessageLink {
+                rakazo_id: "run-1".into(),
+                matrix_id: "$matrix-1".into(),
+                part: "text:0".into(),
+                role: "user".into(),
+                kind: "m.room.message".into(),
+                hash: "hash-a".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.links(&a, "run-1").unwrap().len(), 1);
+    assert!(store.links(&b, "run-1").unwrap().is_empty());
+    assert!(store.matrix_link(&b, "$matrix-1").unwrap().is_none());
+}
+
 #[tokio::test]
 async fn profile_pictures_sync_without_duplicate_uploads_and_retry_partial_updates() {
     let f = fixture().await;
