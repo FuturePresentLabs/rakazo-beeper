@@ -3,6 +3,7 @@ pub mod login;
 pub mod markdown;
 pub mod matrix;
 pub mod media;
+pub mod orch;
 pub mod rakazo;
 pub mod rich;
 pub mod service;

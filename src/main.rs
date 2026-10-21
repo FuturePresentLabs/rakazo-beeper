@@ -32,6 +32,11 @@ enum Command {
     /// Generate a random database encryption key. Save to your secret manager.
     GenerateKey,
     /// Pair through FPL device approval and save a new Rakazo session privately.
+    /// Fleet orchestrator and PM entries in Rakazo (no bridge config required).
+    Orch {
+        #[command(subcommand)]
+        command: OrchCommand,
+    },
     Login {
         #[arg(long, default_value = "https://agents.fpl.dev")]
         rakazo_url: url::Url,
@@ -41,6 +46,45 @@ enum Command {
         client_id: String,
         #[arg(long)]
         output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrchCommand {
+    /// Confirm the session, its owner, and the resolved space.
+    Whoami,
+    /// List agents visible to this session, marking roster entries.
+    List,
+    /// Compare the roster with live agents. Reports only unless --apply.
+    Ensure {
+        /// Create missing entries (idempotent per entry's spawnKey).
+        #[arg(long)]
+        apply: bool,
+        /// Only entries whose key or name contains this text.
+        #[arg(long)]
+        only: Vec<String>,
+    },
+    /// Ask the orchestrator to spawn one PM sub-chat (starts one model run).
+    ///
+    /// Children can only be nested by the orchestrator's own `spawn_bot` tool.
+    Spawn {
+        /// Roster key, e.g. fleet-pm-marbles-v1.
+        key: String,
+    },
+    /// Read one agent's conversation (read-only).
+    Show {
+        /// Agent id, spawnKey, or roster name.
+        bot: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Send one message into an agent's conversation.
+    Say {
+        bot: String,
+        text: String,
+        /// Durable idempotency key; generated when omitted.
+        #[arg(long)]
+        nonce: Option<String>,
     },
 }
 
@@ -74,6 +118,9 @@ async fn run() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut key);
         println!("{}", STANDARD.encode(key));
         return Ok(());
+    }
+    if let Command::Orch { command } = &cli.command {
+        return orch_command(command).await;
     }
     if let Command::Login {
         rakazo_url,
@@ -171,4 +218,145 @@ async fn shutdown() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+const ORCH_HELP: &str =
+    "set RAKAZO_ORCH_TOKEN_FILE (owner-only file) or RAKAZO_ORCH_TOKEN, plus RAKAZO_ORCH_SPACE_ID";
+
+async fn orch_command(command: &OrchCommand) -> Result<()> {
+    use rakazo_beeper::orch::{Orch, roster};
+
+    let orch = Orch::from_env().with_context(|| ORCH_HELP.to_string())?;
+    match command {
+        OrchCommand::Whoami => {
+            let (user, space) = orch.whoami().await?;
+            println!("user\t{user}");
+            println!("space\t{space}");
+            anyhow::ensure!(
+                space == orch.space,
+                "session resolves to space {space}, not the configured {}",
+                orch.space
+            );
+        }
+        OrchCommand::List => {
+            let bots = orch.bots().await?;
+            let mut roster_ids = std::collections::HashSet::new();
+            for entry in roster() {
+                match orch.resolve(&bots, &entry) {
+                    Some(bot) => {
+                        roster_ids.insert(bot.id.clone());
+                        println!(
+                            "{}\t{}\t{}\tparent={}",
+                            bot.id,
+                            entry.name,
+                            entry.key,
+                            bot.parent_bot_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                    None => println!("-\t{}\t{}\tmissing", entry.name, entry.key),
+                }
+            }
+            for bot in bots.iter().filter(|bot| !roster_ids.contains(&bot.id)) {
+                println!("{}\t{}\t(not a fleet entry)", bot.id, bot.name);
+            }
+        }
+        OrchCommand::Ensure { apply, only } => {
+            let entries: Vec<_> = roster()
+                .into_iter()
+                .filter(|entry| {
+                    only.is_empty()
+                        || only.iter().any(|needle| {
+                            entry.key.contains(needle.as_str())
+                                || entry.name.contains(needle.as_str())
+                        })
+                })
+                .collect();
+            anyhow::ensure!(!entries.is_empty(), "no roster entry matched --only");
+            let bots = orch.bots().await?;
+            for entry in entries {
+                match orch.resolve(&bots, &entry) {
+                    Some(bot) => println!("present\t{}\t{}\t{}", bot.id, entry.name, entry.key),
+                    None if *apply && entry.kind == rakazo_beeper::orch::Kind::Root => {
+                        let bot = orch.create(&entry).await?;
+                        println!("created\t{}\t{}\t{}", bot.id, entry.name, entry.key);
+                    }
+                    None if entry.kind == rakazo_beeper::orch::Kind::Child => println!(
+                        "missing\t-\t{}\t{}\t(child: run `orch spawn {}`)",
+                        entry.name, entry.key, entry.key
+                    ),
+                    None => println!("missing\t-\t{}\t{}", entry.name, entry.key),
+                }
+            }
+            if !apply {
+                println!("dry run: no entries created (pass --apply to create)");
+            }
+        }
+        OrchCommand::Spawn { key } => {
+            let entry = roster()
+                .into_iter()
+                .find(|entry| entry.key == key.as_str() || entry.name == key.as_str())
+                .with_context(|| format!("no roster entry matches {key}"))?;
+            anyhow::ensure!(
+                entry.kind == rakazo_beeper::orch::Kind::Child,
+                "{} is a root entry; `orch ensure --apply` creates it",
+                entry.name
+            );
+            let bots = orch.bots().await?;
+            let root = orch
+                .resolve(&bots, &roster()[0])
+                .context("orchestrator entry missing; run `orch ensure --apply` first")?;
+            if let Some(child) = orch.resolve(&bots, &entry) {
+                println!("present\t{}\t{}\t{}", child.id, entry.name, entry.key);
+                return Ok(());
+            }
+            let nonce = format!("spawn-{}-{}", entry.key, random_nonce());
+            let seq = orch
+                .say(&root.id, &Orch::spawn_prompt(&entry), &nonce)
+                .await?;
+            println!("spawning\tseq={seq}\tnonce={nonce}\t{}", entry.name);
+        }
+        OrchCommand::Show { bot, limit } => {
+            let id = resolve_id(&orch, bot).await?;
+            for (seq, role, text) in orch.recent(&id, *limit).await? {
+                println!("#{seq}\t{role}\t{}", text.replace('\n', " ⏎ "));
+            }
+        }
+        OrchCommand::Say { bot, text, nonce } => {
+            let id = resolve_id(&orch, bot).await?;
+            let nonce = nonce.clone().unwrap_or_else(random_nonce);
+            let seq = orch.say(&id, text, &nonce).await?;
+            println!("sent\tseq={seq}\tnonce={nonce}");
+        }
+    }
+    Ok(())
+}
+
+/// Accept an agent id, its spawnKey, or a roster name.
+async fn resolve_id(orch: &rakazo_beeper::orch::Orch, needle: &str) -> Result<String> {
+    use rakazo_beeper::orch::roster;
+
+    let bots = orch.bots().await?;
+    let matched: Vec<_> = bots
+        .iter()
+        .filter(|bot| {
+            bot.id == needle
+                || bot.spawn_key.as_deref() == Some(needle)
+                || roster()
+                    .iter()
+                    .any(|entry| entry.key == needle && bot.spawn_key.as_deref() == Some(entry.key))
+                || bot.name == needle
+        })
+        .collect();
+    match matched.as_slice() {
+        [bot] => Ok(bot.id.clone()),
+        [] => anyhow::bail!("no agent matches {needle}"),
+        many => anyhow::bail!("ambiguous agent name {needle}: {} matches", many.len()),
+    }
+}
+
+fn random_nonce() -> String {
+    use rand::RngCore;
+    let mut bytes = [0; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::Engine::encode(&STANDARD, bytes)
 }

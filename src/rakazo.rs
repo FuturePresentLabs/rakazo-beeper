@@ -14,11 +14,37 @@ pub struct Rakazo {
     base: Url,
 }
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Bot {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub color: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub parent_bot_id: Option<String>,
+    #[serde(default)]
+    pub spawn_key: Option<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+}
+
+/// `bots.create` input; `spawnKey` makes a create idempotent within a space.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewBot<'a> {
+    pub name: &'a str,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub instructions: &'a str,
+    pub notify_on_finish: bool,
+    pub spawn_key: &'a str,
+    pub computer_mode: &'a str,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,22 +120,26 @@ impl Rakazo {
     pub fn new(config: &Tenant) -> Result<Self> {
         Self::with_token(config, &secret(&config.rakazo_token_env)?)
     }
+    /// Build a client from explicit parts so tooling does not need a tenant bundle.
+    pub fn from_parts(base: Url, token: &str, space: &str) -> Result<Self> {
+        Self::build(base, token, space)
+    }
     pub fn with_token(config: &Tenant, token: &str) -> Result<Self> {
+        Self::build(config.rakazo_url.clone(), token, &config.rakazo_space_id)
+    }
+    fn build(base: Url, token: &str, space: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))?;
         auth.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth);
-        headers.insert(
-            "x-rakazo-space-id",
-            HeaderValue::from_str(&config.rakazo_space_id)?,
-        );
+        headers.insert("x-rakazo-space-id", HeaderValue::from_str(space)?);
         Ok(Self {
             client: Client::builder()
                 .default_headers(headers)
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
-            base: config.rakazo_url.clone(),
+            base,
         })
     }
 
@@ -174,6 +204,11 @@ impl Rakazo {
     /// @see github:elie222/rakazo@535de9600bdd90530aa7cd954bf2d29b4a083aaf packages/contracts/src/rpc.ts
     pub async fn bots(&self) -> Result<Vec<Bot>> {
         self.rpc(&["bots", "list"], Value::Null).await
+    }
+    /// Create one agent. `spawnKey` is the server-side idempotency key.
+    pub async fn create_bot(&self, bot: &NewBot<'_>) -> Result<Bot> {
+        self.rpc(&["bots", "create"], serde_json::to_value(bot)?)
+            .await
     }
     pub async fn avatar_style(&self) -> Result<String> {
         Ok(self.preferences().await?.avatar_style)
