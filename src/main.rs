@@ -166,6 +166,15 @@ async fn run() -> Result<()> {
         }
         _ => {}
     }
+    // Identity line for `run`: which build, which config, where it listens.
+    // No secrets, tenants, owner IDs or message text.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        revision = %build_revision(),
+        config = %cli.config.display(),
+        listen = %config.listen,
+        "rakazo-beeper starting"
+    );
     let store = Arc::new(Store::open(
         &config.database,
         &secret(&config.encryption_key_env)?,
@@ -206,6 +215,17 @@ async fn run() -> Result<()> {
     while tasks.join_next().await.is_some() {}
     tracing::info!("bridge stopped; queued messages remain durable");
     Ok(())
+}
+
+/// Build revision stamped into the image/deployment; `unknown` when unset.
+///
+/// The value comes from the environment (no git call in the startup path).
+fn build_revision() -> String {
+    std::env::var("RAKAZO_BUILD_REVISION")
+        .map(|value| value.trim().to_owned())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 async fn shutdown() -> Result<()> {

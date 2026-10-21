@@ -90,6 +90,9 @@ the private bridge endpoint, and its exit codes.
 [`docs/runbook.md`](docs/runbook.md) is the operator runbook: symptom → check →
 action for both surfaces, where logs live, restart and rollback rules.
 
+[`docs/logging.md`](docs/logging.md) says which build is running and gives the
+LogQL and Shroud VM log path for each surface.
+
 [`docs/postmortems/`](docs/postmortems/README.md) holds the postmortem habit:
 when one is required, the template, and the index of past incidents.
 
