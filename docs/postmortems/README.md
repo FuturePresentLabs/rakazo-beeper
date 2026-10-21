@@ -29,4 +29,4 @@ commands; a postmortem links to them rather than repeating them.
 
 | date (UTC) | slug | surface | user impact | duration | status |
 | --- | --- | --- | --- | --- | --- |
-| 2026-10-21 | [agents-fpl-dev-edge](2026-10-21-agents-fpl-dev-edge.md) | A (app) | Rakazo UI unreachable via Cloudflare | ≥8 min, ongoing | open (edge-side) |
+| 2026-10-21 | [agents-fpl-dev-edge](2026-10-21-agents-fpl-dev-edge.md) | A (app) | Rakazo UI unreachable (guest wedged; 522 symptom) | ~110 min | resolved |
