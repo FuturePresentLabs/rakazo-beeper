@@ -19,6 +19,9 @@ Deployment identifiers, from
 The bridge has **no public endpoint**. A 200 from `agents.fpl.dev` says nothing
 about Beeper delivery.
 
+Image contents follow [`guest-rules.md`](guest-rules.md): build outside the guest
+and ship the artifact; `scripts/check-no-toolchain.sh` gates CI.
+
 ## First 60 seconds
 
 ```sh
