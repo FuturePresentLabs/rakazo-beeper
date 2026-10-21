@@ -99,6 +99,9 @@ runs the health check, and states its single-machine limits.
 [`docs/postmortems/`](docs/postmortems/README.md) holds the postmortem habit:
 when one is required, the template, and the index of past incidents.
 
+[`docs/fleet-contract.md`](docs/fleet-contract.md) is the proposed fleet contract:
+bot tiers, conversation→pane mapping, tapbacks, and the A2A envelope.
+
 The implementation and runtime are Rust. SQLite is bundled through its existing
 Rust binding; TLS and authenticated payload encryption use established libraries.
 `bbctl` is Beeper's external registration utility, used once for enrollment. No Go,
