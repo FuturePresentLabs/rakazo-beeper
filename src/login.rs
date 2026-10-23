@@ -18,12 +18,42 @@ struct Device {
     device_code: String,
     user_code: String,
     verification_uri: Url,
+    /// RFC 8628 `verification_uri_complete`; when the issuer sends it, use it
+    /// verbatim rather than constructing a link ourselves.
+    #[serde(default)]
+    verification_uri_complete: Option<Url>,
     expires_in: u64,
     #[serde(default = "default_interval")]
     interval: u64,
 }
 fn default_interval() -> u64 {
     5
+}
+
+/// The URL to open for device approval. Prefer the issuer's
+/// `verification_uri_complete` verbatim; otherwise add `user_code` ourselves.
+/// Either way the result must be HTTPS on the issuer's origin with no
+/// credentials, so a malicious authorization response cannot redirect the
+/// human to a foreign page.
+fn verification_target(device: &Device, issuer: &Url) -> Result<Url> {
+    let target = match &device.verification_uri_complete {
+        Some(complete) => complete.clone(),
+        None => {
+            let mut url = device.verification_uri.clone();
+            url.query_pairs_mut()
+                .append_pair("user_code", &device.user_code);
+            url
+        }
+    };
+    ensure!(
+        target.scheme() == "https"
+            && same_origin(issuer, &target)
+            && target.username().is_empty()
+            && target.password().is_none()
+            && target.fragment().is_none(),
+        "invalid device verification URL"
+    );
+    Ok(target)
 }
 fn same_origin(a: &Url, b: &Url) -> bool {
     a.origin() == b.origin() && b.username().is_empty() && b.password().is_none()
@@ -220,10 +250,16 @@ pub async fn login(rakazo: &Url, issuer: &Url, client_id: &str, output: &Path) -
             && (1..=60).contains(&device.interval),
         "invalid device authorization parameters"
     );
-    println!(
-        "Open {} and enter {} to connect this bridge to Rakazo.",
-        device.verification_uri, device.user_code
-    );
+    let verification = verification_target(&device, issuer)?;
+    // One line first: the prefilled link is what gets copied and opened, so a
+    // human never has to carry a code between two instructions.
+    println!("Open {verification} to connect this bridge to Rakazo.");
+    if device.verification_uri_complete.is_none() {
+        println!(
+            "(or open {} and enter {})",
+            device.verification_uri, device.user_code
+        );
+    }
     std::io::stdout().flush()?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(device.expires_in);
     let mut interval = device.interval;
