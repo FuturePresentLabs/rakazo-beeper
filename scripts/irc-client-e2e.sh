@@ -76,7 +76,10 @@ done
 kill -0 "$BROKER_PID" 2>/dev/null || { cat "$TMP/ircd.log"; fail "ircd exited"; }
 
 client() {
-  "$BIN" irc --host 127.0.0.1 --port "$PORT" --nick "$1" \
+  # A nonexistent config keeps the rehearsal on plain loopback even when the
+  # operator has a live ~/.config/rakazo/irc.toml with TLS enabled.
+  "$BIN" irc --irc-config "$TMP/no-config.toml" \
+    --host 127.0.0.1 --port "$PORT" --nick "$1" \
     --channel '#orch' --inbox "$INBOX" "${@:2}"
 }
 
@@ -101,7 +104,8 @@ transcript_count() {
 }
 
 note "start long-running client as rakazo-test"
-"$BIN" irc --host 127.0.0.1 --port "$PORT" --nick rakazo-test \
+"$BIN" irc --irc-config "$TMP/no-config.toml" \
+  --host 127.0.0.1 --port "$PORT" --nick rakazo-test \
   --channel '#orch' --inbox "$INBOX" connect \
   >"$TMP/client1.out" 2>"$TMP/client1.err" &
 CLIENT_PID=$!

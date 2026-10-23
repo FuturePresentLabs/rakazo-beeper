@@ -1,54 +1,81 @@
-# Rakazo as an IRC client (local rehearsal)
+# Rakazo as an IRC client
 
-Status: **local only.** This increment connects rakazo-beeper as a real IRC client
-to a private loopback `pi-bus-ircd`. It does not touch ports 6667/6697/6669, the
-fleet bus, certificates, ZNC, production config, or SSO. The agent loop stays
-unaware of Rakazo: there is no relay, no `pi-notify` tagging, and no extension.
-
-## Shape
-
-```
-rakazo-beeper irc        ──TCP──▶  pi-bus-ircd (127.0.0.1:<private port>)
-  src/irc/client.rs                  #orch replay + live bus entries
-  src/irc/inbox.rs        SQLite      durable inbox
-```
-
-The later production hop is the existing stack, not a new one:
+Status: **live-capable.** The client connects as the ZNC user `rakazo` over TLS
+to `100.108.9.93:6669`, verifies the listener against the private fleet CA, and
+JOINs `#orch`. The same binary still supports the private loopback
+`pi-bus-ircd` rehearsal used by tests. The agent loop stays unaware of Rakazo:
+there is no relay, no `pi-notify` tagging, and no extension.
 
 ```
-rakazo-beeper (CN=rakazo-beeper) ──TLS+mTLS──▶ ZNC ──▶ pi-irc-tls ──▶ pi-bus-ircd
+rakazo-beeper ──TLS (ca.pem, no client cert)──▶ ZNC (user rakazo)
+  src/irc/client.rs        ──▶ pi-irc-tls ──▶ pi-bus-ircd
+  src/irc/tls.rs           #orch replay + live bus entries
+  src/irc/inbox.rs         SQLite durable inbox
 ```
 
-Certificate paths are accepted in config but unused until that hop is approved.
+No client certificate is presented. `CN=rakazo-beeper` is ZNC's **upstream**
+identity to `pi-irc-tls`; it is configured in the ZNC network, not in this
+client. Entering the IRC side as that CN would be a different identity.
+
+## Config
+
+`--config` (alias `--irc-config`) selects the file; the default is
+`~/.config/rakazo/irc.toml`. See `irc.example.toml`. Secrets are paths only:
+
+```toml
+host = "100.108.9.93"
+port = 6669
+tls = true
+cafile = "~/.config/fleet/pki/ca.pem"
+password_file = "~/.config/rakazo/znc-password"   # mode 0600
+nick = "rakazo"
+user = "rakazo"
+channels = ["#orch"]
+inbox = "~/.local/share/rakazo/irc-inbox.sqlite"
+verify_hostname = true
+```
+
+TLS is fail-closed: with `tls = true`, a missing/unreadable CA, a missing or
+empty password file, or group/other-readable password permissions abort before
+any socket is opened. Errors name paths, never contents. The password is read
+once, sent as `PASS <user>:<password>`, and never printed, logged, or placed in
+an error. `verify_hostname` only controls the name check; chain verification
+against `cafile` always happens. ZNC's certificate carries `IP:100.108.9.93`,
+so the IP host verifies normally.
 
 ## Commands
 
 ```bash
 # Long-running client. Reconnects with capped backoff; never resends.
-rakazo-beeper irc --inbox /tmp/irc.sqlite --nick rakazo \
-  --channel '#orch' connect
+rakazo-beeper irc connect
 
-# One pass for tests: JOIN, replay, then exit after the idle window.
-rakazo-beeper irc --inbox /tmp/irc.sqlite --nick rakazo-test \
-  --channel '#orch' connect --once
+# One pass: JOIN, replay/read until the quiet window, then exit.
+rakazo-beeper irc connect --once --seconds 15
 
-rakazo-beeper irc --inbox /tmp/irc.sqlite send  --target '#orch' --text 'hello'
-rakazo-beeper irc --inbox /tmp/irc.sqlite reply --target '#orch' --msgid m1 --text 'hi'
-rakazo-beeper irc --inbox /tmp/irc.sqlite react --target '#orch' --msgid m1 --emoji '👍'
+rakazo-beeper irc send  --target '#orch' --text 'rakazo-live-proof <nonce>'
+rakazo-beeper irc reply --target '#orch' --msgid m1 --text 'hi'
+rakazo-beeper irc react --target '#orch' --msgid m1 --emoji '👍'
+rakazo-beeper irc whoami       # nick/user/channels/transport; no secrets
+rakazo-beeper irc selftest     # offline caps/chunk/fallback proof
 
-# Offline proof of caps, chunk budgets, fallbacks and source identity.
-rakazo-beeper irc selftest
+# Backfill the inbox from the fleet-bus IRC transcript (no network).
+rakazo-beeper irc ingest --transcript ~/.pi/agent/fleet-bus/irc/transcript-<date>.jsonl \
+  --target '#orch' --limit 1
 ```
 
-`--host`, `--port`, `--nick`, `--channel`, `--inbox`, `--cert` and `--key` override
-`irc.toml` (see `docs/irc-config.example.toml`). When the file is absent, the
-client defaults to `127.0.0.1:6667`, nick `rakazo`, `#orch` and
-`irc-inbox.sqlite`.
+`--host`, `--port`, `--nick`, `--channel`, `--inbox`, `--tls`, `--cafile`,
+`--password-file`, `--user` and `--no-verify-hostname` override the file. With
+no file at all the client falls back to `127.0.0.1:6667`, nick `rakazo`,
+`#orch`, and `irc-inbox.sqlite`, which keeps the local rehearsal working.
+
+The server advertises `echo-message`, so the client requests it (plus
+`message-tags` and `server-time`): a successful send is acknowledged by the
+server's own echo and only then marked `sent`. `CAP END` is mandatory on ZNC.
 
 ## Identity and dedupe
 
-The fleet ircd currently advertises **no caps** and sends **no tags**. The client
-therefore does not assume tags exist:
+The fleet ircd advertises **no caps** and sends **no tags**. The client therefore
+does not assume tags exist:
 
 * `CAP LS` is parsed; an empty list is normal.
 * When `msgid` is present it is the source identity: `msgid:<id>`.
@@ -59,8 +86,8 @@ therefore does not assume tags exist:
   replay window shifts.
 * Chunk parts carrying a `msgid` are stored durably per part (`chunk:<msgid>:<i>`)
   and collapse into one logical row when all parts are present.
-* When the fleet-owned ircd tag patch lands, the same column simply carries the
-  server `msgid` unchanged. No schema change is required.
+* `irc ingest` uses the same keys, so re-running it over the same transcript
+  inserts nothing.
 
 Inbound is written **before** it is printed or handed to a UI. Outbound is written
 `pending` **before** the first socket byte. It becomes `sent` only on an echo;
@@ -79,6 +106,15 @@ reconciled to `unknown` on the next open.
 Every line is checked against IRC's 512-byte limit **including tags and CRLF**
 before it reaches the socket. A body containing newlines becomes separate IRC
 lines; a wire line never contains CR/LF.
+
+## Live proof
+
+`scripts/irc-live-proof.sh` is manual, not CI. It sends **one** message to
+`#orch` prefixed `rakazo-live-proof`, prints the server echo and the outbound
+inbox row, then reads one inbound `#orch` line into the durable inbox. It has no
+retries and exits non-zero on any failure. When `#orch` has no live traffic and
+ZNC has no buffer to play, it backfills the inbound row from the fleet-bus
+transcript through `irc ingest` (still the same durable-inbox path).
 
 ## Local rehearsal
 

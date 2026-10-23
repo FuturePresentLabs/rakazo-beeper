@@ -1,8 +1,8 @@
 //! A small blocking IRC client for the fleet bus.
 //!
-//! No async runtime, no TLS stack: the local rehearsal is a loopback TCP socket.
-//! The same [`Client`] works over any `Read + Write`, which is how the capability
-//! tests drive it with a scripted socket.
+//! No async runtime. The same [`Client`] works over any `Read + Write`, which is
+//! how the capability tests drive it with a scripted socket and how the live TLS
+//! transport plugs in (see [`super::tls`]).
 //!
 //! Sending rules:
 //! * every wire line fits IRC's 512-byte limit including tags and CRLF;
@@ -11,12 +11,15 @@
 //!   preserves;
 //! * an ambiguous send is never retried automatically.
 
-use super::proto::{MAX_LINE_BYTES, Message, line_fits, parse_line, split_numbered, tags_wire};
+use super::{
+    config::IrcConfig,
+    proto::{MAX_LINE_BYTES, Message, line_fits, parse_line, split_numbered, tags_wire},
+    tls::{self, Transport},
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeSet,
     io::{ErrorKind, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
     time::{Duration, Instant},
 };
 
@@ -41,19 +44,12 @@ pub enum ReactionForm {
     Fallback,
 }
 
-impl Client<TcpStream> {
-    pub fn tcp(config: &super::config::IrcConfig, connect_timeout: Duration) -> Result<Self> {
-        let address = config.address();
-        let mut addresses = address
-            .to_socket_addrs()
-            .with_context(|| format!("resolve IRC address {address}"))?;
-        let socket = addresses
-            .next()
-            .with_context(|| format!("IRC address {address} resolved to nothing"))?;
-        let stream = TcpStream::connect_timeout(&socket, connect_timeout)
-            .with_context(|| format!("connect to IRC server {address}"))?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+pub type OpenClient = Client<Transport>;
+
+impl OpenClient {
+    /// Open the configured transport (plain TCP or TLS + private CA).
+    pub fn open(config: &IrcConfig, connect_timeout: Duration) -> Result<Self> {
+        let stream = tls::connect(config, connect_timeout)?;
         Ok(Self::new(stream, &config.nick))
     }
 }
@@ -126,20 +122,48 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
-    /// `CAP LS` + `NICK` + `USER`, then wait for `001`. Capabilities are
-    /// recorded but never required.
-    pub fn handshake(&mut self, deadline: Duration) -> Result<()> {
+    /// `CAP LS` + optional `PASS` + `NICK` + `USER`, then wait for `001`.
+    /// Capabilities are recorded but never required.
+    ///
+    /// `password` is the ZNC secret. It is written to the socket once and is
+    /// never echoed, logged, or included in an error message.
+    pub fn handshake(
+        &mut self,
+        deadline: Duration,
+        user: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
         self.send_line("CAP LS 302")?;
+        if let Some(password) = password {
+            // ZNC's user listener expects `PASS <account>:<password>`.
+            self.send_line(&format!("PASS {}:{}", user, password))?;
+        }
         self.send_line(&format!("NICK {}", self.nick))?;
-        self.send_line(&format!("USER {} 0 * :{}", self.nick, self.nick))?;
+        self.send_line(&format!("USER {} 0 * :{}", user, user))?;
         let started = Instant::now();
+        let mut cap_ended = false;
         while started.elapsed() < deadline {
             let Some(message) = self.read_message()? else {
                 continue;
             };
             self.observe(&message)?;
             match message.command.as_str() {
-                "001" => return Ok(()),
+                "CAP" if message.cap_name() == Some("LS") && !cap_ended => {
+                    // `echo-message` makes the server echo our own PRIVMSG, which
+                    // is how a send is acknowledged. Requesting the caps we use
+                    // also keeps msgid/server-time tags available on ZNC.
+                    self.send_line("CAP REQ :echo-message message-tags server-time")?;
+                    // CAP negotiation suspends registration until CAP END.
+                    self.send_line("CAP END")?;
+                    cap_ended = true;
+                }
+                "001" => {
+                    if !cap_ended {
+                        // Server without CAP support: registration is complete.
+                        self.send_line("CAP END")?;
+                    }
+                    return Ok(());
+                }
                 "432" | "433" => bail!("IRC nick {} rejected by the server", self.nick),
                 _ => {}
             }
@@ -425,7 +449,7 @@ mod tests {
     fn client_with_caps(caps: &str) -> Client<ScriptedIo> {
         let mut client = Client::new(ScriptedIo::new(handshake_input(caps)), "rakazo");
         client
-            .handshake(Duration::from_secs(1))
+            .handshake(Duration::from_secs(1), "rakazo", None)
             .expect("scripted handshake");
         client
     }

@@ -1,0 +1,20 @@
+# Example live IRC client config. Copy to ~/.config/rakazo/irc.toml (mode 0600)
+# and replace the placeholders. Never put a password in this file.
+host = "100.108.9.93"
+port = 6669
+tls = true
+# Private fleet CA that signs the ZNC listener certificate.
+cafile = "~/.config/fleet/pki/ca.pem"
+# Mode-0600 file holding only the ZNC password. The client sends it as
+# `PASS <user>:<password>` and never logs it.
+password_file = "~/.config/rakazo/znc-password"
+nick = "rakazo"
+user = "rakazo"
+channels = ["#orch"]
+inbox = "~/.local/share/rakazo/irc-inbox.sqlite"
+# ZNC's certificate is issued for its IP (IP:100.108.9.93). Chain verification
+# always happens; set this to false only when connecting by a name the
+# certificate does not carry.
+verify_hostname = true
+idle_seconds = 3
+max_backoff_seconds = 30
