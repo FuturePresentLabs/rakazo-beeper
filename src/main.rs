@@ -110,6 +110,24 @@ enum OrchCommand {
         #[arg(long)]
         nonce: Option<String>,
     },
+    /// Relay new user messages from one agent's conversation to the orchestrator
+    /// notification queue (inbound only; this build cannot reply).
+    Watch {
+        /// Agent id, spawnKey, or roster name.
+        bot: String,
+        /// Poll once and exit (the default).
+        #[arg(long)]
+        once: bool,
+        /// Poll forever at this interval. The live loop requires an explicit value.
+        #[arg(long, value_name = "SECONDS")]
+        interval_s: Option<u64>,
+        /// Dedupe/watermark file. Without it, state lives only for this process.
+        #[arg(long)]
+        state_file: Option<std::path::PathBuf>,
+        /// `pi-notify --worker` target.
+        #[arg(long, default_value = "fleet-orch-v1")]
+        worker_name: String,
+    },
 }
 
 #[tokio::main]
@@ -377,6 +395,51 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             let nonce = nonce.clone().unwrap_or_else(random_nonce);
             let seq = orch.say(&id, text, &nonce).await?;
             println!("sent\tseq={seq}\tnonce={nonce}");
+        }
+        OrchCommand::Watch {
+            bot,
+            once,
+            interval_s,
+            state_file,
+            worker_name,
+        } => {
+            use rakazo_beeper::orch::watch::{PiNotify, Watch};
+
+            let state_file = state_file
+                .clone()
+                .or_else(|| std::env::var_os("RAKAZO_ORCH_STATE_FILE").map(Into::into));
+            let mut watch = Watch::new(orch.rakazo.clone(), PiNotify, worker_name, state_file)?;
+            let bound = watch.bind(bot).await?;
+            let interval = match interval_s {
+                Some(seconds) if !once => Some(std::time::Duration::from_secs(*seconds)),
+                _ => None,
+            };
+            anyhow::ensure!(
+                interval.is_none_or(|i| !i.is_zero()),
+                "interval must be positive"
+            );
+            println!(
+                "watching\t{}\t{}\tref=rakazo:{}",
+                bound.id,
+                bound.name,
+                watch.state().thread_id.as_deref().unwrap_or(&bound.id)
+            );
+            loop {
+                match watch.poll_once().await {
+                    Ok(report) => println!(
+                        "poll\tdelivered={}\tduplicates={}\tignored={}",
+                        report.delivered, report.duplicates, report.ignored
+                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "watch poll failed; watermark unchanged");
+                        eprintln!("watch poll failed: {error:#}");
+                    }
+                }
+                match interval {
+                    Some(interval) => tokio::time::sleep(interval).await,
+                    None => break,
+                }
+            }
         }
     }
     Ok(())

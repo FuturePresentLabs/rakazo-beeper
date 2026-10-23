@@ -7,6 +7,8 @@
 //!
 //! Design and gaps: `docs/orchestrator-in-rakazo.md`.
 
+pub mod watch;
+
 use crate::rakazo::{Bot, NewBot, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
