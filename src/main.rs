@@ -47,6 +47,30 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// ohmOS messaging client (offline by default; hidden while the phone hop is unproven).
+    #[command(hide = true)]
+    Ohm {
+        #[arg(long, default_value = "ohm.toml")]
+        ohm_config: PathBuf,
+        #[command(subcommand)]
+        command: OhmCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum OhmCommand {
+    /// Health + inbox against a configured base URL. Prints counts only.
+    Probe,
+    /// Exercise the fake transport and pane bridge. No network.
+    Selftest,
+    /// Poll the daemon and inject routed conversations. Requires base URL + allow_send.
+    Serve {
+        /// Explicit orchestrator pane target, used when a route has no pane.
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        interval_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -130,6 +154,13 @@ async fn run() -> Result<()> {
     } = &cli.command
     {
         return rakazo_beeper::login::login(rakazo_url, issuer, client_id, output).await;
+    }
+    if let Command::Ohm {
+        ohm_config,
+        command,
+    } = &cli.command
+    {
+        return ohm_command(ohm_config, command).await;
     }
     let config = Config::load(&cli.config)?;
     // Read-only commands do not acquire the database lock or create database state.
@@ -379,4 +410,103 @@ fn random_nonce() -> String {
     let mut bytes = [0; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&STANDARD, bytes)
+}
+
+/// Hidden ohmOS commands. `probe` is read-only; `serve` refuses to start without
+/// a configured base URL *and* explicit send opt-in.
+async fn ohm_command(path: &PathBuf, command: &OhmCommand) -> Result<()> {
+    use rakazo_beeper::ohm::{
+        Bridge, FakeNotifier, FakePaneIo, FakeTransport, MsgdClient, OhmConfig, Platform, Route,
+        inbound,
+    };
+
+    match command {
+        OhmCommand::Probe => {
+            let config = OhmConfig::load(path)?;
+            let base = config
+                .base_url
+                .as_deref()
+                .context("ohm config has no base_url; no production value is built in")?;
+            let client = MsgdClient::new(base)?;
+            client.health()?;
+            let inbox = client.inbox()?;
+            println!("health\tok");
+            println!("inbox\t{}\tchats", inbox.len());
+            println!(
+                "send\t{}",
+                if client.send_allowed() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        OhmCommand::Selftest => {
+            let config = OhmConfig {
+                base_url: None,
+                allow_send: false,
+                state_file: None,
+                orchestrator_targets: vec!["%0".into()],
+                routes: vec![Route {
+                    chat_id: 7,
+                    roster_key: "fleet-orch-v1".into(),
+                    pane: Some("%selftest".into()),
+                    platform: Platform::WhatsApp,
+                    remote_id: "selftest-remote".into(),
+                    recipient: None,
+                }],
+            };
+            let msg = inbound(7, Platform::WhatsApp, "selftest-remote", 41, "selftest");
+            let transport = FakeTransport::new(vec![vec![msg.clone()], vec![msg]]);
+            let mut bridge = Bridge::new(
+                &config,
+                None,
+                transport,
+                FakePaneIo::default(),
+                FakeNotifier::default(),
+            )?;
+            let first = bridge.poll_once()?;
+            let second = bridge.poll_once()?;
+            anyhow::ensure!(
+                first.injected == 1 && second.injected == 0 && second.duplicates == 1,
+                "ohm selftest dedupe failed"
+            );
+            println!(
+                "selftest\tok\tinjected={}\tduplicates={}",
+                first.injected, second.duplicates
+            );
+        }
+        OhmCommand::Serve {
+            target,
+            interval_seconds,
+        } => {
+            let config = OhmConfig::load(path)?;
+            let Some(base) = config.base_url.as_deref() else {
+                println!("ohm serve disabled: no base_url configured");
+                return Ok(());
+            };
+            if !config.allow_send {
+                println!("ohm serve disabled: allow_send is false");
+                return Ok(());
+            }
+            anyhow::ensure!(*interval_seconds >= 1, "interval must be positive");
+            let client = MsgdClient::new(base)?.with_send_allowed(true);
+            let transport = rakazo_beeper::ohm::HttpTransport::new(client);
+            let mut bridge = Bridge::new(
+                &config,
+                target.clone(),
+                transport,
+                rakazo_beeper::ohm::TmuxPaneIo,
+                rakazo_beeper::ohm::PiNotifyNotifier,
+            )?;
+            println!("ohm serve: polling (send enabled; replies stay queued)");
+            loop {
+                if let Err(error) = bridge.poll_once() {
+                    tracing::warn!(error = %error, "ohm poll failed; retrying");
+                }
+                tokio::time::sleep(Duration::from_secs(*interval_seconds)).await;
+            }
+        }
+    }
+    Ok(())
 }
