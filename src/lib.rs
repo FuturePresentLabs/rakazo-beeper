@@ -4,6 +4,7 @@ pub mod login;
 pub mod markdown;
 pub mod matrix;
 pub mod media;
+pub mod ohm;
 pub mod orch;
 pub mod rakazo;
 pub mod rich;

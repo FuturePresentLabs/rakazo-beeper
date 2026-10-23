@@ -1,0 +1,27 @@
+# Example ohmOS messaging-client config. Every value is a placeholder.
+# Use it with the hidden client commands, e.g.:
+#   rakazo-beeper ohm --ohm-config docs/ohm-config.example.toml probe
+# The client sends nothing unless allow_send is explicitly true here.
+
+# No production URL is built in. Absent/empty means network calls are refused.
+# base_url = "http://127.0.0.1:8140"
+
+# Local dedupe/idempotency ledger. Optional; process memory only when absent.
+# state_file = "ohm-state.json"
+
+# POST /send stays OFF by default.
+allow_send = false
+
+# Panes that must NEVER get a paste (the human may be typing there).
+# Routes resolving here are delivered through `pi-notify send` instead.
+orchestrator_targets = ["%0"]
+
+# One ohmOS conversation -> one fleet roster key. `roster_key` must be a key
+# from orch::roster(); unknown conversations are dropped, never routed by guess.
+[[routes]]
+chat_id = 0
+roster_key = "fleet-orch-v1"
+pane = "%0"
+platform = "WhatsApp"
+remote_id = "<platform-native chat handle>"
+# recipient = "<platform-native recipient>"  # defaults to remote_id
