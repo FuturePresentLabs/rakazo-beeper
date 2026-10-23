@@ -55,6 +55,29 @@ enum Command {
         #[command(subcommand)]
         command: OhmCommand,
     },
+    /// IRC client for the fleet bus (local rehearsal; hidden until the SSO answer).
+    #[command(hide = true)]
+    Irc {
+        #[arg(long, default_value = "irc.toml")]
+        irc_config: PathBuf,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        nick: Option<String>,
+        /// Repeatable; defaults to #orch from the config.
+        #[arg(long = "channel")]
+        channels: Vec<String>,
+        #[arg(long)]
+        inbox: Option<PathBuf>,
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[command(subcommand)]
+        command: IrcCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +94,43 @@ enum OhmCommand {
         #[arg(long, default_value_t = 5)]
         interval_seconds: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum IrcCommand {
+    /// Connect, join configured channels, store inbound rows, and print only new ones.
+    Connect {
+        /// Exit after the configured quiet window instead of reconnecting forever.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Send one message (chunked within the 512-byte line budget when needed).
+    Send {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Add a reaction, tagged when supported and plain-text otherwise.
+    React {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        msgid: String,
+        #[arg(long)]
+        emoji: String,
+    },
+    /// Reply to a message, tagged when supported and quote-line otherwise.
+    Reply {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        msgid: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Offline proof of capability handling, chunk budgets and source identity.
+    Selftest,
 }
 
 #[derive(Subcommand)]
@@ -161,6 +221,22 @@ async fn run() -> Result<()> {
     } = &cli.command
     {
         return ohm_command(ohm_config, command).await;
+    }
+    if let Command::Irc {
+        irc_config,
+        host,
+        port,
+        nick,
+        channels,
+        inbox,
+        cert,
+        key,
+        command,
+    } = &cli.command
+    {
+        return irc_command(
+            irc_config, host, *port, nick, channels, inbox, cert, key, command,
+        );
     }
     let config = Config::load(&cli.config)?;
     // Read-only commands do not acquire the database lock or create database state.
@@ -410,6 +486,62 @@ fn random_nonce() -> String {
     let mut bytes = [0; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&STANDARD, bytes)
+}
+
+/// Hidden IRC commands. Everything is loopback-only until the human's SSO
+/// answer: no production host, no certificates, no ZNC.
+fn irc_command(
+    path: &PathBuf,
+    host: &Option<String>,
+    port: Option<u16>,
+    nick: &Option<String>,
+    channels: &[String],
+    inbox: &Option<PathBuf>,
+    cert: &Option<PathBuf>,
+    key: &Option<PathBuf>,
+    command: &IrcCommand,
+) -> Result<()> {
+    use rakazo_beeper::irc::{IrcConfig, run};
+
+    let mut config = IrcConfig::load_or_default(path)?;
+    if let Some(host) = host {
+        config.host = host.clone();
+    }
+    if let Some(port) = port {
+        config.port = port;
+    }
+    if let Some(nick) = nick {
+        config.nick = nick.clone();
+    }
+    if !channels.is_empty() {
+        config.channels = channels.to_vec();
+    }
+    if let Some(inbox) = inbox {
+        config.inbox = inbox.clone();
+    }
+    if let Some(cert) = cert {
+        config.cert = Some(cert.clone());
+    }
+    if let Some(key) = key {
+        config.key = Some(key.clone());
+    }
+    config.validate()?;
+
+    match command {
+        IrcCommand::Connect { once } => run::connect(&config, *once),
+        IrcCommand::Send { target, text } => run::send(&config, target, text),
+        IrcCommand::React {
+            target,
+            msgid,
+            emoji,
+        } => run::react(&config, target, msgid, emoji),
+        IrcCommand::Reply {
+            target,
+            msgid,
+            text,
+        } => run::reply(&config, target, msgid, text),
+        IrcCommand::Selftest => run::selftest(),
+    }
 }
 
 /// Hidden ohmOS commands. `probe` is read-only; `serve` refuses to start without
