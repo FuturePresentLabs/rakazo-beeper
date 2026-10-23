@@ -319,7 +319,10 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
 
             let conversation = self.conversation()?.to_string();
             let reference = format!("rakazo:{conversation}:{}", message.id);
-            let text = summarize(&bot.name, &message);
+            // The ref is also embedded in the body: pi-notify keeps --ref as
+            // metadata, and the agent_end reply extension can only see message
+            // text, so the tag must travel with the text it attributes.
+            let text = format!("[{reference}] {}", summarize(&bot.name, &message));
             // Persist any earlier progress before the side effect, then only
             // advance past this message once the notifier accepted it.
             if changed {
@@ -486,7 +489,9 @@ mod tests {
         assert!(
             calls[0]
                 .2
-                .starts_with("[rakazo] Fleet Orchestrator #7 user: ")
+                .starts_with("[rakazo:thread-b1:m1] [rakazo] Fleet Orchestrator #7 user: "),
+            "the ref must travel in the body so agent_end can attribute the turn: {}",
+            calls[0].2
         );
         assert!(calls[0].2.contains("hello orchestrator"));
         assert!(!calls[0].2.contains("assistant reply"));
