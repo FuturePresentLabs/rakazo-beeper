@@ -25,22 +25,90 @@ pub trait PaneIo {
     fn inject(&self, pane: &str, text: &str) -> Result<()>;
 }
 
-/// The real fleet primitive. Arguments are passed directly to `Command`, never
-/// through a shell.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TmuxPaneIo;
+/// Runs one external command. Production uses a real process; tests inject a
+/// recorder so they can prove a refused target spawns nothing at all.
+pub trait CommandRunner {
+    fn run(&self, program: &str, args: &[String]) -> Result<(bool, String)>;
+}
 
-impl PaneIo for TmuxPaneIo {
-    fn inject(&self, pane: &str, text: &str) -> Result<()> {
-        let output = Command::new("pi-tmux")
-            .args(["send", "--target", pane, "--message", text])
+/// The only production command runner.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessRunner;
+
+impl CommandRunner for ProcessRunner {
+    fn run(&self, program: &str, args: &[String]) -> Result<(bool, String)> {
+        let output = Command::new(program)
+            .args(args)
             .output()
-            .context("run pi-tmux send")?;
-        ensure!(
+            .with_context(|| format!("run {program}"))?;
+        Ok((
             output.status.success(),
-            "pi-tmux send failed for pane {pane}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// The real fleet primitive. Arguments are passed directly to `Command`, never
+/// through a shell. This injector is the second, independent E-415 guard: it
+/// refuses an orchestrator target before it builds the `pi-tmux` command.
+#[derive(Clone, Debug)]
+pub struct TmuxPaneIo<R = ProcessRunner> {
+    orchestrator_targets: BTreeSet<String>,
+    runner: R,
+}
+
+impl TmuxPaneIo<ProcessRunner> {
+    /// Real injector with the configured orchestrator deny-list.
+    pub fn new(orchestrator_targets: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            orchestrator_targets: orchestrator_targets.into_iter().collect(),
+            runner: ProcessRunner,
+        }
+    }
+}
+
+impl Default for TmuxPaneIo<ProcessRunner> {
+    fn default() -> Self {
+        Self::new(["%0".to_string()])
+    }
+}
+
+impl<R> TmuxPaneIo<R> {
+    /// Test seam: same guard, recording runner.
+    pub fn with_runner(orchestrator_targets: impl IntoIterator<Item = String>, runner: R) -> Self {
+        Self {
+            orchestrator_targets: orchestrator_targets.into_iter().collect(),
+            runner,
+        }
+    }
+
+    /// The exact `pi-tmux` invocation for a worker pane. The subcommand is
+    /// `send`; this bridge has no `send-keys` path.
+    pub fn command_args(pane: &str, text: &str) -> Vec<String> {
+        vec![
+            "send".to_string(),
+            "--target".to_string(),
+            pane.to_string(),
+            "--message".to_string(),
+            text.to_string(),
+        ]
+    }
+
+    pub fn refuses(&self, pane: &str) -> bool {
+        self.orchestrator_targets.contains(pane)
+    }
+}
+
+impl<R: CommandRunner> PaneIo for TmuxPaneIo<R> {
+    fn inject(&self, pane: &str, text: &str) -> Result<()> {
+        // E-415 defense in depth: refuse before the command is even built.
+        ensure!(
+            !self.refuses(pane),
+            "refusing pi-tmux paste into orchestrator target {pane}"
         );
+        let args = Self::command_args(pane, text);
+        let (success, stderr) = self.runner.run("pi-tmux", &args)?;
+        ensure!(success, "pi-tmux send failed for pane {pane}: {stderr}");
         Ok(())
     }
 }
@@ -84,10 +152,29 @@ pub trait OrchestratorNotifier {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PiNotifyNotifier;
 
+impl PiNotifyNotifier {
+    /// The only notifier kind this bridge may use. `note` is queued; it is never
+    /// a paste and it is never reported as delivered.
+    pub const KIND: &'static str = "note";
+
+    pub fn command_args(worker: &str, text: &str) -> Vec<String> {
+        vec![
+            "send".to_string(),
+            "--kind".to_string(),
+            Self::KIND.to_string(),
+            "--worker".to_string(),
+            worker.to_string(),
+            "--text".to_string(),
+            text.to_string(),
+        ]
+    }
+}
+
 impl OrchestratorNotifier for PiNotifyNotifier {
     fn notify(&self, worker: &str, text: &str) -> Result<()> {
+        let args = Self::command_args(worker, text);
         let output = Command::new("pi-notify")
-            .args(["send", "--kind", "note", "--worker", worker, "--text", text])
+            .args(&args)
             .output()
             .context("run pi-notify send")?;
         ensure!(
@@ -574,5 +661,72 @@ mod tests {
         let outcomes: &[SendOutcome] = &[SendOutcome::Queued];
         assert_eq!(outcomes, &[SendOutcome::Queued]);
         let _: Option<Inbound> = None;
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner {
+        calls: std::sync::Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    }
+
+    impl RecordingRunner {
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<(bool, String)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((program.to_string(), args.to_vec()));
+            Ok((true, String::new()))
+        }
+    }
+
+    #[test]
+    fn real_pane_injector_refuses_orchestrator_targets_before_spawning() {
+        let runner = RecordingRunner::default();
+        let panes = TmuxPaneIo::with_runner(["%0".into(), "%orch".into()], runner.clone());
+
+        let err = panes.inject("%0", "never paste this").unwrap_err();
+        assert!(err.to_string().contains("orchestrator target %0"), "{err}");
+        let err = panes.inject("%orch", "nor this").unwrap_err();
+        assert!(
+            err.to_string().contains("orchestrator target %orch"),
+            "{err}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "E-415 guard must run before any process/command invocation"
+        );
+
+        // The same real injector still reaches a worker pane with the one
+        // supported subcommand, `send`. There is no send-keys path for %0.
+        panes.inject("%1", "worker text").unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "pi-tmux");
+        assert_eq!(
+            calls[0].1,
+            vec!["send", "--target", "%1", "--message", "worker text"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !calls[0].1.iter().any(|arg| arg == concat!("send", "-keys")),
+            "worker injection must not use a keystroke-paste subcommand"
+        );
+    }
+
+    #[test]
+    fn notifier_kind_is_exactly_note_and_has_no_send_keys_path() {
+        assert_eq!(PiNotifyNotifier::KIND, "note");
+        let args = PiNotifyNotifier::command_args("fleet-orch-v1", "queued text");
+        assert_eq!(args[0], "send");
+        assert_eq!(args[1], "--kind");
+        assert_eq!(args[2], "note", "notifier kind must be exactly note");
+        assert!(!args.iter().any(|arg| arg == concat!("send", "-keys")));
     }
 }

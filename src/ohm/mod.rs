@@ -21,8 +21,8 @@ use std::{
 };
 
 pub use bridge::{
-    Bridge, BridgeState, FakeNotifier, FakePaneIo, OrchestratorNotifier, PaneIo, PiNotifyNotifier,
-    PollReport, ReplyReport, TmuxPaneIo, inbound,
+    Bridge, BridgeState, CommandRunner, FakeNotifier, FakePaneIo, OrchestratorNotifier, PaneIo,
+    PiNotifyNotifier, PollReport, ProcessRunner, ReplyReport, TmuxPaneIo, inbound,
 };
 pub use msgd::{HttpExchange, MsgdClient, UreqHttp};
 pub use transport::{FakeTransport, HttpTransport, Inbound, Outbound, SendOutcome, Transport};

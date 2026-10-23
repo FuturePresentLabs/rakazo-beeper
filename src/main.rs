@@ -496,7 +496,7 @@ async fn ohm_command(path: &PathBuf, command: &OhmCommand) -> Result<()> {
                 &config,
                 target.clone(),
                 transport,
-                rakazo_beeper::ohm::TmuxPaneIo,
+                rakazo_beeper::ohm::TmuxPaneIo::new(config.orchestrator_targets.clone()),
                 rakazo_beeper::ohm::PiNotifyNotifier,
             )?;
             println!("ohm serve: polling (send enabled; replies stay queued)");
