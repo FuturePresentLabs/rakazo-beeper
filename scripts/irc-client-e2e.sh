@@ -53,8 +53,14 @@ PY
 )"
 [[ -n "$PORT" ]] || fail "could not allocate a loopback port"
 
-note "starting private ircd on 127.0.0.1:$PORT (PI_BUS_DIR=$BUS)"
-PI_BUS_DIR="$BUS" lua5.4 "$IRCD" serve --bind 127.0.0.1 --port "$PORT" --replay 30 \
+note "starting private ircd on 127.0.0.1:$PORT (PI_BUS_DIR=$BUS, dry-run)"
+# `--dry-run` is mandatory isolation, not a shortcut: without it, an inbound
+# channel PRIVMSG makes the ircd call `pi-bus post` + `pi-bus inject`. `inject`
+# registers from the *real* pi-tmux state regardless of PI_BUS_DIR, so a private
+# rehearsal would fan test text into live worker panes. Dry-run still writes the
+# ircd transcript, which is all this script asserts on.
+PI_BUS_DIR="$BUS" PI_NOTIFY_DIR="$TMP/notify" PI_TMUX_STATE="$TMP/pi-tmux.state" \
+  lua5.4 "$IRCD" serve --bind 127.0.0.1 --port "$PORT" --replay 30 --dry-run \
   >"$TMP/ircd.log" 2>&1 &
 BROKER_PID=$!
 

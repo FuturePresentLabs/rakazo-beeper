@@ -83,7 +83,11 @@ lines; a wire line never contains CR/LF.
 ## Local rehearsal
 
 `scripts/irc-client-e2e.sh` starts a private `pi-bus-ircd` under a throwaway
-`PI_BUS_DIR` and asserts:
+`PI_BUS_DIR` with `--dry-run` (mandatory isolation: otherwise the ircd's
+human-`PRIVMSG` path calls `pi-bus post` + `inject`, and `inject` registers from
+the real `pi-tmux.state` regardless of `PI_BUS_DIR`, fanning rehearsal text into
+live worker panes). `PI_NOTIFY_DIR` and `PI_TMUX_STATE` are also redirected. It
+asserts:
 
 1. one bus post → exactly one inbox row and one printed notification;
 2. a second client re-JOINs and replays the same line → zero new rows;
