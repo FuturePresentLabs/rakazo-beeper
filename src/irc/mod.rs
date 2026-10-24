@@ -13,6 +13,7 @@
 pub mod client;
 pub mod config;
 pub mod inbox;
+pub mod keepalive;
 pub mod proto;
 pub mod run;
 pub mod tls;

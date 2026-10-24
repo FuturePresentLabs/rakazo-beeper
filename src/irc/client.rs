@@ -29,6 +29,10 @@ pub struct Client<S: Read + Write> {
     pub nick: String,
     pub caps: BTreeSet<String>,
     pub receive_index: u64,
+    /// Channels already joined on *this* socket. A reconnect creates a new
+    /// `Client`, so the JOIN is replayed on the wire; on one socket it is a
+    /// no-op rather than another JOIN that the server would reject.
+    joined: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +66,7 @@ impl<S: Read + Write> Client<S> {
             nick: nick.to_string(),
             caps: BTreeSet::new(),
             receive_index: 0,
+            joined: BTreeSet::new(),
         }
     }
 
@@ -173,7 +178,14 @@ impl<S: Read + Write> Client<S> {
 
     /// `JOIN` and wait for the end-of-names numeric. Replay lines that arrive
     /// while waiting are returned for the caller to store.
+    ///
+    /// Idempotent per socket: joining a channel we are already in returns no
+    /// replay instead of sending a second JOIN. A new connection rebuilds the
+    /// set, which is what makes reconnect-then-replay safe.
     pub fn join(&mut self, channel: &str, deadline: Duration) -> Result<Vec<Message>> {
+        if self.joined.contains(channel) {
+            return Ok(Vec::new());
+        }
         self.send_line(&format!("JOIN {channel}"))?;
         let started = Instant::now();
         let mut replay = Vec::new();
@@ -183,6 +195,7 @@ impl<S: Read + Write> Client<S> {
             };
             self.observe(&message)?;
             if message.command == "366" && message.params.get(1) == Some(&channel.to_string()) {
+                self.joined.insert(channel.to_string());
                 return Ok(replay);
             }
             if matches!(message.command.as_str(), "403" | "404")
@@ -204,6 +217,11 @@ impl<S: Read + Write> Client<S> {
         if message.command == "PING" {
             let token = message.tail().unwrap_or("");
             self.send_line(&format!("PONG :{token}"))?;
+        }
+        if matches!(message.command.as_str(), "PART" | "KICK")
+            && let Some(channel) = message.params.first()
+        {
+            self.joined.remove(channel);
         }
         if message.command == "CAP" {
             match message.cap_name() {
@@ -536,6 +554,42 @@ mod tests {
             assembled.push_str(body);
         }
         assert_eq!(assembled, text);
+    }
+
+    #[test]
+    fn join_is_idempotent_on_one_socket() {
+        let input =
+            b":srv CAP * LS :\r\n:srv 001 rakazo :welcome\r\n:srv 366 rakazo #orch :End\r\n";
+        let mut client = Client::new(ScriptedIo::new(input.to_vec()), "rakazo");
+        client
+            .handshake(Duration::from_secs(1), "rakazo", None)
+            .unwrap();
+        assert!(
+            client
+                .join("#orch", Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .join("#orch", Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
+        let output = client.into_stream().output_string();
+        assert_eq!(output.matches("JOIN #orch").count(), 1);
+    }
+
+    #[test]
+    fn server_ping_is_answered_with_its_token() {
+        let mut client = Client::new(ScriptedIo::new(Vec::new()), "rakazo");
+        let ping = parse_line("PING :srv-token-1").expect("ping");
+        client.observe(&ping).unwrap();
+        let ping_without_colon = parse_line("PING srv-token-2").expect("ping");
+        client.observe(&ping_without_colon).unwrap();
+        let output = client.into_stream().output_string();
+        assert!(output.contains("PONG :srv-token-1\r\n"));
+        assert!(output.contains("PONG :srv-token-2\r\n"));
     }
 
     #[test]

@@ -116,6 +116,47 @@ retries and exits non-zero on any failure. When `#orch` has no live traffic and
 ZNC has no buffer to play, it backfills the inbound row from the fleet-bus
 transcript through `irc ingest` (still the same durable-inbox path).
 
+## Connection stability and reconnect diagnosis
+
+The client is a client of ZNC, not of the ircd. ZNC's own upstream link
+(ZNC → `pi-irc-tls` → `pi-bus-ircd`) is independent: when that link drops, ZNC
+sends itself a status notice shaped like
+
+```
+:*rakazo!znc@znc.in PRIVMSG rakazo :Disconnected from IRC (Connection reset by peer). Reconnecting...
+```
+
+Those are **bouncer status lines**, not this client reconnecting, and they are
+not bus traffic. The client prints them as `STATUS	<prefix>	<body>` and never
+stores them in the durable inbox (the old behaviour put them in a `rakazo`
+thread and made a healthy connection look unstable). A real client reconnect is
+the client's own `RECONNECT	...` line on stderr; it also never resends.
+
+The read loop is a state machine, not a timeout race:
+
+* the socket read timeout is one second and only means "try again"; it never
+  closes a healthy connection;
+* the client sends `PING :rzk-keepalive-<n>` after 60 s with no traffic in
+  either direction, under ZNC's 180 s `NoTrafficTimeout`;
+* any inbound line (`PONG`, channel traffic, or a ZNC status line) is liveness;
+* only 120 s with no traffic in either direction is a dead link;
+* server `PING` is answered with `PONG` on every read path;
+* reconnect backoff is 1 s, 2 s, 4 s … capped at `max_backoff_seconds`, and
+  resets only after a connection has stayed up for 60 s. A server that accepts
+  JOIN and immediately drops cannot make the client hammer it;
+* `JOIN` is idempotent per socket; a new socket re-joins and replay dedupe
+  handles the rest.
+
+Manual 90 s soak (not CI): connects to ZNC, joins `#rakazo-beeper`, posts one
+real `repo:FuturePresentLabs/rakazo-beeper` message, and asserts zero client
+reconnects and exactly one durable inbound row. It never uses global scope and
+never sends probe/no-op text.
+
+```bash
+scripts/irc-live-soak.sh
+RAKAZO_SOAK_SECONDS=120 scripts/irc-live-soak.sh
+```
+
 ## Local rehearsal
 
 `scripts/irc-client-e2e.sh` starts a private `pi-bus-ircd` under a throwaway

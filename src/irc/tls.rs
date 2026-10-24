@@ -199,7 +199,7 @@ pub fn connect(config: &IrcConfig, connect_timeout: Duration) -> Result<Transpor
     let mut stream = TcpStream::connect_timeout(&socket, connect_timeout)
         .with_context(|| format!("connect to IRC server {address}"))?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     if !config.tls {
         return Ok(Transport::Plain(stream));
     }
@@ -229,7 +229,7 @@ pub fn connect(config: &IrcConfig, connect_timeout: Duration) -> Result<Transpor
             }
         }
     }
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     Ok(Transport::Tls(Box::new(StreamOwned::new(
         connection, stream,
     ))))

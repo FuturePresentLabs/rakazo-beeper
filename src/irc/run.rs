@@ -7,6 +7,7 @@ use super::{
     client::{Client, OpenClient, ReactionForm, SendForm},
     config::{IrcConfig, expand_path},
     inbox::{InboundRecord, Inbox, StoreOutcome, StoredInbound},
+    keepalive::{Backoff, Keepalive, KeepaliveAction},
     proto::{Message, bus_pointer, msgid_key, source_key},
 };
 use anyhow::{Context, Result, ensure};
@@ -18,6 +19,15 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+
+/// How often the client sends a PING when the link has been quiet. ZNC's live
+/// user has `NoTrafficTimeout = 180`, so 60 s leaves two full chances before
+/// the bouncer's own idle timer would close the client.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Two missed keepalive intervals. This is a dead-link detector, not an idle
+/// timeout: any inbound line (channel traffic, PONG, even a ZNC status line)
+/// counts as liveness.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn now() -> String {
     chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
@@ -43,15 +53,36 @@ fn print_inbound(stored: &StoredInbound) -> Result<()> {
     Ok(())
 }
 
+/// ZNC sends its own connection notices as a normal `PRIVMSG` to the user's
+/// nick from the configured status prefix (`StatusPrefix = *` in the fleet
+/// config, so `*rakazo`). They describe the *bouncer's upstream* link, not a
+/// client reconnect and not bus traffic. Storing them in the bus inbox produced
+/// rows such as `Disconnected from IRC (Connection reset by peer). Reconnecting...`
+/// in the `rakazo` thread and made a healthy client look unstable.
+pub(crate) fn bouncer_status<'a>(message: &'a Message, own_nick: &str) -> Option<&'a str> {
+    if !matches!(message.command.as_str(), "PRIVMSG" | "NOTICE" | "TAGMSG") {
+        return None;
+    }
+    let target = message.params.first()?;
+    let from = message.prefix_nick().unwrap_or("");
+    let status_target = target.starts_with('*')
+        || (target.eq_ignore_ascii_case(own_nick)
+            && (from.eq_ignore_ascii_case(own_nick) || from.starts_with('*')));
+    status_target.then(|| message.trailing.as_deref().unwrap_or(""))
+}
+
 /// Translate one parsed server line into inbox state. Returns a row only when a
-/// *new* logical message was inserted; replay duplicates return `None` and are
-/// never printed or notified.
+/// *new* logical message was inserted; replay duplicates and bouncer status
+/// lines return `None` and are never printed or notified.
 pub(crate) fn handle_inbound(
     inbox: &Inbox,
     own_nick: &str,
     message: &Message,
     ordinal: u64,
 ) -> Result<Option<StoredInbound>> {
+    if bouncer_status(message, own_nick).is_some() {
+        return Ok(None);
+    }
     match message.command.as_str() {
         "PRIVMSG" => {
             let Some(target) = message.params.first() else {
@@ -183,6 +214,8 @@ fn session(config: &IrcConfig, inbox: &Inbox, once: bool, idle: Duration) -> Res
     let mut client = open_client(config)?;
     let mut ordinal = 0u64;
     let mut idle_at = Instant::now();
+    // A bounded replay on JOIN is normal, so record the connected state only
+    // after every channel has completed its JOIN/366 exchange.
     for channel in &config.channels {
         let replay = client.join(channel, Duration::from_secs(30))?;
         for message in replay {
@@ -194,10 +227,27 @@ fn session(config: &IrcConfig, inbox: &Inbox, once: bool, idle: Duration) -> Res
             }
         }
     }
+    println!(
+        "CONNECTED\t{}\tnick={}\tchannels={}",
+        config.address(),
+        client.nick,
+        config.channels.join(",")
+    );
+    let mut keepalive = Keepalive::new(KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, Instant::now());
     loop {
         match client.read_message()? {
             Some(message) => {
+                keepalive.on_received(Instant::now());
                 client.observe(&message)?;
+                if let Some(status) = bouncer_status(&message, &client.nick) {
+                    // Visible to the operator, never a durable bus row.
+                    println!(
+                        "STATUS\t{}\t{}",
+                        message.prefix_nick().unwrap_or("znc"),
+                        status.replace('\n', "\\n")
+                    );
+                    continue;
+                }
                 if matches!(message.command.as_str(), "PRIVMSG" | "TAGMSG" | "NOTICE") {
                     ordinal += 1;
                     if let Some(stored) = handle_inbound(inbox, &client.nick, &message, ordinal)? {
@@ -212,6 +262,19 @@ fn session(config: &IrcConfig, inbox: &Inbox, once: bool, idle: Duration) -> Res
                 }
             }
         }
+        match keepalive.poll(Instant::now()) {
+            KeepaliveAction::None => {}
+            KeepaliveAction::SendPing(token) => {
+                println!("KEEPALIVE\tping\t{token}");
+                client.send_line(&format!("PING :{token}"))?;
+            }
+            KeepaliveAction::TimedOut => {
+                anyhow::bail!(
+                    "IRC keepalive timed out after {:?} with no traffic in either direction",
+                    keepalive.timeout()
+                );
+            }
+        }
     }
 }
 
@@ -223,17 +286,24 @@ pub fn connect(config: &IrcConfig, once: bool, seconds: Option<u64>) -> Result<(
     let idle = seconds
         .map(Duration::from_secs)
         .unwrap_or_else(|| config.idle());
-    let mut backoff = 1u64;
+    let mut backoff = Backoff::new(config.max_backoff_seconds);
     loop {
+        let started = Instant::now();
         match session(config, &inbox, once, idle) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if once {
                     return Err(error);
                 }
-                eprintln!("irc connect failed: {error:#}; reconnecting in {backoff}s (no resend)");
-                thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(config.max_backoff_seconds.max(1));
+                // The reconnect log and the delay are the soak script's signal:
+                // `RECONNECT` counts client-side resets, never ZNC status lines.
+                let delay = backoff.on_disconnect(started.elapsed());
+                eprintln!(
+                    "RECONNECT\tirc connect failed after {:.0}s: {error:#}; retrying in {}s (no resend)",
+                    started.elapsed().as_secs_f64(),
+                    delay.as_secs()
+                );
+                thread::sleep(delay);
             }
         }
     }
@@ -474,6 +544,44 @@ pub fn selftest() -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn znc_status_messages_are_not_stored_as_bus_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = IrcConfig {
+            inbox: dir.path().join("inbox.sqlite"),
+            ..IrcConfig::default()
+        };
+        let inbox = Inbox::open(&config.inbox).unwrap();
+        let status = Message {
+            tags: BTreeMap::new(),
+            prefix: Some("*rakazo!znc@znc.in".into()),
+            command: "PRIVMSG".into(),
+            params: vec!["rakazo".into()],
+            trailing: Some(
+                "Disconnected from IRC (Connection reset by peer). Reconnecting...".into(),
+            ),
+        };
+        assert!(bouncer_status(&status, "rakazo").is_some());
+        assert!(
+            handle_inbound(&inbox, "rakazo", &status, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inbox.count().unwrap(), 0);
+
+        // A real DM to our nick from another user is still bus traffic.
+        let dm = Message {
+            tags: BTreeMap::new(),
+            prefix: Some("orch!orch@bus".into()),
+            command: "PRIVMSG".into(),
+            params: vec!["rakazo".into()],
+            trailing: Some("hello".into()),
+        };
+        assert!(bouncer_status(&dm, "rakazo").is_none());
+        assert!(handle_inbound(&inbox, "rakazo", &dm, 2).unwrap().is_some());
+        assert_eq!(inbox.count().unwrap(), 1);
+    }
 
     #[test]
     fn ingest_skips_own_nick_and_dedupes_on_a_second_pass() {
