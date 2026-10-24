@@ -1504,6 +1504,8 @@ dependencies = [
  "reqwest",
  "resvg",
  "rusqlite",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",

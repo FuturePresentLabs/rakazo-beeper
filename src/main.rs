@@ -55,6 +55,36 @@ enum Command {
         #[command(subcommand)]
         command: OhmCommand,
     },
+    /// IRC client for the fleet bus (local rehearsal; hidden until the SSO answer).
+    #[command(hide = true)]
+    Irc {
+        /// IRC config file; defaults to ~/.config/rakazo/irc.toml.
+        #[arg(long = "irc-config", default_value_os_t = default_irc_config())]
+        irc_config: PathBuf,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        nick: Option<String>,
+        /// Repeatable; defaults to #orch from the config.
+        #[arg(long = "channel")]
+        channels: Vec<String>,
+        #[arg(long)]
+        inbox: Option<PathBuf>,
+        #[arg(long)]
+        tls: bool,
+        #[arg(long)]
+        cafile: Option<PathBuf>,
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        no_verify_hostname: bool,
+        #[command(subcommand)]
+        command: IrcCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +101,65 @@ enum OhmCommand {
         #[arg(long, default_value_t = 5)]
         interval_seconds: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum IrcCommand {
+    /// Connect, join configured channels, store inbound rows, and print only new ones.
+    Connect {
+        /// Exit after the configured quiet window instead of reconnecting forever.
+        #[arg(long)]
+        once: bool,
+        /// Quiet window for --once, overriding idle_seconds.
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
+    /// Send one message (chunked within the 512-byte line budget when needed).
+    Send {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Add a reaction, tagged when supported and plain-text otherwise.
+    React {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        msgid: String,
+        #[arg(long)]
+        emoji: String,
+    },
+    /// Reply to a message, tagged when supported and quote-line otherwise.
+    Reply {
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long)]
+        msgid: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Backfill the durable inbox from a fleet-bus IRC transcript.
+    Ingest {
+        #[arg(long)]
+        transcript: PathBuf,
+        #[arg(long, default_value = "#orch")]
+        target: String,
+        #[arg(long, default_value_t = 1)]
+        limit: usize,
+    },
+    /// Print nick, user, channels and transport without any secret material.
+    Whoami,
+    /// Offline proof of capability handling, chunk budgets and source identity.
+    Selftest,
+}
+
+/// The live IRC client's default config lives beside its password file.
+fn default_irc_config() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".config/rakazo/irc.toml"),
+        None => PathBuf::from("irc.toml"),
+    }
 }
 
 #[derive(Subcommand)]
@@ -129,6 +218,29 @@ async fn main() {
     }
 }
 
+/// The bridge has a global `--config`; inside the `irc` subcommand the same
+/// spelling means the IRC config. Rewrite only arguments that appear after the
+/// `irc` subcommand so `--config bridge.toml irc ...` keeps its meaning.
+fn rewrite_irc_config_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut args: Vec<String> = args.into_iter().collect();
+    let mut in_irc = false;
+    for arg in args.iter_mut().skip(1) {
+        if arg == "irc" {
+            in_irc = true;
+            continue;
+        }
+        if !in_irc {
+            continue;
+        }
+        if arg == "--config" {
+            *arg = "--irc-config".into();
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            *arg = format!("--irc-config={value}");
+        }
+    }
+    args
+}
+
 async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -136,7 +248,7 @@ async fn run() -> Result<()> {
                 .unwrap_or_else(|_| "rakazo_beeper=info".into()),
         )
         .init();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(rewrite_irc_config_args(std::env::args()));
     if matches!(cli.command, Command::GenerateKey) {
         let mut key = [0; 32];
         rand::thread_rng().fill_bytes(&mut key);
@@ -161,6 +273,36 @@ async fn run() -> Result<()> {
     } = &cli.command
     {
         return ohm_command(ohm_config, command).await;
+    }
+    if let Command::Irc {
+        irc_config,
+        host,
+        port,
+        nick,
+        channels,
+        inbox,
+        tls,
+        cafile,
+        password_file,
+        user,
+        no_verify_hostname,
+        command,
+    } = &cli.command
+    {
+        return irc_command(
+            irc_config,
+            host,
+            *port,
+            nick,
+            channels,
+            inbox,
+            *tls,
+            cafile,
+            password_file,
+            user,
+            *no_verify_hostname,
+            command,
+        );
     }
     let config = Config::load(&cli.config)?;
     // Read-only commands do not acquire the database lock or create database state.
@@ -410,6 +552,85 @@ fn random_nonce() -> String {
     let mut bytes = [0; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&STANDARD, bytes)
+}
+
+/// Hidden IRC commands. The live hop is TLS to ZNC with a private CA; secrets
+/// come from files and are never printed.
+#[allow(clippy::too_many_arguments)]
+fn irc_command(
+    path: &PathBuf,
+    host: &Option<String>,
+    port: Option<u16>,
+    nick: &Option<String>,
+    channels: &[String],
+    inbox: &Option<PathBuf>,
+    tls: bool,
+    cafile: &Option<PathBuf>,
+    password_file: &Option<PathBuf>,
+    user: &Option<String>,
+    no_verify_hostname: bool,
+    command: &IrcCommand,
+) -> Result<()> {
+    use rakazo_beeper::irc::{IrcConfig, run};
+
+    let mut config = IrcConfig::load_or_default(path)?;
+    if let Some(host) = host {
+        config.host = host.clone();
+    }
+    if let Some(port) = port {
+        config.port = port;
+    }
+    if let Some(nick) = nick {
+        config.nick = nick.clone();
+    }
+    if !channels.is_empty() {
+        config.channels = channels.to_vec();
+    }
+    if let Some(inbox) = inbox {
+        config.inbox = inbox.clone();
+    }
+    if tls {
+        config.tls = true;
+    }
+    if let Some(cafile) = cafile {
+        config.cafile = Some(cafile.clone());
+    }
+    if let Some(password_file) = password_file {
+        config.password_file = Some(password_file.clone());
+    }
+    if let Some(user) = user {
+        config.user = Some(user.clone());
+    }
+    if no_verify_hostname {
+        config.verify_hostname = false;
+    }
+    config.resolve_paths();
+    config.validate()?;
+
+    match command {
+        IrcCommand::Connect { once, seconds } => run::connect(&config, *once, *seconds),
+        IrcCommand::Send { target, text } => run::send(&config, target, text),
+        IrcCommand::React {
+            target,
+            msgid,
+            emoji,
+        } => run::react(&config, target, msgid, emoji),
+        IrcCommand::Reply {
+            target,
+            msgid,
+            text,
+        } => run::reply(&config, target, msgid, text),
+        IrcCommand::Ingest {
+            transcript,
+            target,
+            limit,
+        } => run::ingest(&config, transcript, target, *limit),
+        IrcCommand::Whoami => {
+            println!("{}", config.whoami());
+            Ok(())
+        }
+        IrcCommand::Selftest => run::selftest(),
+    }
 }
 
 /// Hidden ohmOS commands. `probe` is read-only; `serve` refuses to start without

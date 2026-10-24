@@ -1,0 +1,16 @@
+# Example rakazo-beeper IRC client config for the local rehearsal.
+# Copy beside config.toml or pass --irc-config. Cert/key are reserved for the
+# later TLS + client-certificate hop and are not read by the loopback client.
+
+host = "127.0.0.1"
+port = 6667
+nick = "rakazo"
+channels = ["#orch"]
+inbox = "irc-inbox.sqlite"
+
+# Unused until the ZNC/pi-irc-tls hop is approved:
+# cert = "/etc/rakazo/irc/client.crt"
+# key = "/etc/rakazo/irc/client.key"
+
+idle_seconds = 2
+max_backoff_seconds = 30
