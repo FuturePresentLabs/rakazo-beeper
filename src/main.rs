@@ -110,11 +110,9 @@ enum OrchCommand {
         #[arg(long)]
         nonce: Option<String>,
     },
-    /// Relay new user messages from one agent's conversation to the orchestrator
-    /// notification queue (inbound only; this build cannot reply).
+    /// Relay new user messages from the allowlisted conversation to the
+    /// orchestrator notification queue (inbound only; no assistant append).
     Watch {
-        /// Agent id, spawnKey, or roster name.
-        bot: String,
         /// Poll once and exit (the default).
         #[arg(long)]
         once: bool,
@@ -127,6 +125,26 @@ enum OrchCommand {
         /// `pi-notify --worker` target.
         #[arg(long, default_value = "fleet-orch-v1")]
         worker_name: String,
+    },
+    /// Reply through a linked messaging attachment only. There is no
+    /// assistant-append RPC, so a normal Agent conversation reports
+    /// `unsupported: no assistant-append RPC` and sends nothing.
+    Reply {
+        /// Text to post on the attachment surface.
+        text: String,
+        /// Print the would-be surface without sending anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// UUID idempotency key; generated when omitted.
+        #[arg(long)]
+        nonce: Option<String>,
+    },
+    /// Machine-readable health/watermark state (no secrets). Exits non-zero if
+    /// the app health probe or the bearer token is not healthy.
+    Status {
+        /// Dedupe/watermark file used by `watch`.
+        #[arg(long)]
+        state_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -289,8 +307,8 @@ async fn shutdown() -> Result<()> {
     Ok(())
 }
 
-const ORCH_HELP: &str =
-    "set RAKAZO_ORCH_TOKEN_FILE (owner-only file) or RAKAZO_ORCH_TOKEN, plus RAKAZO_ORCH_SPACE_ID";
+const ORCH_HELP: &str = "set RAKAZO_ORCH_TOKEN_FILE (owner-only file) or RAKAZO_ORCH_TOKEN, RAKAZO_ORCH_SPACE_ID, \
+     and for watch/reply/status RAKAZO_ORCH_BOT_ID + RAKAZO_ORCH_THREAD_ID";
 
 async fn orch_command(command: &OrchCommand) -> Result<()> {
     use rakazo_beeper::orch::{Orch, roster};
@@ -397,7 +415,6 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             println!("sent\tseq={seq}\tnonce={nonce}");
         }
         OrchCommand::Watch {
-            bot,
             once,
             interval_s,
             state_file,
@@ -405,11 +422,18 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
         } => {
             use rakazo_beeper::orch::watch::{PiNotify, Watch};
 
+            let allowlist = allowlist(&orch)?;
             let state_file = state_file
                 .clone()
                 .or_else(|| std::env::var_os("RAKAZO_ORCH_STATE_FILE").map(Into::into));
-            let mut watch = Watch::new(orch.rakazo.clone(), PiNotify, worker_name, state_file)?;
-            let bound = watch.bind(bot).await?;
+            let mut watch = Watch::new(
+                orch.rakazo.clone(),
+                PiNotify,
+                worker_name,
+                state_file,
+                allowlist.clone(),
+            )?;
+            let bound = watch.bind().await?;
             let interval = match interval_s {
                 Some(seconds) if !once => Some(std::time::Duration::from_secs(*seconds)),
                 _ => None,
@@ -420,9 +444,7 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             );
             println!(
                 "watching\t{}\t{}\tref=rakazo:{}",
-                bound.id,
-                bound.name,
-                watch.state().thread_id.as_deref().unwrap_or(&bound.id)
+                bound.id, bound.name, allowlist.thread_id
             );
             loop {
                 match watch.poll_once().await {
@@ -441,8 +463,132 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 }
             }
         }
+        OrchCommand::Reply {
+            text,
+            dry_run,
+            nonce,
+        } => {
+            use rakazo_beeper::orch::reply::{self, Plan};
+
+            let allowlist = allowlist(&orch)?;
+            let bots = orch.bots().await?;
+            let bot = bots
+                .iter()
+                .find(|bot| bot.id == allowlist.bot_id)
+                .with_context(|| {
+                    format!(
+                        "allowlisted bot {} is not visible to this session",
+                        allowlist.bot_id
+                    )
+                })?;
+            allowlist.check(bot)?;
+            let nonce = nonce.clone().unwrap_or_else(reply::nonce);
+            let plan = if *dry_run {
+                reply::plan(&orch.rakazo, bot).await?
+            } else {
+                reply::reply(&orch.rakazo, bot, text, &nonce).await?
+            };
+            match plan {
+                Plan::Attachment {
+                    attachment_id,
+                    label,
+                } => {
+                    if *dry_run {
+                        println!(
+                            "surface=attachment\tattachment={attachment_id}\tlabel={label}\tdry_run=true"
+                        );
+                    } else {
+                        println!(
+                            "surface=attachment\tattachment={attachment_id}\tlabel={label}\tnonce={nonce}"
+                        );
+                    }
+                }
+                Plan::Unsupported(reason) => anyhow::bail!("{reason}"),
+            }
+        }
+        OrchCommand::Status { state_file } => {
+            use rakazo_beeper::orch::watch::{WatchState, now_rfc3339};
+
+            let allowlist = allowlist(&orch)?;
+            let state_file = state_file
+                .clone()
+                .or_else(|| std::env::var_os("RAKAZO_ORCH_STATE_FILE").map(Into::into));
+            let state = WatchState::load(state_file.as_deref())?;
+            let conversation = state
+                .thread_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| allowlist.thread_id.clone());
+            let bot_id = if state.bot_id.is_empty() {
+                allowlist.bot_id.clone()
+            } else {
+                state.bot_id.clone()
+            };
+
+            let at = now_rfc3339();
+            let healthz = match orch.rakazo.healthz().await {
+                Ok(code) if code == 200 => serde_json::json!({
+                    "status": "ok", "code": code, "at": at
+                }),
+                Ok(code) => serde_json::json!({
+                    "status": "unhealthy", "code": code, "at": at
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "error", "error": format!("{error:#}"), "at": at
+                }),
+            };
+            let token = match orch.whoami().await {
+                Ok((_user, space)) if space == allowlist.space_id && space == orch.space => {
+                    serde_json::json!({"status": "valid", "at": at})
+                }
+                Ok((_user, space)) => serde_json::json!({
+                    "status": "wrong-space", "space": space, "at": at
+                }),
+                Err(error)
+                    if error
+                        .downcast_ref::<rakazo_beeper::rakazo::Unauthorized>()
+                        .is_some() =>
+                {
+                    serde_json::json!({"status": "invalid", "code": 401, "at": at})
+                }
+                Err(error) => serde_json::json!({
+                    "status": "error", "error": format!("{error:#}"), "at": at
+                }),
+            };
+            let status = serde_json::json!({
+                "bot_id": bot_id,
+                "conversation_id": conversation,
+                "thread_id": allowlist.thread_id,
+                "space_id": allowlist.space_id,
+                "watermark": state.last_seq,
+                "last_seq": state.last_seq,
+                "delivered": state.delivered_total,
+                "duplicates": state.duplicates_total,
+                "last_delivered_id": state.last_delivered_id,
+                "last_poll_ok": state.last_poll_ok,
+                "last_poll_at": state.last_poll_at,
+                "last_error": state.last_error,
+                "upstream": {"healthz": healthz, "token": token},
+            });
+            println!("{}", serde_json::to_string(&status)?);
+            let healthy = status["upstream"]["healthz"]["status"] == "ok"
+                && status["upstream"]["token"]["status"] == "valid";
+            anyhow::ensure!(healthy, "orch status degraded");
+        }
     }
     Ok(())
+}
+
+/// Read the allowlist and fail unless it names the same space as the session.
+fn allowlist(orch: &rakazo_beeper::orch::Orch) -> Result<rakazo_beeper::orch::Allowlist> {
+    let allowlist = rakazo_beeper::orch::Allowlist::from_env()?;
+    anyhow::ensure!(
+        allowlist.space_id == orch.space,
+        "allowlist space {} differs from RAKAZO_ORCH_SPACE_ID {}",
+        allowlist.space_id,
+        orch.space
+    );
+    Ok(allowlist)
 }
 
 /// Accept an agent id, its spawnKey, or a roster name.
