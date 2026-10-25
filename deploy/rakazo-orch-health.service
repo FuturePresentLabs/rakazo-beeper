@@ -1,0 +1,22 @@
+[Unit]
+Description=Rakazo Fleet Orchestrator relay health/watermark check
+Documentation=file://%h/.local/share/rakazo-beeper/docs/orchestrator-in-rakazo.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=%h/.local/share/rakazo-beeper/bin/rakazo-beeper
+ConditionPathExists=%h/.local/share/rakazo-beeper/orch.env
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/rakazo-beeper
+EnvironmentFile=%h/.local/share/rakazo-beeper/orch.env
+Environment=RUST_LOG=rakazo_beeper=info
+# Exits non-zero when /healthz is not 200 or the token is invalid (including a
+# silent 401), and prints no token or message body.
+ExecStart=%h/.local/share/rakazo-beeper/bin/rakazo-beeper orch status --state-file %h/.local/share/rakazo-beeper/data/orch-watch.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=30

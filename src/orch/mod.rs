@@ -7,12 +7,77 @@
 //!
 //! Design and gaps: `docs/orchestrator-in-rakazo.md`.
 
+pub mod reply;
 pub mod watch;
 
 use crate::rakazo::{Bot, NewBot, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use url::Url;
+
+/// The single production conversation this process may read and reply to.
+///
+/// Every value is explicit and non-empty; there is no wildcard, no fallback to
+/// "whatever the session can see", and no cross-space read. `from_env` is the
+/// only production constructor so the binding is visible in the unit/config
+/// diff rather than inferred from the live bot list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allowlist {
+    pub bot_id: String,
+    pub space_id: String,
+    pub thread_id: String,
+}
+
+impl Allowlist {
+    /// `RAKAZO_ORCH_BOT_ID`, `RAKAZO_ORCH_SPACE_ID`, `RAKAZO_ORCH_THREAD_ID`.
+    pub fn from_env() -> Result<Self> {
+        let read = |name: &str| -> Result<String> {
+            let value = std::env::var(name).with_context(|| format!("set {name}"))?;
+            let value = value.trim().to_string();
+            ensure!(!value.is_empty(), "empty {name}");
+            Ok(value)
+        };
+        Ok(Self {
+            bot_id: read("RAKAZO_ORCH_BOT_ID")?,
+            space_id: read("RAKAZO_ORCH_SPACE_ID")?,
+            thread_id: read("RAKAZO_ORCH_THREAD_ID")?,
+        })
+    }
+
+    /// Fail closed unless `bot` is exactly the configured conversation.
+    pub fn check(&self, bot: &Bot) -> Result<()> {
+        ensure!(
+            bot.id == self.bot_id,
+            "refusing bot {}: allowlist is {}",
+            bot.id,
+            self.bot_id
+        );
+        ensure!(
+            bot.archived_at.is_none(),
+            "refusing archived bot {}",
+            self.bot_id
+        );
+        ensure!(
+            !bot.space_id.is_empty() && bot.space_id == self.space_id,
+            "refusing bot {} in space {}: allowlist space is {}",
+            self.bot_id,
+            if bot.space_id.is_empty() {
+                "<unknown>"
+            } else {
+                &bot.space_id
+            },
+            self.space_id
+        );
+        let actual = bot.thread_id.as_deref().unwrap_or(&bot.id);
+        ensure!(
+            actual == self.thread_id,
+            "refusing thread {}: allowlist thread is {}",
+            actual,
+            self.thread_id
+        );
+        Ok(())
+    }
+}
 
 /// How an entry is matched to an agent and how it may be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,10 +306,12 @@ mod tests {
             color: String::new(),
             title: String::new(),
             description: String::new(),
+            space_id: "space".into(),
             thread_id: None,
             parent_bot_id: None,
             spawn_key: spawn.map(str::to_string),
             archived_at: archived.map(str::to_string),
+            capabilities: None,
         };
         let orch = Orch {
             rakazo: Rakazo::from_parts(

@@ -11,6 +11,7 @@
 //! ids, so a restart never notifies twice and a notify failure never advances the
 //! watermark.
 
+use crate::orch::Allowlist;
 use crate::rakazo::{Bot, Message, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,18 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Current UTC time as RFC 3339, without adding a wall-clock dependency.
+pub fn now_rfc3339() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    chrono::DateTime::from_timestamp(now.as_secs() as i64, now.subsec_nanos())
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| format!("{}.{}Z", now.as_secs(), now.subsec_nanos()))
+}
 
 /// Read side of a Rakazo conversation. Production is [`Rakazo`]; tests inject a
 /// scripted fake so no live call is ever made.
@@ -142,9 +154,38 @@ pub struct WatchState {
     /// increment, but it is what makes a future outbound echo recognisable.
     #[serde(default)]
     pub own_nonces: VecDeque<String>,
+    /// Total user messages handed to the notifier since this state was created.
+    #[serde(default)]
+    pub delivered_total: u64,
+    /// Total already-seen rows skipped since this state was created.
+    #[serde(default)]
+    pub duplicates_total: u64,
+    /// Message id of the most recent successful delivery.
+    #[serde(default)]
+    pub last_delivered_id: Option<String>,
+    /// `None` before the first poll; explicit so an unstarted watcher is not healthy.
+    #[serde(default)]
+    pub last_poll_ok: Option<bool>,
+    #[serde(default)]
+    pub last_poll_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 impl WatchState {
+    /// Load a state file when it exists; a missing file is a fresh state.
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        match path {
+            Some(path) if path.exists() => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("read watch state {}", path.display()))?;
+                serde_json::from_str(&text)
+                    .with_context(|| format!("invalid watch state {}", path.display()))
+            }
+            _ => Ok(Self::default()),
+        }
+    }
+
     fn delivered(&self, id: &str) -> bool {
         self.delivered_ids.iter().any(|seen| seen == id)
     }
@@ -180,6 +221,7 @@ pub struct Watch<S: RakazoSource, N: Notifier> {
     notifier: N,
     worker: String,
     state_file: Option<PathBuf>,
+    allowlist: Allowlist,
     state: WatchState,
     bound: Option<Bot>,
 }
@@ -188,25 +230,24 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
     /// Load the state file when it exists. Nothing is bound yet; call [`bind`].
     ///
     /// [`bind`]: Watch::bind
-    pub fn new(source: S, notifier: N, worker: &str, state_file: Option<PathBuf>) -> Result<Self> {
+    pub fn new(
+        source: S,
+        notifier: N,
+        worker: &str,
+        state_file: Option<PathBuf>,
+        allowlist: Allowlist,
+    ) -> Result<Self> {
         ensure!(
             !worker.trim().is_empty(),
             "orchestrator worker name is empty"
         );
-        let state = match &state_file {
-            Some(path) if path.exists() => {
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("read watch state {}", path.display()))?;
-                serde_json::from_str(&text)
-                    .with_context(|| format!("invalid watch state {}", path.display()))?
-            }
-            _ => WatchState::default(),
-        };
+        let state = WatchState::load(state_file.as_deref())?;
         Ok(Self {
             source,
             notifier,
             worker: worker.to_string(),
             state_file,
+            allowlist,
             state,
             bound: None,
         })
@@ -224,33 +265,31 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
         &self.notifier
     }
 
-    /// Resolve `needle` (agent id, spawnKey, or roster name) against the agents
-    /// this session can actually see, then persist the binding.
+    /// Resolve the one allowlisted agent against the agents this session can
+    /// actually see, then persist the binding.
     ///
-    /// A foreign agent (not listed for this session) and a state file bound to a
-    /// different agent are both refused rather than silently rebound.
-    pub async fn bind(&mut self, needle: &str) -> Result<Bot> {
-        ensure!(!needle.trim().is_empty(), "empty agent selector");
+    /// A foreign agent (not listed for this session), a different space/thread,
+    /// and a state file bound to a different agent are all refused rather than
+    /// silently rebound.
+    pub async fn bind(&mut self) -> Result<Bot> {
         let bots = self.source.bots().await?;
         let matched: Vec<&Bot> = bots
             .iter()
-            .filter(|bot| {
-                bot.id == needle || bot.spawn_key.as_deref() == Some(needle) || bot.name == needle
-            })
+            .filter(|bot| bot.id == self.allowlist.bot_id)
             .collect();
         let bot = match matched.as_slice() {
             [bot] => (*bot).clone(),
-            [] => anyhow::bail!("no agent matches {needle}; refusing an unknown or foreign bot"),
+            [] => anyhow::bail!(
+                "allowlisted bot {} is not visible to this session; refusing a foreign conversation",
+                self.allowlist.bot_id
+            ),
             many => anyhow::bail!(
-                "ambiguous agent {needle}: {} agents match; use the id",
+                "allowlisted bot {} matched {} agents; refusing ambiguous binding",
+                self.allowlist.bot_id,
                 many.len()
             ),
         };
-        ensure!(
-            bot.archived_at.is_none(),
-            "agent {} is archived; refusing to watch it",
-            bot.id
-        );
+        self.allowlist.check(&bot)?;
         if !self.state.bot_id.is_empty() {
             ensure!(
                 self.state.bot_id == bot.id,
@@ -260,7 +299,7 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
             );
         }
         self.state.bot_id = bot.id.clone();
-        self.state.thread_id = Some(bot.thread_id.clone().unwrap_or_else(|| bot.id.clone()));
+        self.state.thread_id = Some(self.allowlist.thread_id.clone());
         self.bound = Some(bot.clone());
         self.save()?;
         Ok(bot)
@@ -279,8 +318,31 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
     /// across polls and restarts.
     ///
     /// A notifier failure returns an error *without* advancing the watermark past
-    /// the failed message, so the next poll retries it.
+    /// the failed message, so the next poll retries it. The poll timestamp and
+    /// outcome are persisted even on failure so `status` cannot show a stale
+    /// healthy timestamp after an outage.
     pub async fn poll_once(&mut self) -> Result<Report> {
+        self.state.last_poll_at = Some(now_rfc3339());
+        let outcome = self.poll_inner().await;
+        match &outcome {
+            Ok(_) => {
+                self.state.last_poll_ok = Some(true);
+                self.state.last_error = None;
+            }
+            Err(error) => {
+                self.state.last_poll_ok = Some(false);
+                self.state.last_error = Some(format!("{error:#}"));
+            }
+        }
+        if let Err(save_error) = self.save() {
+            if outcome.is_ok() {
+                return Err(save_error);
+            }
+        }
+        outcome
+    }
+
+    async fn poll_inner(&mut self) -> Result<Report> {
         let bot = self
             .bound
             .clone()
@@ -296,11 +358,13 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
         for message in messages {
             if message.seq <= self.state.last_seq {
                 report.duplicates += 1;
+                self.state.duplicates_total += 1;
                 continue;
             }
             if self.state.delivered(&message.id) {
                 // A crash between notify and save must not re-notify.
                 report.duplicates += 1;
+                self.state.duplicates_total += 1;
                 self.state.last_seq = message.seq;
                 changed = true;
                 continue;
@@ -319,7 +383,9 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
 
             let conversation = self.conversation()?.to_string();
             let reference = format!("rakazo:{conversation}:{}", message.id);
-            let text = summarize(&bot.name, &message);
+            // The same tag appears in `--ref` and in the body so a notification
+            // can be traced back to the exact Rakazo message after a restart.
+            let text = format!("[{reference}] {}", summarize(&bot.name, &message));
             // Persist any earlier progress before the side effect, then only
             // advance past this message once the notifier accepted it.
             if changed {
@@ -330,6 +396,8 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
                 .notify(&self.worker, &reference, &text)
                 .with_context(|| format!("notify {reference}"))?;
             self.state.record_delivered(&message.id);
+            self.state.last_delivered_id = Some(message.id.clone());
+            self.state.delivered_total += 1;
             self.state.last_seq = message.seq;
             self.save()?;
             report.delivered += 1;
@@ -398,10 +466,20 @@ mod tests {
             color: String::new(),
             title: String::new(),
             description: String::new(),
+            space_id: "space".into(),
             thread_id: Some(format!("thread-{id}")),
             parent_bot_id: None,
             spawn_key: Some("fleet-orch-v1".into()),
             archived_at: None,
+            capabilities: None,
+        }
+    }
+
+    fn allowlist(id: &str) -> Allowlist {
+        Allowlist {
+            bot_id: id.into(),
+            space_id: "space".into(),
+            thread_id: format!("thread-{id}"),
         }
     }
 
@@ -452,12 +530,13 @@ mod tests {
         }
     }
 
-    fn watch<'a>(
+    fn watch(
         source: FakeSource,
         notifier: FakeNotifier,
         state_file: Option<PathBuf>,
+        allowlist: Allowlist,
     ) -> Watch<FakeSource, FakeNotifier> {
-        Watch::new(source, notifier, "fleet-orch-v1", state_file).unwrap()
+        Watch::new(source, notifier, "fleet-orch-v1", state_file, allowlist).unwrap()
     }
 
     #[tokio::test]
@@ -472,12 +551,20 @@ mod tests {
                 vec![message("m1", 7, "user", "hello orchestrator")],
             ],
         );
-        let mut watcher = watch(source, FakeNotifier::default(), None);
-        watcher.bind("fleet-orch-v1").await.unwrap();
+        let mut watcher = watch(source, FakeNotifier::default(), None, allowlist("b1"));
+        watcher.bind().await.unwrap();
 
         let first = watcher.poll_once().await.unwrap();
         assert_eq!(first.delivered, 1);
         assert_eq!(first.ignored, 1, "assistant rows are skipped");
+        assert_eq!(watcher.state().last_poll_ok, Some(true));
+        assert!(watcher.state().last_poll_at.is_some());
+        assert_eq!(
+            watcher.state().last_delivered_id.as_deref(),
+            Some("m1"),
+            "status must name the last delivered message"
+        );
+        assert_eq!(watcher.state().delivered_total, 1);
 
         let calls = watcher.notifier.calls();
         assert_eq!(calls.len(), 1);
@@ -486,7 +573,9 @@ mod tests {
         assert!(
             calls[0]
                 .2
-                .starts_with("[rakazo] Fleet Orchestrator #7 user: ")
+                .starts_with("[rakazo:thread-b1:m1] [rakazo] Fleet Orchestrator #7 user: "),
+            "{}",
+            calls[0].2
         );
         assert!(calls[0].2.contains("hello orchestrator"));
         assert!(!calls[0].2.contains("assistant reply"));
@@ -504,14 +593,24 @@ mod tests {
         let page = vec![message("m1", 7, "user", "only once")];
         {
             let source = FakeSource::new(vec![bot("b1", "Orch")], vec![page.clone()]);
-            let mut watcher = watch(source, FakeNotifier::default(), Some(path.clone()));
-            watcher.bind("b1").await.unwrap();
+            let mut watcher = watch(
+                source,
+                FakeNotifier::default(),
+                Some(path.clone()),
+                allowlist("b1"),
+            );
+            watcher.bind().await.unwrap();
             assert_eq!(watcher.poll_once().await.unwrap().delivered, 1);
             assert!(path.exists());
         }
         let source = FakeSource::new(vec![bot("b1", "Orch")], vec![page]);
-        let mut watcher = watch(source, FakeNotifier::default(), Some(path.clone()));
-        watcher.bind("b1").await.unwrap();
+        let mut watcher = watch(
+            source,
+            FakeNotifier::default(),
+            Some(path.clone()),
+            allowlist("b1"),
+        );
+        watcher.bind().await.unwrap();
         let report = watcher.poll_once().await.unwrap();
         assert_eq!(report.delivered, 0);
         assert_eq!(report.duplicates, 1);
@@ -536,8 +635,8 @@ mod tests {
                 message("m4", 10, "user", "  "),
             ]],
         );
-        let mut watcher = watch(source, FakeNotifier::default(), None);
-        watcher.bind("b1").await.unwrap();
+        let mut watcher = watch(source, FakeNotifier::default(), None, allowlist("b1"));
+        watcher.bind().await.unwrap();
         watcher.state.own_nonces.push_back("our-nonce".into());
         let report = watcher.poll_once().await.unwrap();
         assert_eq!(report.delivered, 0);
@@ -560,19 +659,31 @@ mod tests {
                     fail: true,
                 },
                 Some(path.clone()),
+                allowlist("b1"),
             );
-            watcher.bind("b1").await.unwrap();
+            watcher.bind().await.unwrap();
             assert!(watcher.poll_once().await.is_err());
             assert_eq!(watcher.state().last_seq, 0);
+            assert_eq!(watcher.state().last_poll_ok, Some(false));
+            assert!(watcher.state().last_poll_at.is_some());
+            assert!(
+                watcher
+                    .state()
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("scripted notifier failure")),
+                "status must surface the last error"
+            );
             let saved: WatchState =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(saved.last_seq, 0);
             assert!(saved.delivered_ids.is_empty());
+            assert_eq!(saved.last_poll_ok, Some(false));
         }
         // Next poll retries the same message and succeeds.
         let source = FakeSource::new(vec![bot("b1", "Orch")], vec![page]);
-        let mut watcher = watch(source, FakeNotifier::default(), Some(path));
-        watcher.bind("b1").await.unwrap();
+        let mut watcher = watch(source, FakeNotifier::default(), Some(path), allowlist("b1"));
+        watcher.bind().await.unwrap();
         assert_eq!(watcher.poll_once().await.unwrap().delivered, 1);
         assert_eq!(watcher.notifier.calls().len(), 1);
     }
@@ -581,19 +692,42 @@ mod tests {
     async fn unknown_foreign_and_rebound_agents_are_refused() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("watch.json");
-        // Foreign: the session cannot list the agent at all.
+        // Foreign: the allowlisted bot is not listed for this session.
         let source = FakeSource::new(vec![bot("other", "Someone Else")], vec![]);
-        let mut watcher = watch(source, FakeNotifier::default(), None);
-        assert!(watcher.bind("b-missing").await.is_err());
+        let mut watcher = watch(
+            source,
+            FakeNotifier::default(),
+            None,
+            allowlist("b-missing"),
+        );
+        assert!(watcher.bind().await.is_err());
+
+        // Wrong space: listed, same id, but not the configured tenant.
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![]);
+        let mut wrong_space = allowlist("b1");
+        wrong_space.space_id = "other-space".into();
+        let mut watcher = watch(source, FakeNotifier::default(), None, wrong_space);
+        assert!(watcher.bind().await.is_err());
+
+        // Wrong thread: listed, same space, but a different conversation.
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![]);
+        let mut wrong_thread = allowlist("b1");
+        wrong_thread.thread_id = "thread-elsewhere".into();
+        let mut watcher = watch(source, FakeNotifier::default(), None, wrong_thread);
+        assert!(watcher.bind().await.is_err());
 
         // Bound state: a different agent must not silently take over the file.
-        let source = FakeSource::new(
-            vec![bot("b1", "Orch"), bot("b2", "Other")],
-            vec![Vec::new()],
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![Vec::new()]);
+        let mut watcher = watch(
+            source,
+            FakeNotifier::default(),
+            Some(path.clone()),
+            allowlist("b1"),
         );
-        let mut watcher = watch(source, FakeNotifier::default(), Some(path));
-        watcher.bind("b1").await.unwrap();
-        assert!(watcher.bind("b2").await.is_err());
+        watcher.bind().await.unwrap();
+        let source = FakeSource::new(vec![bot("b2", "Other")], vec![]);
+        let mut rebind = watch(source, FakeNotifier::default(), Some(path), allowlist("b2"));
+        assert!(rebind.bind().await.is_err());
     }
 
     #[test]
