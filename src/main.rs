@@ -568,6 +568,9 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 "last_poll_ok": state.last_poll_ok,
                 "last_poll_at": state.last_poll_at,
                 "last_error": state.last_error,
+                // E-847 waiver: the poller uses the human session token read-only
+                // until the service token lands; revoke at cutover.
+                "auth_mode": "session-waiver (expires on service-token rollout)",
                 "upstream": {"healthz": healthz, "token": token},
             });
             println!("{}", serde_json::to_string(&status)?);
