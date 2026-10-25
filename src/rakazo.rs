@@ -6,7 +6,23 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fmt;
 use url::Url;
+
+/// The server answered a request with `401 Unauthorized`.
+///
+/// A typed error (rather than a message) lets `orch status` report
+/// `token=invalid` without ever treating an expired session as healthy.
+#[derive(Clone, Copy, Debug)]
+pub struct Unauthorized;
+
+impl fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Rakazo rejected the bearer token (HTTP 401)")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
 
 #[derive(Clone)]
 pub struct Rakazo {
@@ -25,6 +41,8 @@ pub struct Bot {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub space_id: String,
+    #[serde(default)]
     pub thread_id: Option<String>,
     #[serde(default)]
     pub parent_bot_id: Option<String>,
@@ -32,6 +50,10 @@ pub struct Bot {
     pub spawn_key: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// Present only for a bot backed by a messaging attachment. A normal
+    /// Agent bot omits this object entirely.
+    #[serde(default)]
+    pub capabilities: Option<Value>,
 }
 
 /// `bots.create` input; `spawnKey` makes a create idempotent within a space.
@@ -90,6 +112,20 @@ impl Message {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
+}
+/// One conversation attachment linked to this session's space.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedAttachment {
+    pub id: String,
+    #[serde(default)]
+    pub binding_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub linked_at: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +198,9 @@ impl Rakazo {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Rakazo transport failed: {}", e.without_url()))?;
+        if response.status().as_u16() == 401 {
+            return Err(Unauthorized.into());
+        }
         if response.status().as_u16() == 404 {
             return Err(
                 crate::media::Rejected("That Rakazo resource is no longer available.").into(),
@@ -204,6 +243,47 @@ impl Rakazo {
     /// @see github:elie222/rakazo@535de9600bdd90530aa7cd954bf2d29b4a083aaf packages/contracts/src/rpc.ts
     pub async fn bots(&self) -> Result<Vec<Bot>> {
         self.rpc(&["bots", "list"], Value::Null).await
+    }
+    /// Unauthenticated liveness probe (`GET /healthz`). The bearer token is
+    /// deliberately not sent to the health endpoint.
+    pub async fn healthz(&self) -> Result<u16> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid RPC base"))?
+            .pop_if_empty()
+            .extend(["healthz"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Rakazo health probe failed: {}", e.without_url()))?;
+        Ok(response.status().as_u16())
+    }
+    /// Messaging attachments linked to this session's user and space.
+    pub async fn linked_attachments(&self) -> Result<Vec<LinkedAttachment>> {
+        self.rpc(&["conversationAttachments", "linked"], Value::Null)
+            .await
+    }
+    /// Post plain text through a linked messaging attachment. This is the
+    /// interim reply surface: it never writes a user-role thread message and
+    /// never starts a model run. `clientNonce` must be a UUID.
+    pub async fn direct_send_attachment(
+        &self,
+        attachment_id: &str,
+        text: &str,
+        nonce: &str,
+    ) -> Result<()> {
+        let _: Value = self
+            .rpc(
+                &["conversationAttachments", "directSend"],
+                json!({"attachmentId": attachment_id, "text": text, "clientNonce": nonce}),
+            )
+            .await?;
+        Ok(())
     }
     /// Create one agent. `spawnKey` is the server-side idempotency key.
     pub async fn create_bot(&self, bot: &NewBot<'_>) -> Result<Bot> {

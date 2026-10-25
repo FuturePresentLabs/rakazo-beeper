@@ -1,0 +1,27 @@
+[Unit]
+Description=Rakazo Fleet Orchestrator inbound relay
+Documentation=file://%h/.local/share/rakazo-beeper/docs/orchestrator-in-rakazo.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=%h/.local/share/rakazo-beeper/bin/rakazo-beeper
+ConditionPathExists=%h/.local/share/rakazo-beeper/orch.env
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/rakazo-beeper
+EnvironmentFile=%h/.local/share/rakazo-beeper/orch.env
+Environment=RUST_LOG=rakazo_beeper=info
+ExecStart=%h/.local/share/rakazo-beeper/bin/rakazo-beeper orch watch --interval-s 5 --state-file %h/.local/share/rakazo-beeper/data/orch-watch.json
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/rakazo-beeper/data
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

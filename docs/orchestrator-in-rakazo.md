@@ -1,8 +1,9 @@
 # Fleet orchestrator and PMs in Rakazo
 
-Status: **phase 1 — CLI and roster only.** Nothing in this document has been
-applied to `agents.fpl.dev`. Creating production agents, nesting sub-chats and
-the live message spike are phase 2 and require human approval.
+Status: **phase 1 CLI/roster plus the authorised inbound relay.** The relay
+code, unit/config diff and rollback are ready; nothing has been deployed to
+`agents.fpl.dev`. A reply still needs the upstream assistant-append change
+(`pm/rakazo/assistant-append-proposal.md`).
 
 This document describes how the local fleet (the pi orchestrator plus one PM per
 live vertical) is represented as first-class Rakazo agents, and how human text in
@@ -25,6 +26,110 @@ The token is a normal Rakazo session. Secret files must remain owner-readable
 only. `orch whoami` is the first command to run in a new environment: it prints
 the session owner and the space the server actually resolved, and fails if that
 space differs from `RAKAZO_ORCH_SPACE_ID`.
+
+## Allowlisted conversation (inbound relay)
+
+`orch watch`, `orch reply` and `orch status` read exactly one conversation from
+the environment. There is no wildcard and no fallback to "the first bot this
+session can see":
+
+| variable | meaning |
+| --- | --- |
+| `RAKAZO_ORCH_BOT_ID` | the one bot id (`cmvic21mh001gkuffgxcmz7lb` for the live Fleet Orchestrator) |
+| `RAKAZO_ORCH_SPACE_ID` | the one space id (`b66f30cc72e5beac43f6b9ad9c0d5c9b` for live) |
+| `RAKAZO_ORCH_THREAD_ID` | the one thread id; `botId` is not accepted as an implicit fallback |
+| `RAKAZO_ORCH_STATE_FILE` | optional default for `--state-file` |
+
+`Allowlist::check` rejects a different bot id, an archived bot, a different
+space, or a different thread before any read or write. `bind` also refuses a
+state file bound to another bot, so a copied state file cannot re-point the
+relay. A mismatch is one log line and an error, never a cross-tenant read.
+
+The bearer token is still the existing Rakazo **session** token behind
+`RAKAZO_ORCH_TOKEN_FILE` (mode 0600) or `RAKAZO_ORCH_TOKEN`. No service token is
+issued upstream yet; the PM is routing that separately as
+`pm/rakazo/service-token-proposal.md`. Do not mint credentials or create a
+service account for this increment. The token is never printed or logged.
+
+## Inbound delivery
+
+`orch watch` polls only user-role messages in the allowlisted thread. Each new
+message produces exactly one:
+
+```sh
+pi-notify send --kind note --worker <name> --ref rakazo:<threadId>:<messageId> \
+  --text '[rakazo:<threadId>:<messageId>] <summary>'
+```
+
+Dedupe is by message id plus a `seq` watermark in a bounded JSON state file
+(512 ids). Restarting with the same state file delivers nothing twice. A
+notify failure returns an error and does **not** advance the watermark, so the
+next poll retries the same message. There is no `pi-tmux`, `send-keys`, or
+`--kind steer` path.
+
+## Interim reply surface (no lie)
+
+There is no assistant-append RPC. `threads.send` always writes a **user**
+message and queues a run, so `reply` never calls it. The only outbound path is
+`conversationAttachments.directSend` on a linked attachment whose label matches
+the allowlisted bot name. The output is explicitly `surface=attachment`.
+
+A normal Agent conversation (including the live Fleet Orchestrator today) has
+no linked attachment. `orch reply --dry-run` prints the would-be surface without
+sending; without an attachment both dry-run and real reply fail closed with:
+
+```
+unsupported: no assistant-append RPC
+```
+
+That limitation is intentional: an interim notification is honest, a fake user
+message (which would also start a model run) is not.
+
+## Health / status
+
+`orch status` is one JSON line and exits non-zero if any upstream check fails.
+It never includes a token, a request body, or message text.
+
+```json
+{
+  "bot_id": "...",
+  "conversation_id": "...",
+  "thread_id": "...",
+  "space_id": "...",
+  "watermark": 42,
+  "delivered": 3,
+  "duplicates": 1,
+  "last_delivered_id": "...",
+  "last_poll_ok": true,
+  "last_poll_at": "2026-10-21T18:00:00Z",
+  "last_error": null,
+  "upstream": {
+    "healthz": {"status": "ok", "code": 200, "at": "..."},
+    "token": {"status": "valid", "at": "..."}
+  }
+}
+```
+
+`healthz` is an unauthenticated `GET /healthz` (the token is not sent). Token
+validity is a real `me` RPC: an explicit HTTP 401 becomes
+`token.status = "invalid", code = 401`, with the time, so a silent expiry can
+never look healthy. A transport error is `status = "error"`.
+
+## Deploy diff (not applied) and rollback
+
+Files, none of which changes the server:
+
+- `deploy/rakazo-orch-watch.service` — one long-running `orch watch` unit,
+  hardened with `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, and a
+  single writable state directory.
+- `deploy/rakazo-orch.env.example` — the four non-secret environment values plus
+  the token file path. Copy it to a mode-0600 `orch.env`; never commit values.
+- `deploy/rakazo-orch-health.{service,timer}` — a five-minute `orch status`
+  check that fails on a non-200 `/healthz` or a 401/invalid token.
+
+Rollback is local and instant: stop and disable the unit, remove it and
+`orch.env`, and keep the state file (deleting it would re-deliver recent
+messages). Nothing upstream was created or changed.
 
 ## Roster
 
