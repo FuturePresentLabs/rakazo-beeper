@@ -1,8 +1,13 @@
 # ADR: one `irc-bridge` core for Rakazo, Muse and the pi fleet
 
 Status: **Proposed — evidence and decision only.** No bridge, daemon, transcript
-or production path was added in this unit. Repo placement is a human decision
-and is not recorded as accepted here.
+or production path was added by this document. Repo placement is a human
+decision and is not recorded as accepted here.
+
+Reconciled against `origin/main` `41a2144` (after PR #19 "auto-add orchestrator,
+PMs and Muse" and PR #20 "Muse via the self-hosted ohmOS agent-conversation
+API"). This revision only corrects statements that became stale when those two
+changes merged; no claim was added beyond code that exists on that commit.
 
 Companion evidence: [`irc-bridge-inventory.md`](irc-bridge-inventory.md).
 Related: [`irc-client.md`](irc-client.md),
@@ -17,7 +22,10 @@ agent:
 1. **Beeper/Matrix ↔ Rakazo agent** — the Rust `rakazo-beeper` appservice.
 2. **Rakazo UI ↔ an existing ohmOS conversation (the visible Muse chat)** — a
    selected WhatsApp/Telegram thread imported into Rakazo as an
-   attachment-backed bot by `fpl-agents`.
+   attachment-backed bot by `fpl-agents` for **display**, while a second,
+   separate consumer in `rakazo-beeper`
+   (`[[agent]] transport = "ohmos"`) owns **agent delivery and outbound** for
+   the same native conversation.
 3. **Fleet IRC / pi bus** — `pi-bus`, `pi-bus-ircd.lua`, `pi-irc-tls`,
    `pi-bus-unibus`, `pi-note`, `pi-notify`, plus the Rust IRC client in
    `rakazo-beeper`.
@@ -25,7 +33,9 @@ agent:
 Each path has its own identity, dedupe, durable ledger, retry rule and
 transcript. The result is not just duplication: the same logical peer (“Muse”)
 has at least two unrelated identities, and a message can be delivered by one
-path while a different path waits for a poll.
+path while a different path waits for a poll. The Muse conversation is now read
+by two consumers with disjoint jobs (UI display vs agent delivery); that split
+is deliberate and must be preserved, not "deduplicated" by merging accounts.
 
 The first deliverable is therefore **evidence**, not a rewrite. This ADR records
 the paths, the duplicated responsibilities, one proposed core, the repo
@@ -69,6 +79,9 @@ Writers of a message row on this path: `src/transport.rs`,
 
 ### 2.2 Rakazo UI ↔ ohmOS conversation (the visible Muse chat)
 
+There are now **two consumers of the same ohmOS conversation with disjoint
+ownership**. Neither one is allowed to do the other's job.
+
 ```text
 WhatsApp / Telegram / SMS
         │  existing native conversation on the CAT S22 ohmphone
@@ -80,24 +93,44 @@ ohmos-provisioning-1  services/provisioning/src/agent_conversations.rs
   GET  /messages/agent-conversations
   GET  /messages/agent-conversations/:id
   POST /messages/agent-conversations/:id/messages
-        │  HTTP(S), bearer, attachment id = <channel>:<remote_id>
-        ▼
-Rakazo API adapter  packages/adapters/src/selected-conversation-attachments.ts
-        │  endpoint + "/agent-conversations"
-        ▼
-Rakazo API  packages/adapters/src/conversation-bots.ts
-  ensureBot(attachment)          → Rakazo bot = conversationBotId(attachment.id)
-  synchronize(attachment)        → message id = native:<sha256([botId,native_id])>
-  send(...)                      → conversationBotTransportNonce(botId, clientNonce)
-        │
-        ▼
-Rakazo UI  (bot with a thread; current Muse binding id = muse-whatsapp)
+        │  HTTP(S), bearer; attachment id = <channel>:<remote_id>
+        ├───────────────────────────────────────────────┐
+        │ display owner                                  │ agent owner
+        ▼                                               ▼
+Rakazo API adapter                            rakazo-beeper [[agent]]
+  packages/adapters/src/                      transport = "ohmos"
+  selected-conversation-attachments.ts          src/ohm/agent_conversations.rs
+        │ endpoint + "/agent-conversations"         │ src/ohm/ohmos.rs
+        ▼                                           │ inbound from_me=false
+Rakazo API                                      │   → pi-notify --kind steer --urgent
+  packages/adapters/src/                        │     --ref rakazo:<conversation>:<native_id>
+  conversation-bots.ts                          │ outbound reply
+  ensureBot/synchronize/send                    │   → POST …/messages with stable request_id
+        │                                           ▼
+        ▼                                     roster `worker` pane (default: agent key)
+Rakazo UI  (display only; current Muse binding id = muse-whatsapp)
 ```
 
-Writers of a message row on this path: `conversation-bots.ts::synchronize`
+Display path: `conversation-bots.ts::synchronize` imports native rows
+(`native:<sha256([botId, native_id])>`) and the Rakazo API send path uses
+`conversationBotTransportNonce(botId, clientNonce)` → ohmOS
+`queue_outbound_once`. The provider echo is then imported by `synchronize`.
+
+Agent path: `src/ohm/agent_conversations.rs` speaks exactly the three routes
+above (`src/ohm/agent_conversations.rs:13-21`), offline unless an `[[agent]]`
+`base_url` is configured (`src/ohm/mod.rs:13-17`), with a typed 401 and a typed
+502/503/504 (`degraded`, never a success: `src/ohm/agent_conversations.rs:127-145`).
+`src/ohm/ohmos.rs::poll_once` (`:352-404`) delivers each `from_me=false` row at
+most once, keyed by the phone `native_id`, and `reply` (`:415-444`) posts with a
+stable `request_id` so a retry replays at the phone instead of duplicating.
+The ownership split is stated in `src/ohm/ohmos.rs:9-15`: this code owns agent
+delivery + outbound; the hosted `conversationAttachments` binding owns display.
+
+Writers of a message row on the display path: `conversation-bots.ts::synchronize`
 (imports/upserts native messages) and the Rakazo API send path
-(`conversation-bots.ts::send` → ohmOS `queue_outbound_once`; the provider echo is
-then imported by `synchronize`).
+(`conversation-bots.ts::send` → ohmOS `queue_outbound_once`).
+Writers on the agent path: the ohmOS native store (phone), plus the local
+dedupe ledger `src/ohm/ohmos.rs` writes to `<key>-ohmos.json`.
 
 ### 2.3 Rakazo conversation ↔ local fleet pane
 
@@ -127,6 +160,25 @@ src/orch/reply.rs
 Writers: `src/orch/watch.rs` writes only the notify row and its state file;
 `src/orch/reply.rs` writes through `directSend`; `bin/pi-notify` writes the
 outbox; `extensions/inbox-delivery.ts` marks per-consumer delivery.
+
+**Roster source (current, not a hardcoded PM list).** The local fleet roster is
+derived at runtime by `src/orch/roster.rs`: `verticals.toml` (resolved through
+`PI_PM_VERTICALS`, then `PI_PM_ROOT`/`PI_AGENT_HOME`, then `~/.pi/agent`) is the
+canonical vertical list, and `pi-pm list --tsv` supplies each live pane, phase
+and worker count (`src/orch/roster.rs:1-21`, `:197-218`, `:249-291`). Stable keys
+are derived (`fleet-orch-v1`, `fleet-pm-<vertical>-v1`), so a new PM appears from
+a data edit. A paused vertical stays visible but is never routed
+(`src/orch/mod.rs:181-187`).
+
+**Which Rakazo bots the Beeper bridge polls.** PR #19 added `auto_bots`: when
+`auto_bots = true` (`src/config.rs:41-44`), `select_bot_ids` adds the live space's
+orchestrator root (matched by `spawnKey == "fleet-orch-v1"` or name
+`Fleet Orchestrator`), **every active direct child of that root** (the PMs), and
+any active bot named `Muse` (`src/service.rs:102-146`; selection is refreshed on
+every discover tick, `:224-230`). Explicit `bot_ids` are still honored and
+archived bots stop being polled. Selection is relationship/live-space based,
+while `orch watch` remains a single allowlisted conversation
+(`RAKAZO_ORCH_BOT_ID`/`THREAD_ID`) — the two are not the same list.
 
 ### 2.4 Fleet IRC / pi bus
 
@@ -188,14 +240,31 @@ Beeper contact.
   the phone's `queue_outbound_once` key `(owner, device, request_id)`.
 - The fleet IRC room `#muse` is a different identity: principal `muse` in
   `fleet-bus/irc/grants.json`, rooms `#muse`/`#buddies`, rows in
-  `fleet-bus/irc/transcript-YYYYMMDD.jsonl`. No source or config file under
-  `rakazo-beeper`'s `src/`, `config*.toml` or `deploy/` references Muse; the
-  only Muse references in `docs/` are this ADR and its inventory.
+  `fleet-bus/irc/transcript-YYYYMMDD.jsonl`. It is still a distinct peer from
+  the WhatsApp conversation and must not be merged with it.
+- Since PR #20, `rakazo-beeper` **does** reference the WhatsApp Muse path: it is
+  a second consumer of the same ohmOS `agent-conversations` API, owning agent
+  delivery and outbound only. The relevant code is
+  `src/ohm/agent_conversations.rs` (HTTP provider, typed 401 and typed
+  502/503/504 `degraded`), `src/ohm/ohmos.rs` (poll/reply/durable ledger) and
+  `src/main.rs` (`ohm agent-probe|agent-reply|agent-serve`). The Rakazo UI
+  still gets its rows from `fpl-agents`, and this provider never posts into the
+  Rakazo UI, so a message is not doubled (`src/ohm/ohmos.rs:9-15`).
 
-One consequence matters for the wake contract: the Muse attachment is currently
-a **human UI relay**. It does not call `pi-notify`/`pi-note`, so it does not wake
-a fleet pane. That is a gap to fix in an adapter; it is not evidence that
-`#muse` is already wired into Rakazo.
+**Ownership split, stated explicitly:** Rakazo/`fpl-agents` owns **display** of
+the attachment (`conversation-bots.ts::synchronize` is the row writer); the
+`rakazo-beeper` ohmOS provider owns **agent delivery and outbound** for the same
+native conversation. The old blanket claim that "no source or config file under
+`rakazo-beeper` references Muse" was true at `e99f122` and is now stale; it was
+replaced by this split when PR #20 merged.
+
+One consequence matters for the wake contract: the Rakazo **UI attachment** is
+still a human display relay and does not call `pi-notify`/`pi-note`, so display
+alone does not wake a fleet pane. The ohmOS **agent provider** does comply: it
+delivers each inbound row via `pi-notify send --kind steer --urgent --ref
+rakazo:<conversation>:<native_id>` (`src/ohm/ohmos.rs:121-183`, `:352-404`).
+These are two different consumers; do not represent the display binding as a
+fleet wake, and do not add a poller to make it one.
 
 ## 4. Duplicated responsibilities
 
@@ -205,7 +274,7 @@ a fleet pane. That is a gap to fix in an adapter; it is not evidence that
 | **Dedupe** | Beeper `(tenant,txn)`, `(tenant,event_id)`, `event_nonces`, `message_links`, `send_receipts`; IRC `source_key`; orch `last_seq` + `delivered_ids` + `own_nonces`; A2A `(from,to,content_hash)`; tapback `(escalation_id,message_id)`; ohmOS `(owner,device,request_id)`; fpl-agents `(attachmentId,clientNonce)` + `native:<hash>`; `pi-note` `msg_id` | Every adapter is replay-safe only in its own ledger. A cross-path retry is a new message. |
 | **Transcript** | Rakazo `messages`; `irc_messages`; `fleet-bus/irc/transcript-*.jsonl`; `notes/*.jsonl`; ohmOS phone store; Beeper room timeline | Several “sources of truth”. Replay and audit require knowing which one is authoritative. |
 | **Retry** | Beeper `inbox.attempts/next_at`; IRC `pending`→`sent`/`unknown` (never resend); fpl-agents `SyncHealth` backoff + immutable send request; orch watermark not advanced on notify failure; ohmOS `queue_outbound_once` | Retry semantics differ across paths; a timeout can mean “unknown” on one path and “safe to retry” on another. |
-| **Wake** | `pi-notify` outbox + `inbox-delivery` `fs.watch`; IRC DM to orch → `pi-notify`; `orch watch` → `pi-notify steer`; Muse attachment → Rakazo UI only | Chat delivery must be event-driven. Writing a transcript row and waiting for a poll is a bug. |
+| **Wake** | `pi-notify` outbox + `inbox-delivery` `fs.watch`; IRC DM to orch → `pi-notify`; `orch watch` → `pi-notify steer`; ohmOS agent provider → `pi-notify steer --urgent`; Rakazo UI attachment → display only | Chat delivery must be event-driven. Writing a transcript row and waiting for a poll is a bug. |
 | **Routing** | `src/fleet/route.rs` (offline M0); `src/orch/roster.rs` + `src/orch/mod.rs` (derived roster); `fleet-bus/irc/grants.json` (IRC/unibus); `pi-note` target resolution | Two routing models (bot/thread and principal/room) with no shared table. |
 
 ## 5. Proposed one-core layout
@@ -268,7 +337,7 @@ irc-bridge/
 | adapter | owns | does not own |
 | --- | --- | --- |
 | `adapters/rakazo` | Matrix appservice/websocket transport, tenant registration, ghost/room lifecycle, Rakazo RPC (`threads.*`, `conversationAttachments.*`, `messages.react`), per-tenant config | appservice registration (Beeper/`bbctl`), tenant secrets, Rakazo UI |
-| `adapters/muse` | ohmOS `agent-conversations` HTTP + Iroh phone hop, WhatsApp/Telegram native ids, owner/device scope; and the `org:muse`/`#muse` IRC profile as a *distinct account* | phone credentials/history, ohmOS store, WhatsApp client; never merges the two Muse identities |
+| `adapters/muse` | ohmOS `agent-conversations` HTTP + Iroh phone hop, WhatsApp/Telegram native ids, owner/device scope; and the `org:muse`/`#muse` IRC profile as a *distinct account*. **Current home of the ohmOS provider: `rakazo-beeper` `src/ohm/{agent_conversations,ohmos}.rs`; extraction means moving it behind this boundary, not writing a second one.** | phone credentials/history, ohmOS store, WhatsApp client; never merges the two Muse identities; never writes Rakazo UI rows |
 | `adapters/pi` | `pi-bus`/`pi-note`/`pi-notify` calls, fleet principals, pane targets, transcript projection | grant issuance/CA, pane lifecycle, pi runtime |
 | `irc/` | ZNC/TLS client or edge, CAP/msgid handling, chunking, keepalive | routing policy, transcript ownership |
 
@@ -307,6 +376,10 @@ removed only after parity evidence.
 
 - Inventory and this ADR. No production change, no new daemon, no second
   transcript.
+- Reconciled against `origin/main` `41a2144`, which includes PR #19 (auto-add
+  orchestrator, PMs and Muse) and PR #20 (the ohmOS agent-conversation
+  provider). Rebase target and component facts in this revision are those of
+  that commit.
 - Human decision on repo placement. If the decision is “new repo”, create it
   empty; do not move code yet.
 
@@ -321,9 +394,10 @@ removed only after parity evidence.
   nothing; an unknown/ambiguous outbound is never automatically resent; our own
   echo does not create an inbound row; chunk reassembly is stable.
 - This slice does **not** touch `src/orch/**` or `src/fleet/route.rs`.
-- Base: current `origin/main` (`e99f122`, which already includes the derived-roster
-  change). If `pi/dynamic-roster` is still open in another checkout,
-  rebase on it rather than duplicating its files.
+- Base: current `origin/main` (`41a2144`, which already includes the derived
+  roster, the auto-fleet selection and the ohmOS agent provider). If another
+  roster/provider branch is still open in another checkout, rebase on it rather
+  than duplicating its files.
 
 ### Phase 2 — `adapters/pi`
 
@@ -336,8 +410,11 @@ removed only after parity evidence.
 
 ### Phase 3 — `adapters/muse`
 
-- Wrap the ohmOS `agent-conversations` API and the `org:muse`/`#muse` IRC
-  profile as separate accounts under one adapter.
+- The ohmOS `agent-conversations` provider already exists in `rakazo-beeper`
+  (`src/ohm/agent_conversations.rs`, `src/ohm/ohmos.rs`, CLI in `src/main.rs`),
+  offline by default and owning agent delivery + outbound. Phase 3 is an
+  **extraction behind the adapter boundary**, not a new implementation: the
+  `org:muse`/`#muse` IRC profile stays a separate account.
 - Preserve `muse-whatsapp` binding, `conversationBotId`, `native:<hash>` and
   `conversationBotTransportNonce` semantics exactly. The first version can be a
   mirror/read-through: the core records identity and intent, the existing
@@ -394,22 +471,25 @@ removed only after parity evidence.
   IRC/transcript row and waiting for a poll is a bug.
 - A missed message must be recoverable from the durable ledger, not “wait for
   the next tick”.
-- Current status: `orch watch` and the IRC DM-to-orch path comply; the Muse
-  ohmOS attachment does not (it is UI-only today) and must not be represented as
-  a fleet wake until the handoff is implemented.
+- Current status: `orch watch`, the IRC DM-to-orch path and the ohmOS agent
+  provider (`ohm agent-serve` → `pi-notify --kind steer --urgent`) comply. The
+  Rakazo **UI attachment** does not: it is display-only today and must not be
+  represented as a fleet wake until an explicit handoff is implemented.
 
 ## 10. Open decisions for the human
 
 1. **Repo placement:** new repo (recommended), agentsmith, or ohmOS.
-2. **Muse scope:** is the desired Muse adapter the existing WhatsApp
-   conversation (what the Rakazo UI shows), the `org:muse`/`#muse` IRC peer, or
-   both as separate accounts? This ADR treats them as separate; do not merge.
+2. **Muse scope:** the ohmOS conversation now has two consumers (Rakazo UI
+   display, `rakazo-beeper` agent delivery/outbound) plus the separate
+   `org:muse`/`#muse` IRC peer. Confirm the intended product surface: keep the
+   current split, or make the IRC peer a third account? This ADR keeps all
+   three separate and says do not merge them.
 3. **Beeper exposure:** is Muse expected to appear as a Beeper contact, or only
    as the Rakazo UI attachment bot? Beeper only sees the bots listed in
    `bot_ids`; that is a separate configuration decision.
 4. **First slice owner/base:** confirm Phase 1 on current `origin/main`
-   (`e99f122`, the derived-roster change) and that no one is editing
-   `src/orch/**` or `src/fleet/route.rs` concurrently.
+   (`41a2144`, derived roster + auto-fleet + ohmOS agent provider) and that no
+   one is editing `src/orch/**` or `src/fleet/route.rs` concurrently.
 
 ## 11. Consequences
 
@@ -421,3 +501,27 @@ removed only after parity evidence.
   Phases 1–4 require temporary dual-write/read-through and a feature flag.
 - Non-goal: a “universal chat” model that erases native semantics. The core
   routes and dedupes; adapters preserve their transport’s truth.
+
+## 12. Evidence basis for this revision
+
+- Branch `pi/irc-bridge-extraction` rebased onto `origin/main` `41a2144`.
+  `git diff --stat origin/main...HEAD` shows only `docs/*.md`.
+- Every file:line citation added or corrected in this revision was checked with
+  `git grep -n` against that commit; the commands are listed in
+  `irc-bridge-inventory.md` §9.
+- No code, test, config, daemon, deploy, transcript or secret was added by this
+  PR. No live network call, Rakazo session, ohmOS request or phone contact was
+  made while writing it.
+
+**Not verified here (explicitly out of scope for a docs-only PR):**
+
+- The live ohmOS leg. `docs/ohm-client.md` records the phone/Iroh hop as
+  currently returning 502 (typed `degraded`); this ADR does not claim a
+  successful live snapshot, delivery or reply.
+- Any deployed behavior on `agents.fpl.dev`, pris, the CAT S22 phone, Beeper or
+  the fleet panes. The documents describe code and configuration, not uptime.
+- Whether a real Muse message currently reaches `pi-notify` end to end; the
+  code path and its offline tests exist, the production invocation does not.
+- Cross-repo commits other than the pinned `rakazo-beeper` `41a2144`
+  (`fpl-agents`, `ohmos`, `agentsmith` pins are unchanged from the original
+  inventory).

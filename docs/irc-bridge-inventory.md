@@ -8,7 +8,7 @@ Pinned checkouts used for this inventory:
 
 | repo | commit |
 | --- | --- |
-| `rakazo-beeper` | `e99f122` (`origin/main`; the derived roster change) |
+| `rakazo-beeper` | `41a2144` (`origin/main`; derived roster + auto-fleet + ohmOS agent provider) |
 | `fpl-agents` | `826bc019` |
 | `ohmos` | `849e49c` |
 | `shared-infra` | `8916e0a` |
@@ -26,7 +26,8 @@ rooms.
 | durable Beeper inbox/outbox | `src/store.rs` | tables `inbox`, `transactions`, `event_nonces`, `message_links`, `send_receipts`, `run_routes`, `bindings`, `sync_cursors` |
 | tenant runtime / poll | `src/service.rs` | `TenantRuntime::ingest`, `deliver_inbound`, `poll_binding` |
 | Rakazo RPC client | `src/rakazo.rs` | `threads.send`, `conversationAttachments.directSend`, `messages.react`; no assistant-append RPC on this base |
-| configuration | `config.example.toml` | `[[tenants]]`, `registration`, `bot_ids`, `rakazo_space_id` |
+| configuration | `config.example.toml` | `[[tenants]]`, `registration`, `bot_ids`, `auto_bots` (`src/config.rs:41-44`), `rakazo_space_id` |
+| selected bot set | `src/service.rs` | `select_bot_ids` (`:102-146`); with `auto_bots`, adds the orchestrator root, its active direct children (PMs) and a bot named `Muse` on every discover tick (`:224-230`) |
 | deployment owner | `shared-infra/projects/rakazo-beeper/` | `live-deployment.json`, `main.tf`, `release-request.json` |
 | personal registration path | `secrets/registration-personal.json` (runtime, not git) | `bbctl register --json sh-rakazo`; `README.md` |
 
@@ -59,7 +60,9 @@ Writers: `src/service.rs`, `src/matrix.rs`, `src/store.rs`.
 | Rakazo bot/thread API | `src/rakazo.rs` | `bots`, `threads.messages`, `threads.send`, `conversationAttachments.directSend`, `messages.react` |
 | allowlisted inbound watcher | `src/orch/watch.rs` | polls one bot/thread, notifies `pi-notify send --kind steer --ref rakazo:<thread>:<message>` |
 | interim reply surface | `src/orch/reply.rs` | only `conversationAttachments.directSend`; no assistant append on the committed base |
-| derived roster | `src/orch/roster.rs`, `src/orch/mod.rs` | `verticals.toml` + `pi-pm list --tsv`; no hardcoded PM array |
+| derived roster | `src/orch/roster.rs`, `src/orch/mod.rs` | `verticals.toml` + `pi-pm list --tsv`; no hardcoded PM array (`src/orch/roster.rs:1-21`, `:197-218`, `:249-291`) |
+| Muse agent provider (Slice B) | `src/ohm/agent_conversations.rs`, `src/ohm/ohmos.rs` | ohmOS `agent-conversations` HTTP; offline by default, typed 401/502; `pi-notify` delivery + stable `request_id` |
+| Muse CLI surface | `src/main.rs` | `ohm agent-probe`, `ohm agent-reply`, `ohm agent-serve` (`:108-140`) |
 | offline fleet contract | `src/fleet/{route,a2a,tapback}.rs` | M0 only; `main.rs` is not wired to these modules |
 | no assistant append | `docs/orchestrator-in-rakazo.md` | "there is no assistant-append RPC"; `orch reply` fails closed without an attachment |
 
@@ -89,7 +92,33 @@ exactly one linked attachment whose label matches the bot name, with a UUID
 | A2A `(from, to, content_hash)` | `src/fleet/a2a.rs`; offline dedupe window |
 | tapback `(escalation_id, message_id)` | `src/fleet/tapback.rs`; terminal per escalation |
 
-## 3. Rakazo IRC client (Rust, `rakazo-beeper`)
+## 3. Muse agent provider (Rust, `rakazo-beeper`, `transport = "ohmos"`)
+
+This is a **second consumer of the same ohmOS conversation**, not a second
+bridge. It owns agent delivery and outbound; the Rakazo UI attachment still owns
+display (`src/ohm/ohmos.rs:9-15`). It does not use `conversationAttachments`
+and never posts into the Rakazo UI.
+
+| concern | path | evidence |
+| --- | --- | --- |
+| ohmOS HTTP provider | `src/ohm/agent_conversations.rs` | `GET /agent-conversations`, `GET /{id}?limit=N`, `POST /{id}/messages` (`:13-21`); bearer from an owner-only token file |
+| offline default | `src/ohm/mod.rs` | no `[[agent]] base_url` = zero network calls (`:13-17`); `AgentConversationsClient::is_offline` (`agent_conversations.rs:444-446`) |
+| typed failures | `src/ohm/agent_conversations.rs` | 401 = `Unauthorized`, 502/503/504 = `Degraded` (reported, never queued/delivered) (`:127-145`, `:607-615`) |
+| inbound delivery | `src/ohm/ohmos.rs` | `poll_once` (`:352-404`) delivers `from_me=false`, non-deleted, non-empty `native_id` rows at most once via `pi-notify send --kind steer --urgent --ref rakazo:<conversation>:<native_id>` (`:121-183`) |
+| outbound reply | `src/ohm/ohmos.rs` | `reply` (`:415-444`) posts with a stable `request_id`; retry returns `AlreadyQueued` instead of a second HTTP post |
+| CLI | `src/main.rs` | `ohm agent-probe` (read-only status), `ohm agent-reply`, `ohm agent-serve` (`:108-140`) |
+| durable ledger | `src/ohm/ohmos.rs` | one JSON state file per agent (default `<key>-ohmos.json`); `seen`, `replies`, `own_requests` (`:264-284`, `:465-479`) |
+
+**Identity/dedupe keys.**
+
+| key | where |
+| --- | --- |
+| phone `native_id` | inbound dedupe (`seen`, bounded at 8192) and the `--ref` suffix; the phone's stable message identity |
+| `(agent, text)` → `stable_request_id` = `rakazo-<agent>-<24 hex>` | `src/ohm/agent_conversations.rs:665-673`; deterministic retry-safe outbound id |
+| `request_id` | ohmOS/phone immutable send key; also recorded in `own_requests`/`replies` for echo suppression |
+| conversation id (`<channel>:<remote_id>`, e.g. `whatsapp:…@bot`) | provider target; read from `GET /agent-conversations` |
+
+## 4. Rakazo IRC client (Rust, `rakazo-beeper`)
 
 This is a real IRC client for the fleet bus, separate from the Beeper/Matrix
 bridge and from the Rakazo UI.
@@ -116,7 +145,7 @@ bridge and from the Rakazo UI.
 printing; `src/irc/inbox.rs` writes outbound before the socket write. The
 inbox is the authority for unread/acked/replied/reactions.
 
-## 4. Fleet IRC and agent bus (agentsmith, `~/.pi/agent`)
+## 5. Fleet IRC and agent bus (agentsmith, `~/.pi/agent`)
 
 | concern | path | evidence |
 | --- | --- | --- |
@@ -143,7 +172,7 @@ inbox is the authority for unread/acked/replied/reactions.
 | `chat.v1` `msg_id` / `prev_id` | unibus bridge envelope |
 | notify outbox row `id` + `--ref` | `bin/pi-notify`; `inbox-delivery` per-consumer ack |
 
-## 5. ohmOS phone/attachment transport (Rust, `ohmos`)
+## 6. ohmOS phone/attachment transport (Rust, `ohmos`)
 
 | concern | path | evidence |
 | --- | --- | --- |
@@ -166,7 +195,12 @@ inbox is the authority for unread/acked/replied/reactions.
 The phone owns WhatsApp/Telegram credentials, history and the native outbox.
 The provisioning service holds only the bearer and the paired Iroh endpoint.
 
-## 6. Rakazo API conversation attachments (TypeScript, `fpl-agents`)
+Current in-repo consumer: `rakazo-beeper` `src/ohm/agent_conversations.rs`
+(HTTP client) + `src/ohm/ohmos.rs` (poll/reply/ledger), configured by an
+`[[agent]] transport = "ohmos"` block. It is a second consumer beside the
+`fpl-agents` display binding, not a replacement for it (§3, §8).
+
+## 7. Rakazo API conversation attachments (TypeScript, `fpl-agents`)
 
 | concern | path | evidence |
 | --- | --- | --- |
@@ -187,7 +221,7 @@ The provisioning service holds only the bearer and the paired Iroh endpoint.
 | `deliveryKey` (`bot-message:...`) | native sender; immutable intent |
 | `(attachmentId, clientNonce)` | `ConversationAttachmentSend` unique row; duplicate intent rejected |
 
-## 7. The Muse chat visible in the Rakazo UI
+## 8. The Muse chat visible in the Rakazo UI
 
 **Answer: it is an ohmOS WhatsApp conversation attachment, not the fleet IRC
 `#muse` and not a Beeper contact.**
@@ -197,12 +231,15 @@ Evidence is the dated live topology in
 code:
 
 ```text
-Rakazo UI / API
-  CONVERSATION_ATTACHMENTS_JSON endpoint = https://ohm.fpl.dev/messages
-  binding: id=muse-whatsapp label=Muse channel=whatsapp
-           remoteId=1807055946647697@bot
-        │  provider appends /agent-conversations
-        ▼
+              Rakazo UI / API                         rakazo-beeper [[agent]]
+  binding id=muse-whatsapp, channel=whatsapp      transport = "ohmos"
+  endpoint https://ohm.fpl.dev/messages            src/ohm/agent_conversations.rs
+        │ display owner                                  │ agent owner
+        │   /agent-conversations                          │   GET /agent-conversations
+        │                                                 │   GET /{id}?limit=N
+        │                                                 │   POST /{id}/messages
+        └───────────────────┬─────────────────────────────┘
+                            ▼
 ohm.fpl.dev → pris:12002 → container ohmos-provisioning-1
   services/provisioning/src/agent_conversations.rs
         │  Iroh ALPN ohm-bridge/1
@@ -212,6 +249,11 @@ CAT S22 ohmphone (ohmOS bridge-iroh)
         ▼
 WhatsApp conversation with Muse
 ```
+
+**The UI display path** (`fpl-agents`) and **the agent path** (`rakazo-beeper`)
+read the same native conversation but own disjoint outcomes: display vs agent
+delivery/outbound. See §3 for the provider and the ownership table below for
+the split.
 
 The writer of the Rakazo message rows is
 `packages/adapters/src/conversation-bots.ts::synchronize`, not `threads.send`.
@@ -229,16 +271,42 @@ updates `message` rows in the bot's thread:
 
 The fleet IRC `#muse` is a different principal and a different transcript:
 `muse` is in `fleet-bus/irc/grants.json` with rooms `#muse` and `#buddies`;
-its rows live in `fleet-bus/irc/transcript-YYYYMMDD.jsonl`. Nothing in
-`rakazo-beeper`'s `src/`, `config*.toml` or `deploy/` references Muse. The only
-Muse references in `docs/` are this inventory and its ADR.
+its rows live in `fleet-bus/irc/transcript-YYYYMMDD.jsonl`. It remains a
+separate peer from the WhatsApp conversation and must not be merged with it.
 
-The Muse attachment is currently a **human UI relay**. It does not hand a
-message to `pi-notify`/`pi-note`, so it does not satisfy the fleet wake contract.
-That is a gap to close in an adapter, not evidence that the fleet IRC room is
-already wired into Rakazo.
+### Ownership split after PR #19 and PR #20
 
-## 8. Every writer of a message row (summary)
+The claim that "nothing in `rakazo-beeper` references Muse" was true at
+`e99f122` and is **stale** as of `41a2144`: `src/ohm/ohmos.rs` and
+`src/ohm/agent_conversations.rs` now consume the same ohmOS conversation, and
+`src/service.rs` auto-selects a bot named `Muse`. The ownership is deliberately
+split, one owner per WhatsApp message (`src/ohm/ohmos.rs:9-15`):
+
+| concern | owner | evidence |
+| --- | --- | --- |
+| Rakazo UI display of `muse-whatsapp` | `fpl-agents` `conversation-bots.ts` (unchanged) | `synchronize` writes `native:<sha256([botId,native_id])>`; UI send uses `conversationBotTransportNonce` |
+| Agent delivery of inbound Muse rows | `rakazo-beeper` `[[agent]] transport = "ohmos"` | `src/ohm/ohmos.rs:352-404` → `pi-notify send --kind steer --urgent --ref rakazo:<conversation>:<native_id>` |
+| Outbound agent reply | `rakazo-beeper`, same provider | `src/ohm/ohmos.rs:415-444` → `POST /agent-conversations/{id}/messages` with `stable_request_id` |
+| Provider HTTP/typed errors | `rakazo-beeper` `src/ohm/agent_conversations.rs` | three routes (`:13-21`); 401 `Unauthorized`, 502 `Degraded` (`:127-145`); offline with no `base_url` (`src/ohm/mod.rs:13-17`) |
+| Beeper bridge auto-selection | `rakazo-beeper` `src/service.rs` | `auto_bots` adds the orchestrator root, active direct children (PMs) and a bot named `Muse` (`:102-146`) |
+
+Consequences for the wake contract:
+
+- The ohmOS **agent provider** complies: it hands each inbound row to
+  `pi-notify` (`src/ohm/ohmos.rs:121-183`), deduped by phone `native_id`, and
+the production command is `ohm agent-serve` (`src/main.rs:132-140`).
+- The Rakazo **UI attachment** is still display-only and does not call
+  `pi-notify`/`pi-note`. That is not a bug in the display binding and must not
+  be "fixed" by adding a poller; a wake belongs to the agent provider.
+- The split is what keeps a message from being doubled: the provider never
+  posts into the Rakazo UI, and the UI binding is never asked to deliver to an
+  agent (`src/ohm/ohmos.rs:9-15`).
+
+The live leg is not claimed here: `docs/ohm-client.md` records the phone/Iroh
+hop returning 502 (typed `degraded`), so the provider is offline-complete and
+its real snapshot/delivery is unverified in this inventory.
+
+## 9. Every writer of a message row (summary)
 
 | ledger/table | writer(s) | key |
 | --- | --- | --- |
@@ -250,18 +318,30 @@ already wired into Rakazo.
 | `fleet-bus/notes/*.jsonl` | `bin/pi-note` | `msg_id` |
 | `notify/outbox.jsonl` | `bin/pi-notify`, `bin/pi-bus-ircd.lua`, `bin/pi-note` | row `id` + `--ref` |
 | ohmOS phone `bridge.sqlite` / outbox | `agent_conversation.rs` / native messaging pump | `(owner,device,request_id)`, native id |
+| `<key>-ohmos.json` agent ledger | `src/ohm/ohmos.rs` (`poll_once`/`reply`/`save`) | phone `native_id`; `request_id` in `replies`/`own_requests`; bounded `seen` |
 | Beeper/Matrix room timeline | `src/matrix.rs` | Matrix event id; `event_nonces` for our sends |
 
-## 9. Commands used (read-only)
+## 10. Commands used (read-only)
 
 These are the exact commands used to build this inventory. They contain no
 secrets and made no writes.
 
 ```sh
-cd /Users/ajmwagar/src/fpl/rakazo-beeper
-git rev-parse --short HEAD                         # e99f122
-git log --oneline -3                               # e99f122, bc044c4, 1a3b220
-rg -n "muse" src config.example.toml deploy    # no live Muse path in source/config
+cd /Users/ajmwagar/src/fpl/rakazo-beeper/.worktrees/irc-bridge-extraction
+git rev-parse --short HEAD                         # 41a2144
+git log --oneline -3                               # 41a2144, 7fcaa2b, e99f122
+git diff --stat origin/main...HEAD                 # docs/*.md only
+
+# citations added/corrected in this revision (all must print a line)
+git grep -n "auto_bots" -- src/service.rs src/config.rs config.example.toml
+git grep -n "select_bot_ids" -- src/service.rs
+git grep -n "fn poll_once\|fn reply\|Ownership split" -- src/ohm/ohmos.rs
+git grep -n "pub enum AgentError\|stable_request_id\|is_offline" -- src/ohm/agent_conversations.rs
+git grep -n "transport = \"ohmos\"\|Offline by default" -- src/ohm/mod.rs
+git grep -n "AgentProbe\|AgentReply\|AgentServe" -- src/main.rs
+git grep -n "verticals.toml\|pi-pm" -- src/orch/roster.rs
+
+# original inventory commands (still read-only)
 rg -n "CREATE TABLE|event_id|nonce|source_key|stable_id" src/store.rs src/irc src/orch src/fleet
 sed -n '1,140p' src/store.rs
 sed -n '1,120p' src/irc/inbox.rs
@@ -290,6 +370,16 @@ head -c 600 fleet-bus/irc/transcript-20261026.jsonl
 rg -n "fs.watch|sendUserMessage|outbox.jsonl" extensions/inbox-delivery.ts
 ```
 
-Read-only verification result: the only live Muse chat path found is the
-`muse-whatsapp` ohmOS conversation attachment described above. No command in
-this inventory contacted Rakazo, pris, or the phone.
+**Not verified here.** No live network call, Rakazo session, ohmOS request or
+phone contact was made for this revision. In particular: the ohmOS live leg
+(`docs/ohm-client.md` records the phone/Iroh hop as 502/`degraded`), any
+deployed behavior on `agents.fpl.dev`/pris/the phone/Beeper, and whether a real
+Muse message currently reaches `pi-notify` end to end. The provider and its
+offline tests exist; production delivery is unproven in this document. The
+`fpl-agents`, `ohmos` and `agentsmith` pins are unchanged from the original
+inventory and were not re-verified.
+
+Read-only result: the only live Muse path found in this repo is the ohmOS
+conversation consumed by two owners — `fpl-agents` for Rakazo UI display and
+`rakazo-beeper` (`transport = "ohmos"`) for agent delivery/outbound. The fleet
+IRC `#muse` remains a separate principal.
