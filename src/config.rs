@@ -37,6 +37,11 @@ pub struct Tenant {
     pub rakazo_space_id: String,
     /// Explicitly opt individual bots into bridging. Empty means none.
     pub bot_ids: Vec<String>,
+    /// Automatically keep the fleet in sync: the orchestrator, every child
+    /// conversation (PMs), and the Muse agent. Explicit `bot_ids` are added
+    /// to this set. Removed/archived bots stop being polled on the next tick.
+    #[serde(default)]
+    pub auto_bots: bool,
     #[serde(default = "websocket_default")]
     pub websocket: bool,
 }

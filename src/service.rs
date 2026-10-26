@@ -33,6 +33,10 @@ pub struct TenantRuntime {
     pub last_success: AtomicU64,
     pub unsupported_encryption: AtomicBool,
     pub initialized: AtomicBool,
+    /// The bot ids currently selected for this tenant. `discover` refreshes
+    /// this from the live space when `auto_bots` is enabled, so inbound/queued
+    /// delivery cannot keep using a stale allowlist between ticks.
+    pub selected: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 pub struct Runtime {
@@ -68,6 +72,13 @@ impl Runtime {
                 last_success: AtomicU64::new(0),
                 unsupported_encryption: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
+                selected: std::sync::RwLock::new(
+                    tenant
+                        .bot_ids
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>(),
+                ),
             }));
         }
         Ok(Self {
@@ -84,6 +95,52 @@ impl Runtime {
                     < (self.poll_seconds * 4).max(90)
         })
     }
+}
+
+/// Build the selected bot ids from the live space. Kept as a pure function so
+/// the auto-fleet rule can be tested without a Matrix/Rakazo runtime.
+fn select_bot_ids(
+    bots: &[crate::rakazo::Bot],
+    explicit: &[String],
+    auto_bots: bool,
+) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    let mut push = |id: &str| {
+        if seen.insert(id.to_string()) {
+            selected.push(id.to_string());
+        }
+    };
+    let active = |bot: &&crate::rakazo::Bot| bot.archived_at.is_none();
+    let roots: Vec<&crate::rakazo::Bot> = bots
+        .iter()
+        .filter(active)
+        .filter(|bot| {
+            bot.spawn_key.as_deref() == Some("fleet-orch-v1") || bot.name == "Fleet Orchestrator"
+        })
+        .collect();
+    if auto_bots {
+        for root in &roots {
+            push(&root.id);
+            for bot in bots.iter().filter(active) {
+                if bot.parent_bot_id.as_deref() == Some(root.id.as_str()) {
+                    push(&bot.id);
+                }
+            }
+        }
+        for bot in bots.iter().filter(active) {
+            if bot.name.eq_ignore_ascii_case("muse") {
+                push(&bot.id);
+            }
+        }
+    }
+    for id in explicit {
+        if bots.iter().filter(active).any(|bot| &bot.id == id) {
+            push(id);
+        }
+    }
+    selected
 }
 
 impl TenantRuntime {
@@ -106,7 +163,7 @@ impl TenantRuntime {
             };
             let Some(binding) = bindings
                 .iter()
-                .find(|b| b.room == room && self.config.bot_ids.contains(&b.bot))
+                .find(|b| b.room == room && self.selected(&b.bot))
             else {
                 continue;
             };
@@ -148,18 +205,49 @@ impl TenantRuntime {
         self.store.ingest(&self.config.id, txn, &incoming)
     }
 
+    fn selected(&self, bot: &str) -> bool {
+        self.selected
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(bot)
+    }
+
+    fn set_selected<'a>(&self, bots: impl IntoIterator<Item = &'a String>) {
+        let selected = bots.into_iter().cloned().collect();
+        *self
+            .selected
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = selected;
+    }
+
+    /// The live fleet selection. Explicit `bot_ids` are always included when
+    /// they are visible. With `auto_bots`, the orchestrator root, every direct
+    /// child conversation (PMs), and Muse are added automatically. This is
+    /// deliberately relationship-based rather than a display-name list: a new
+    /// PM appears without a code or config edit.
+    fn selected_bot_ids(&self, bots: &[crate::rakazo::Bot]) -> Vec<String> {
+        select_bot_ids(bots, &self.config.bot_ids, self.config.auto_bots)
+    }
+
     pub async fn discover(&self) -> Result<()> {
-        if self.config.bot_ids.is_empty() {
+        if !self.config.auto_bots && self.config.bot_ids.is_empty() {
+            self.set_selected(std::iter::empty());
             self.initialized.store(true, Ordering::Relaxed);
             return Ok(());
         }
         let bots = self.rakazo.bots().await?;
+        let selected = self.selected_bot_ids(&bots);
+        if selected.is_empty() {
+            self.set_selected(std::iter::empty());
+            self.initialized.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let preferences = self.rakazo.preferences().await?;
         let avatar_style = &preferences.avatar_style;
         let features = crate::rich::room_features(&preferences);
         let bridge_logo = self.sync_bridge_identity().await?;
         let bindings = self.store.bindings(&self.config.id)?;
-        for bot_id in &self.config.bot_ids {
+        for bot_id in &selected {
             let bot = bots
                 .iter()
                 .find(|b| &b.id == bot_id)
@@ -209,6 +297,7 @@ impl TenantRuntime {
                 .await?;
             tracing::info!(tenant=%self.config.id,"provisioned agent chat");
         }
+        self.set_selected(selected.iter());
         self.initialized.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -300,7 +389,7 @@ impl TenantRuntime {
                 break;
             };
             let bindings = self.store.bindings(&self.config.id)?;
-            let binding = bindings.iter().find(|b| b.room == pending.event.room && self.config.bot_ids.contains(&b.bot))
+            let binding = bindings.iter().find(|b| b.room == pending.event.room && self.selected(&b.bot))
                 .context("queued message belongs to a disabled bot; restore configuration before delivery")?;
             let result = async {
                 self.matrix
@@ -427,7 +516,7 @@ impl TenantRuntime {
             .store
             .bindings(&self.config.id)?
             .iter()
-            .filter(|b| self.config.bot_ids.contains(&b.bot))
+            .filter(|b| self.selected(&b.bot))
         {
             if let Err(error) = self.backfill_binding(binding).await {
                 tracing::warn!(tenant=%self.config.id,error=%error,"history import failed; cursor retained");
@@ -458,4 +547,84 @@ pub fn text_chunks(mut text: &str, limit: usize) -> Vec<&str> {
         text = &text[end..];
     }
     chunks
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::select_bot_ids;
+    use crate::rakazo::Bot;
+
+    fn bot(id: &str, name: &str, parent: Option<&str>, spawn: Option<&str>, archived: bool) -> Bot {
+        Bot {
+            id: id.into(),
+            name: name.into(),
+            color: String::new(),
+            title: String::new(),
+            description: String::new(),
+            space_id: "space".into(),
+            thread_id: Some(format!("thread-{id}")),
+            parent_bot_id: parent.map(str::to_string),
+            spawn_key: spawn.map(str::to_string),
+            archived_at: archived.then(|| "2026-10-26T00:00:00Z".into()),
+            capabilities: None,
+        }
+    }
+
+    #[test]
+    fn auto_fleet_selects_orchestrator_children_and_muse_only() {
+        let bots = vec![
+            bot(
+                "orch",
+                "Fleet Orchestrator",
+                None,
+                Some("fleet-orch-v1"),
+                false,
+            ),
+            bot("pm-fpl", "PM · FPL", Some("orch"), None, false),
+            bot("pm-rakazo", "PM · Rakazo", Some("orch"), None, false),
+            bot("alfred", "Alfred", None, None, false),
+            bot("muse", "Muse", None, None, false),
+            bot("old-pm", "PM · Old", Some("orch"), None, true),
+        ];
+        let selected = select_bot_ids(&bots, &[], true);
+        assert_eq!(selected, vec!["orch", "pm-fpl", "pm-rakazo", "muse"]);
+    }
+
+    #[test]
+    fn explicit_ids_are_added_when_auto_is_enabled_and_missing_ids_are_ignored() {
+        let bots = vec![
+            bot(
+                "orch",
+                "Fleet Orchestrator",
+                None,
+                Some("fleet-orch-v1"),
+                false,
+            ),
+            bot("extra", "Extra", None, None, false),
+        ];
+        let explicit = vec!["extra".to_string(), "missing".to_string()];
+        assert_eq!(
+            select_bot_ids(&bots, &explicit, true),
+            vec!["orch", "extra"]
+        );
+    }
+
+    #[test]
+    fn auto_off_keeps_the_explicit_allowlist_contract() {
+        let bots = vec![
+            bot(
+                "orch",
+                "Fleet Orchestrator",
+                None,
+                Some("fleet-orch-v1"),
+                false,
+            ),
+            bot("extra", "Extra", None, None, false),
+        ];
+        assert!(select_bot_ids(&bots, &[], false).is_empty());
+        assert_eq!(
+            select_bot_ids(&bots, &["extra".into()], false),
+            vec!["extra"]
+        );
+    }
 }

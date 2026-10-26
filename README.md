@@ -173,7 +173,11 @@ Node, Python, bridge framework, or proxy process is required to run this service
    every Beeper endpoint. `run` creates a ghost and private room for each selected
    agent, then invites the owner. Accept those room invitations in Beeper and
    send a text message. Bot discovery is constrained to the token's selected space.
-   `bot_ids = []` creates no rooms. Stop the service before changing its configuration.
+   `bot_ids = []` creates no rooms. Set `auto_bots = true` to keep the fleet in
+sync automatically: the orchestrator root, every child conversation (PMs), and
+Muse are added on discovery; explicit `bot_ids` are still honored. Archived or
+removed bots stop being polled on the next tick. Stop the service before changing
+its configuration. Auto-discovery needs no restart for newly created PMs.
 
 ## Agora-one: native systemd service
 

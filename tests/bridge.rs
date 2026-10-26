@@ -433,6 +433,7 @@ async fn fixture() -> Fixture {
         rakazo_token_env: "UNUSED_TEST_TOKEN".into(),
         rakazo_space_id: "space-a".into(),
         bot_ids: vec!["agent-a".into()],
+        auto_bots: false,
         websocket: false,
     };
     let bundle = json!({"homeserver_url":base,"homeserver_domain":"beeper.local","your_user_id":config.owner,
@@ -452,6 +453,7 @@ async fn fixture() -> Fixture {
         last_success: AtomicU64::new(0),
         unsupported_encryption: AtomicBool::new(false),
         initialized: AtomicBool::new(false),
+        selected: std::sync::RwLock::new(["agent-a".to_string()].into_iter().collect()),
     });
     Fixture {
         _temp: temp,
