@@ -259,13 +259,13 @@ impl<S: Read + Write> Client<S> {
         let tags_ok = self.has_cap("message-tags");
         let tagged_reply = reply_to.is_some() && tags_ok && self.has_cap("draft/reply");
         let mut segments: Vec<String> = text.split('\n').map(str::to_string).collect();
-        if let Some(parent) = reply_to {
-            if !tagged_reply {
-                // Plain-text fallback the fleet transcript preserves. The
-                // renderer strips this leading quote line. It is a separate
-                // IRC line because a wire line can never contain CR/LF.
-                segments.insert(0, format!("> {parent}"));
-            }
+        if let Some(parent) = reply_to
+            && !tagged_reply
+        {
+            // Plain-text fallback the fleet transcript preserves. The
+            // renderer strips this leading quote line. It is a separate
+            // IRC line because a wire line can never contain CR/LF.
+            segments.insert(0, format!("> {parent}"));
         }
         let mut total = 0usize;
         let mut used_multiline = false;

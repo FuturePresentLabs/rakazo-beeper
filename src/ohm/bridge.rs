@@ -663,9 +663,11 @@ mod tests {
         let _: Option<Inbound> = None;
     }
 
+    type Calls = std::sync::Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     #[derive(Clone, Default)]
     struct RecordingRunner {
-        calls: std::sync::Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        calls: Calls,
     }
 
     impl RecordingRunner {

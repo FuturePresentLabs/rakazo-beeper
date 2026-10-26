@@ -77,7 +77,7 @@ pub fn parse(signal_or_text: &str) -> Option<Signal> {
     }
 
     // Keycap emoji are the digit followed by VS16 and/or U+20E3.
-    let digits = text.trim_end_matches(|c| c == '\u{fe0f}' || c == '\u{20e3}');
+    let digits = text.trim_end_matches(['\u{fe0f}', '\u{20e3}']);
     let mut chars = digits.chars();
     let digit = chars.next()?;
     if chars.next().is_some() {

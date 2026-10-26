@@ -337,10 +337,10 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
                 self.state.last_error = Some(format!("{error:#}"));
             }
         }
-        if let Err(save_error) = self.save() {
-            if outcome.is_ok() {
-                return Err(save_error);
-            }
+        if let Err(save_error) = self.save()
+            && outcome.is_ok()
+        {
+            return Err(save_error);
         }
         outcome
     }

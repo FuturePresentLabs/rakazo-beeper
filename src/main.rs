@@ -8,7 +8,11 @@ use rakazo_beeper::{
     transport,
 };
 use rand::RngCore;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -930,7 +934,7 @@ fn random_nonce() -> String {
 /// come from files and are never printed.
 #[allow(clippy::too_many_arguments)]
 fn irc_command(
-    path: &PathBuf,
+    path: &Path,
     host: &Option<String>,
     port: Option<u16>,
     nick: &Option<String>,
@@ -1007,7 +1011,7 @@ fn irc_command(
 
 /// Hidden ohmOS commands. `probe` is read-only; `serve` refuses to start without
 /// a configured base URL *and* explicit send opt-in.
-async fn ohm_command(path: &PathBuf, command: &OhmCommand) -> Result<()> {
+async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
     use rakazo_beeper::ohm::{
         Bridge, FakeNotifier, FakePaneIo, FakeTransport, MsgdClient, OhmConfig, Platform, Route,
         inbound,
