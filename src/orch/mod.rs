@@ -93,6 +93,8 @@ pub fn roster() -> Result<Vec<Entry>> {
 
 pub struct Orch {
     pub rakazo: Rakazo,
+    /// Bot-bound service principal for assistant-append replies, when configured.
+    pub assistant: Option<Rakazo>,
     pub space: String,
 }
 
@@ -144,8 +146,13 @@ impl Orch {
         )
         .context("invalid RAKAZO_ORCH_URL")?;
         crate::config::validate_url(&base)?;
+        let assistant = crate::config::secret("RAKAZO_ORCH_SERVICE_TOKEN")
+            .ok()
+            .map(|token| Rakazo::from_service_parts(base.clone(), &token, &space))
+            .transpose()?;
         Ok(Self {
             rakazo: Rakazo::from_parts(base, &token, &space)?,
+            assistant,
             space,
         })
     }
@@ -266,6 +273,23 @@ impl Orch {
         let receipt = self.rakazo.send_routed(bot, text, &[], None, nonce).await?;
         Ok(receipt.seq)
     }
+
+    /// Append a local orchestrator reply as a bot message. Requires the
+    /// bot-bound service token; a session token is never used for this path.
+    pub async fn reply_assistant(
+        &self,
+        bot: &str,
+        text: &str,
+        nonce: &str,
+        reply_to: Option<&str>,
+    ) -> Result<crate::rakazo::AppendReceipt> {
+        let assistant = self
+            .assistant
+            .as_ref()
+            .context("set RAKAZO_ORCH_SERVICE_TOKEN[_FILE] for assistant append")?;
+        ensure!(!text.trim().is_empty(), "refusing to send an empty reply");
+        assistant.append_assistant(bot, text, nonce, reply_to).await
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +332,7 @@ mod tests {
                 "space",
             )
             .unwrap(),
+            assistant: None,
             space: "space".into(),
         }
     }

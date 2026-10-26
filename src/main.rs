@@ -773,6 +773,18 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 })?;
             allowlist.check(bot)?;
             let nonce = nonce.clone().unwrap_or_else(reply::nonce);
+            if orch.assistant.is_some() {
+                if *dry_run {
+                    println!("surface=assistant\tbot={}\tdry_run=true", bot.id);
+                } else {
+                    let receipt = orch.reply_assistant(&bot.id, text, &nonce, None).await?;
+                    println!(
+                        "surface=assistant\tbot={}\tmessage={}\tseq={}\tnonce={}",
+                        bot.id, receipt.message_id, receipt.seq, nonce
+                    );
+                }
+                return Ok(());
+            }
             let plan = if *dry_run {
                 reply::plan(&orch.rakazo, bot).await?
             } else {
