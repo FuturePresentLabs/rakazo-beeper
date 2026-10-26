@@ -57,15 +57,20 @@ service account for this increment. The token is never printed or logged.
 message produces exactly one:
 
 ```sh
-pi-notify send --kind note --worker <name> --ref rakazo:<threadId>:<messageId> \
+pi-notify send --kind steer --worker <name> --ref rakazo:<threadId>:<messageId> \
   --text '[rakazo:<threadId>:<messageId>] <summary>'
 ```
+
+`steer` is required for the local orchestrator: the inbox-delivery gate
+suppresses a non-decision `note` addressed to orch, so a note would be recorded
+in the outbox but never wake the fleet. `--worker` is configurable so the same
+watcher can target a different registered agentsmith/orchestrator; keep one
+state file per watcher.
 
 Dedupe is by message id plus a `seq` watermark in a bounded JSON state file
 (512 ids). Restarting with the same state file delivers nothing twice. A
 notify failure returns an error and does **not** advance the watermark, so the
-next poll retries the same message. There is no `pi-tmux`, `send-keys`, or
-`--kind steer` path.
+next poll retries the same message. There is no `pi-tmux` or `send-keys` path.
 
 ## Interim reply surface (no lie)
 

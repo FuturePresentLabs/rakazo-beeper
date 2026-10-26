@@ -5,11 +5,13 @@
 //! **user-role** messages are handed once to a [`Notifier`] seam. There is no
 //! reply path here and no attempt to fake one.
 //!
-//! Delivery is `pi-notify send --kind note` (a queued notification, never a
-//! `pi-tmux` paste and never `--kind steer`). Dedupe is a small JSON state file
-//! holding the bot binding, a `seq` watermark and the recently delivered message
-//! ids, so a restart never notifies twice and a notify failure never advances the
-//! watermark.
+//! Delivery is `pi-notify send --kind steer` (a live, event-driven wake, never a
+//! `pi-tmux` paste). `note` is deliberately not used for the local orchestrator:
+//! the inbox-delivery gate suppresses non-decision notes addressed to orch, so a
+//! phone message would be recorded but never wake the fleet. Dedupe is a small
+//! JSON state file holding the bot binding, a `seq` watermark and the recently
+//! delivered message ids, so a restart never notifies twice and a notify failure
+//! never advances the watermark.
 
 use crate::orch::Allowlist;
 use crate::rakazo::{Bot, Message, Rakazo};
@@ -61,15 +63,15 @@ pub trait Notifier {
     fn notify(&self, worker: &str, reference: &str, text: &str) -> Result<()>;
 }
 
-/// Real notifier: `pi-notify send --kind note` with a stable `--ref`.
+/// Real notifier: `pi-notify send --kind steer` with a stable `--ref`.
 ///
-/// `note` is the queued-notification kind used by the rest of this bridge; the
-/// notifier never pastes and never uses `--kind steer`.
+/// `steer` is the wake kind; a `note` addressed to orch is suppressed by the
+/// inbox-delivery gate as a non-decision. The notifier never pastes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PiNotify;
 
 impl PiNotify {
-    pub const KIND: &'static str = "note";
+    pub const KIND: &'static str = "steer";
 
     /// The full argument vector. `--ref` is `rakazo:<conversation>:<message>`.
     pub fn command_args(worker: &str, reference: &str, text: &str) -> Vec<String> {
@@ -79,6 +81,7 @@ impl PiNotify {
             Self::KIND.to_string(),
             "--worker".to_string(),
             worker.to_string(),
+            "--urgent".to_string(),
             "--ref".to_string(),
             reference.to_string(),
             "--text".to_string(),
@@ -334,10 +337,10 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
                 self.state.last_error = Some(format!("{error:#}"));
             }
         }
-        if let Err(save_error) = self.save() {
-            if outcome.is_ok() {
-                return Err(save_error);
-            }
+        if let Err(save_error) = self.save()
+            && outcome.is_ok()
+        {
+            return Err(save_error);
         }
         outcome
     }
@@ -731,17 +734,17 @@ mod tests {
     }
 
     #[test]
-    fn notify_command_is_pi_notify_note_with_ref_and_no_tmux() {
+    fn notify_command_is_pi_notify_steer_with_ref_and_no_tmux() {
         let args = PiNotify::command_args("fleet-orch-v1", "rakazo:t:m", "body");
         assert_eq!(args[0], "send");
         assert_eq!(args[1], "--kind");
-        assert_eq!(args[2], "note");
-        assert_eq!(PiNotify::KIND, "note");
+        assert_eq!(args[2], "steer");
+        assert_eq!(PiNotify::KIND, "steer");
+        assert!(args.iter().any(|arg| arg == "--urgent"));
         assert!(args.windows(2).any(|pair| pair == ["--ref", "rakazo:t:m"]));
         let joined = args.join(" ");
         assert!(!joined.contains("pi-tmux"), "{joined}");
         assert!(!joined.contains(concat!("send", "-keys")), "{joined}");
-        assert!(!joined.contains("--kind steer"), "{joined}");
     }
 
     #[test]

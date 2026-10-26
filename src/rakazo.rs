@@ -97,6 +97,12 @@ pub struct Message {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppendReceipt {
+    pub message_id: String,
+    pub seq: i64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendReceipt {
     pub seq: i64,
     pub run_id: String,
@@ -158,6 +164,10 @@ impl Rakazo {
     }
     /// Build a client from explicit parts so tooling does not need a tenant bundle.
     pub fn from_parts(base: Url, token: &str, space: &str) -> Result<Self> {
+        Self::build(base, token, space)
+    }
+    /// A bot-bound service principal: same RPC envelope, different bearer.
+    pub fn from_service_parts(base: Url, token: &str, space: &str) -> Result<Self> {
         Self::build(base, token, space)
     }
     pub fn with_token(config: &Tenant, token: &str) -> Result<Self> {
@@ -320,6 +330,21 @@ impl Rakazo {
             .send_routed(bot, text, artifacts, reply, nonce)
             .await?
             .seq)
+    }
+    /// Write a bot message in-thread without starting a run. This is the
+    /// service-token-only reply path; the session token must not be used here.
+    pub async fn append_assistant(
+        &self,
+        bot: &str,
+        text: &str,
+        nonce: &str,
+        reply_to: Option<&str>,
+    ) -> Result<AppendReceipt> {
+        let mut input = json!({"botId":bot,"text":text,"clientNonce":nonce});
+        if let Some(reply) = reply_to {
+            input["replyToMessageId"] = json!(reply);
+        }
+        self.rpc(&["threads", "appendAssistant"], input).await
     }
     pub async fn send_routed(
         &self,

@@ -150,10 +150,10 @@ pub(crate) fn handle_inbound(
                 .tags
                 .get("+draft/reply")
                 .or_else(|| message.tags.get("draft/reply"));
-            if let (Some(emoji), Some(parent)) = (emoji, parent) {
-                if inbox.apply_reaction(target, parent, emoji)? {
-                    println!("REACTION\t{target}\t{parent}\t{emoji}");
-                }
+            if let (Some(emoji), Some(parent)) = (emoji, parent)
+                && inbox.apply_reaction(target, parent, emoji)?
+            {
+                println!("REACTION\t{target}\t{parent}\t{emoji}");
             }
             Ok(None)
         }
@@ -199,10 +199,11 @@ fn open_client(config: &IrcConfig) -> Result<OpenClient> {
 fn connect_and_join(config: &IrcConfig, target: Option<&str>) -> Result<OpenClient> {
     let mut client = open_client(config)?;
     let mut channels = config.channels.clone();
-    if let Some(target) = target {
-        if target.starts_with('#') && !channels.iter().any(|channel| channel == target) {
-            channels.push(target.to_string());
-        }
+    if let Some(target) = target
+        && target.starts_with('#')
+        && !channels.iter().any(|channel| channel == target)
+    {
+        channels.push(target.to_string());
     }
     for channel in &channels {
         let _ = client.join(channel, Duration::from_secs(30))?;
@@ -320,27 +321,24 @@ fn wait_for_outcome(
     let mut ordinal = 0u64;
     let mut announced_echo = false;
     while Instant::now() < deadline {
-        match client.read_message()? {
-            Some(message) => {
-                client.observe(&message)?;
-                if !announced_echo
-                    && message.command == "PRIVMSG"
-                    && message
-                        .prefix_nick()
-                        .is_some_and(|from| from.eq_ignore_ascii_case(own_nick))
-                {
-                    let target = message.params.first().cloned().unwrap_or_default();
-                    // The server echo is the acknowledgement; the inbox row is
-                    // updated by `handle_inbound` below.
-                    println!("echo\tmsgid={msgid}\ttarget={target}\tstatus=acked");
-                    announced_echo = true;
-                }
-                if matches!(message.command.as_str(), "PRIVMSG" | "TAGMSG" | "NOTICE") {
-                    ordinal += 1;
-                    let _ = handle_inbound(inbox, own_nick, &message, ordinal)?;
-                }
+        if let Some(message) = client.read_message()? {
+            client.observe(&message)?;
+            if !announced_echo
+                && message.command == "PRIVMSG"
+                && message
+                    .prefix_nick()
+                    .is_some_and(|from| from.eq_ignore_ascii_case(own_nick))
+            {
+                let target = message.params.first().cloned().unwrap_or_default();
+                // The server echo is the acknowledgement; the inbox row is
+                // updated by `handle_inbound` below.
+                println!("echo\tmsgid={msgid}\ttarget={target}\tstatus=acked");
+                announced_echo = true;
             }
-            None => {}
+            if matches!(message.command.as_str(), "PRIVMSG" | "TAGMSG" | "NOTICE") {
+                ordinal += 1;
+                let _ = handle_inbound(inbox, own_nick, &message, ordinal)?;
+            }
         }
         if inbox.row(msgid)?.is_some_and(|row| row.status == "sent") {
             return Ok(true);

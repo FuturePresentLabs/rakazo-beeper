@@ -1,0 +1,11 @@
+# False positives: these are stable public roster/route IDs in tests and docs
+# ("fleet-orch-v1", "fleet-pm-transmog-v1", "fleet-imaginary-v1"), not secrets.
+de1ef567180db54eb775d5cd663d5eda4337a1a3:tests/roster.rs:generic-api-key:105
+de1ef567180db54eb775d5cd663d5eda4337a1a3:tests/roster.rs:generic-api-key:135
+e99f1221dd2819fe634647c65db8e27b75468f47:tests/roster.rs:generic-api-key:105
+e99f1221dd2819fe634647c65db8e27b75468f47:tests/roster.rs:generic-api-key:135
+de1ef567180db54eb775d5cd663d5eda4337a1a3:src/orch/roster.rs:generic-api-key:425
+e99f1221dd2819fe634647c65db8e27b75468f47:src/orch/roster.rs:generic-api-key:425
+7f6ff506671011fbac471203d63f35f9625c6bcf:src/ohm/bridge.rs:generic-api-key:575
+b305428e6076cc89203468524a311ed1eced637b:docs/orchestrator-in-rakazo.md:generic-api-key:214
+c265c3e6f7b2a70013a47c18345243c122582672:docs/orchestrator-in-rakazo.md:generic-api-key:214
