@@ -83,3 +83,101 @@ requested as "open this screen, copy this field".
   only; no secrets).
 - `docs/ohm-client.md` (this page) — the shared description to agree on before
   the live hop is built.
+
+## Agent conversations (Muse, self-hosted ohmOS)
+
+Status: **offline-complete, live leg UNVERIFIED (phone 502).** The provider and
+its tests are merged-ready; the real catalog/snapshot currently answers **502**
+because the provisioning service cannot reach the paired phone over Iroh. That is
+recorded as the named blocker, not papered over.
+
+This is a *provider beside* the msgd client above, not a third bridge. It uses
+the provisioning `agent-conversations` API (`GET /agent-conversations`,
+`GET /agent-conversations/{id}?limit=N`,
+`POST /agent-conversations/{id}/messages`), which forwards over the phone's
+Iroh link. It does not touch `ohm-msgd` and it does not use the hosted Rakazo
+`conversationAttachments` binding.
+
+### Exactly one owner per WhatsApp message
+
+| concern | owner |
+| --- | --- |
+| Agent delivery (wake the roster `worker`) | this bridge (`[[agent]] transport = "ohmos"`) |
+| Outbound agent reply | this bridge, `POST …/messages` with a stable `request_id` |
+| Rakazo UI display of the same thread | the existing hosted attachment binding (unchanged) |
+
+The two paths do not run for the same message: this bridge never posts into the
+Rakazo UI, and the UI binding is never asked to deliver to an agent.
+
+### Config and commands
+
+See the `[[agent]]` block in `docs/ohm-config.example.toml`. `transport` is
+required and explicit; `msgd` is configured through the top-level
+`base_url`/`[[routes]]`, so there is no implicit fallback either way. No
+`base_url` means **offline: zero network calls**.
+
+```sh
+# Read-only: HTTP status + catalog/conversation ids only. No token, no text.
+rakazo-beeper ohm --ohm-config ohm.toml agent-probe --agent muse
+
+# Dry run of a reply: endpoint status only, nothing sent.
+rakazo-beeper ohm --ohm-config ohm.toml agent-reply --agent muse --text "…" --dry-run
+
+# Real outbound; the same text retries to the same stable request id.
+rakazo-beeper ohm --ohm-config ohm.toml agent-reply --agent muse --text "…"
+# An explicit key is honoured when identical text must be sent twice on purpose.
+rakazo-beeper ohm --ohm-config ohm.toml agent-reply --agent muse --text "…" --request-id <id>
+
+# Inbound poll loop; delivers once via `pi-notify --kind steer --urgent`.
+rakazo-beeper ohm --ohm-config ohm.toml agent-serve --agent muse
+rakazo-beeper ohm --ohm-config ohm.toml agent-serve --agent muse --once
+```
+
+Inbound rules: only `from_me=false`, non-deleted rows with a non-empty phone
+`native_id` are delivered, once each, durably deduped by that **phone id** (never
+text), with `--ref rakazo:<conversation>:<native_id>`. Our own request ids and
+our own echoes are suppressed. A delivery failure fails closed and does not
+advance the ledger, so the next poll retries.
+
+Outbound rules: the request id is the phone's idempotency key; a retry with the
+same id returns the same queued result and does not create a second native send.
+`queued` is never reported as delivered.
+
+### Status semantics (no silent success)
+
+| result | meaning |
+| --- | --- |
+| `status=200` | catalog/snapshot read (or send queued) |
+| `status=401` | typed `unauthorized`: bearer missing/wrong/revoked |
+| `status=502`/`503`/`504` | typed `degraded`: provisioning is up, phone/Iroh is not |
+| `offline` | no `base_url`; zero network calls were made |
+
+`agent-probe` and `agent-reply --dry-run` print these statuses only — never a
+token, never message text — and exit non-zero when the probe saw a 401/502. A
+502 is a reported `degraded` result, not a silent success. The token is read from
+`token_file`/`OHM_MUSE_TOKEN_FILE`, must be owner-only (`0600`), and is redacted
+even in `Debug`.
+
+If the token file is missing, the CLI prints a one-line, human-run acquisition
+command and labels the live leg **UNVERIFIED** rather than scraping a container
+environment silently.
+
+### Rollback
+
+Delete the `[[agent]]` block (or the state file) and stop `agent-serve`. No
+daemon/unit was added in this slice, so rollback is: stop the command, remove the
+block. The msgd provider, the Rakazo UI attachment binding and the single-orch
+path are untouched and keep working throughout.
+
+### Fleet-wide semantics this slice respects
+
+- `relayOnly` applies to **every** fleet bot identity (orch, every PM child, and
+  any relay/worker bot the bridge creates). New bots default to `relayOnly=true`
+  unless explicitly overridden; the server implementation is pm-fpl's.
+- `appendAssistant` remains the **only** bot reply path. This slice never uses
+  `threads.send` for a bot reply, and never for relay-only inbound in a way that
+  creates a run.
+- The Fleet Orchestrator thread is not archived.
+- No worker bots are created here; workers are Slice A with
+  `hide_workers=true` by default.
+- Muse is transport-backed in this slice: no Rakazo bot is created for it.

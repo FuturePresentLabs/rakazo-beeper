@@ -25,3 +25,36 @@ pane = "%0"
 platform = "WhatsApp"
 remote_id = "<platform-native chat handle>"
 # recipient = "<platform-native recipient>"  # defaults to remote_id
+
+# ---------------------------------------------------------------------------
+# Slice B: Muse through the self-hosted ohmOS agent-conversation API.
+#
+# This is the provisioning API (`{base_url}/agent-conversations`, backed by the
+# paired phone's Iroh link), NOT the ohm-msgd daemon and NOT the hosted Rakazo
+# `conversationAttachments` binding. `transport` is required: there is no
+# implicit fallback between `ohmos` and `msgd`. No base_url means offline and
+# zero network calls.
+#
+# Ownership split: this bridge owns agent delivery + outbound; the Rakazo UI
+# keeps its existing attachment binding for *display only*. Never run both
+# paths for the same message.
+[[agent]]
+key = "muse"
+kind = "external"
+transport = "ohmos"
+base_url = "https://ohm.fpl.dev/messages"
+# Owner-only (0600). OHM_MUSE_TOKEN_FILE overrides this when set.
+token_file = "/home/ajmwagar/.rakazo/ohm-muse-token"
+# The catalog id returned by GET /agent-conversations, not a display label.
+conversation_id = "whatsapp:<remote-id>"
+platform = "WhatsApp"
+remote_id = "<remote-id>"
+label = "Muse"
+# Roster worker target for delivery; defaults to `key` until the Slice A
+# roster contract exists.
+worker = "muse"
+poll_seconds = 5
+limit = 50
+# Durable dedupe/idempotency ledger. Optional; defaults to
+# $RAKAZO_BRIDGE_STATE_DIR (or ~/.local/state/rakazo/bridge)/muse-ohmos.json.
+# state_file = "/home/ajmwagar/.local/state/rakazo/bridge/muse-ohmos.json"

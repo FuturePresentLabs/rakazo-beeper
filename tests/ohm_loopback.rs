@@ -300,6 +300,7 @@ fn message(id: i64, text: &str) -> Msg {
 fn config(state_file: Option<PathBuf>, pane: &str) -> OhmConfig {
     OhmConfig {
         base_url: None,
+        agents: Vec::new(),
         allow_send: true,
         state_file,
         orchestrator_targets: vec!["%0".into()],

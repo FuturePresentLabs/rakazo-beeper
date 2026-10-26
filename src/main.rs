@@ -105,6 +105,39 @@ enum OhmCommand {
         #[arg(long, default_value_t = 5)]
         interval_seconds: u64,
     },
+    /// Read-only probe of one (or all) `[[agent]]` providers. Prints HTTP status
+    /// and catalog ids only: never the token, never message text.
+    AgentProbe {
+        #[arg(long)]
+        agent: Option<String>,
+        /// Explicit dry run (same read-only behaviour as `agent-probe`).
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Post one agent reply through the ohmOS agent-conversation API.
+    AgentReply {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        text: String,
+        /// Explicit stable idempotency key; defaults to a deterministic id so a
+        /// retry of the same text is a replay, never a duplicate.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Print endpoint status only; send nothing and print no text.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Poll one agent conversation and deliver new inbound rows via `pi-notify`.
+    AgentServe {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        interval_seconds: Option<u64>,
+        /// Poll once and exit (the degraded status is still printed explicitly).
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1041,6 +1074,7 @@ async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
         OhmCommand::Selftest => {
             let config = OhmConfig {
                 base_url: None,
+                agents: Vec::new(),
                 allow_send: false,
                 state_file: None,
                 orchestrator_targets: vec!["%0".into()],
@@ -1104,6 +1138,214 @@ async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(*interval_seconds)).await;
             }
         }
+        OhmCommand::AgentProbe { agent, dry_run: _ } => {
+            let config = OhmConfig::load(path)?;
+            agent_probe(&config, agent.as_deref())?;
+        }
+        OhmCommand::AgentReply {
+            agent,
+            text,
+            request_id,
+            dry_run,
+        } => {
+            let config = OhmConfig::load(path)?;
+            agent_reply(&config, agent, text, request_id.as_deref(), *dry_run)?;
+        }
+        OhmCommand::AgentServe {
+            agent,
+            interval_seconds,
+            once,
+        } => {
+            let config = OhmConfig::load(path)?;
+            agent_serve(&config, agent.as_deref(), *interval_seconds, *once).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Load the owner-only bearer for one agent, or explain the one human command
+/// that obtains it. The value is never printed.
+fn agent_token(agent: &rakazo_beeper::ohm::AgentConfig) -> Result<rakazo_beeper::ohm::Token> {
+    use rakazo_beeper::ohm::agent_conversations::{TOKEN_ACQUISITION, Token};
+    let path = agent.token_path()?;
+    Token::load(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "{error}\nobtain the token once with:\n  {TOKEN_ACQUISITION}\nUNVERIFIED: no live request was made"
+        )
+    })
+}
+
+fn agent_probe(config: &rakazo_beeper::ohm::OhmConfig, selected: Option<&str>) -> Result<()> {
+    use rakazo_beeper::ohm::{AgentConversationsClient, UreqAgentHttp};
+    for agent in config.agents(selected)? {
+        let Some(base) = agent.base_url.as_deref() else {
+            println!(
+                "{}\toffline\tno base_url configured; zero network calls",
+                agent.key
+            );
+            continue;
+        };
+        let token = agent_token(agent)?;
+        let client = AgentConversationsClient::new(Some(base), token, UreqAgentHttp::new())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let report = client.probe(agent.conversation_id.as_deref());
+        for line in report.lines() {
+            println!("{}\t{line}", agent.key);
+        }
+        if let Some(error) = report.errors.first() {
+            // Non-zero exit: a 401/502 probe is never a silent success.
+            anyhow::bail!("agent {} probe: {error}", agent.key);
+        }
+    }
+    Ok(())
+}
+
+fn agent_reply(
+    config: &rakazo_beeper::ohm::OhmConfig,
+    key: &str,
+    text: &str,
+    request_id: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use rakazo_beeper::ohm::{
+        AgentConversationsClient, ExpectedNativeIdentity, UreqAgentHttp, stable_request_id,
+    };
+    let agent = config
+        .agents(Some(key))?
+        .into_iter()
+        .next()
+        .expect("selected above");
+    let Some(base) = agent.base_url.as_deref() else {
+        anyhow::bail!(
+            "agent {} is offline (no base_url); refusing to send and making no network call",
+            agent.key
+        );
+    };
+    let conversation = agent.conversation_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent {} has no conversation_id; read it from GET /agent-conversations",
+            agent.key
+        )
+    })?;
+    let request_id = request_id
+        .map(str::to_string)
+        .unwrap_or_else(|| stable_request_id(&agent.key, text));
+    let token = agent_token(agent)?;
+    let client = AgentConversationsClient::new(Some(base), token, UreqAgentHttp::new())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    if dry_run {
+        // Status only: no text, no token, no send.
+        let report = client.probe(Some(conversation));
+        for line in report.lines() {
+            println!("{}\t{line}", agent.key);
+        }
+        println!("{}\tdry_run\tno message sent", agent.key);
+        if let Some(error) = report.errors.first() {
+            anyhow::bail!("agent {} dry run: {error}", agent.key);
+        }
+        return Ok(());
+    }
+
+    let identity = match (agent.platform, agent.remote_id.as_deref()) {
+        (Some(platform), Some(remote_id)) if !remote_id.trim().is_empty() => {
+            Some(ExpectedNativeIdentity {
+                platform,
+                remote_id,
+            })
+        }
+        _ => None,
+    };
+    let receipt = client
+        .send(conversation, &request_id, text, identity)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    println!(
+        "{}\trequest_id={}\tstatus={}",
+        agent.key, receipt.id, receipt.status
+    );
+    Ok(())
+}
+
+async fn agent_serve(
+    config: &rakazo_beeper::ohm::OhmConfig,
+    selected: Option<&str>,
+    interval_seconds: Option<u64>,
+    once: bool,
+) -> Result<()> {
+    use rakazo_beeper::ohm::{
+        AgentBridge, AgentConversationsClient, OhmosTransport, PiNotifyDelivery, UreqAgentHttp,
+        default_state_file, identity,
+    };
+    let agents = config.agents(selected)?;
+    anyhow::ensure!(
+        agents.len() == 1,
+        "agent serve needs exactly one --agent ({} agent entries configured)",
+        agents.len()
+    );
+    let agent = agents[0];
+    let Some(base) = agent.base_url.as_deref() else {
+        println!(
+            "{}\toffline\tno base_url configured; zero network calls",
+            agent.key
+        );
+        return Ok(());
+    };
+    let conversation = agent
+        .conversation_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("agent {} has no conversation_id", agent.key))?;
+    let token = agent_token(agent)?;
+    let client = AgentConversationsClient::new(Some(base), token, UreqAgentHttp::new())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let transport = OhmosTransport::new(
+        client,
+        conversation.clone(),
+        identity(agent.platform, agent.remote_id.as_deref()),
+        agent.limit,
+    );
+    let state_file = default_state_file(&agent.key, agent.state_file.as_deref());
+    let mut bridge = AgentBridge::new(
+        transport,
+        PiNotifyDelivery::new(),
+        agent.worker().to_string(),
+        conversation,
+        Some(state_file.clone()),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let interval = interval_seconds.unwrap_or_else(|| agent.poll_seconds());
+    println!(
+        "{}\tserve\tworker={}\tstate={}\tinterval={}s",
+        agent.key,
+        agent.worker(),
+        state_file.display(),
+        interval
+    );
+    loop {
+        match bridge.poll_once() {
+            Ok(report) => {
+                if report.delivered > 0 || report.duplicates > 0 {
+                    println!(
+                        "{}\tdelivered={}\tduplicates={}\tsuppressed={}\tdropped={}",
+                        agent.key,
+                        report.delivered,
+                        report.duplicates,
+                        report.suppressed,
+                        report.dropped
+                    );
+                }
+            }
+            Err(error) if error.is_degraded() => {
+                // Explicit degraded status: never a silent success.
+                println!("{}\tdegraded\t{error}", agent.key);
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent.key, %error, "agent poll failed; retrying");
+            }
+        }
+        if once {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
     }
     Ok(())
 }
