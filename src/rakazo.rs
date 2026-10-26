@@ -54,6 +54,10 @@ pub struct Bot {
     /// Agent bot omits this object entirely.
     #[serde(default)]
     pub capabilities: Option<Value>,
+    /// Server-side relay-only flag (pm-fpl owns it). `None` when the deployment
+    /// does not report it yet; status prints that honestly instead of guessing.
+    #[serde(default)]
+    pub relay_only: Option<bool>,
 }
 
 /// `bots.create` input; `spawnKey` makes a create idempotent within a space.
@@ -67,6 +71,10 @@ pub struct NewBot<'a> {
     pub notify_on_finish: bool,
     pub spawn_key: &'a str,
     pub computer_mode: &'a str,
+    /// Relay-only: the bot may append assistant messages but never runs a
+    /// model. Every fleet bot this bridge creates sets this; the server flag is
+    /// owned by pm-fpl and unknown-field-safe (zod strips it until it lands).
+    pub relay_only: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,11 +103,19 @@ pub struct Message {
     #[serde(default)]
     pub run_id: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendReceipt {
     pub message_id: String,
     pub seq: i64,
+}
+/// `serviceTokens.issue` result. The raw token is returned exactly once; the
+/// bridge writes it owner-only and never prints it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTokenReceipt {
+    pub id: String,
+    pub token: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,6 +205,11 @@ impl Rakazo {
         })
     }
 
+    /// Base deployment URL, for building a per-agent service principal without
+    /// re-reading the environment.
+    pub fn base(&self) -> &Url {
+        &self.base
+    }
     /// @implements url:https://orpc.dev/docs/rpc/protocol -- JSON serializer envelope and slash routing
     pub async fn rpc<T: serde::de::DeserializeOwned>(
         &self,
@@ -299,6 +320,25 @@ impl Rakazo {
     pub async fn create_bot(&self, bot: &NewBot<'_>) -> Result<Bot> {
         self.rpc(&["bots", "create"], serde_json::to_value(bot)?)
             .await
+    }
+    /// Archive a bot we own (the orchestrator or a relay-only worker).
+    pub async fn archive_bot(&self, bot: &str) -> Result<()> {
+        let _: Value = self
+            .rpc(&["bots", "archive"], json!({"botId": bot}))
+            .await?;
+        Ok(())
+    }
+    /// Issue a bot-bound service token from the owner session.
+    ///
+    /// Owner-only, per `pm/rakazo/service-token-proposal.md`: the two scopes the
+    /// bridge needs are `threads:read` and `threads:write:assistant`. The raw
+    /// token is returned once and must never be logged.
+    pub async fn issue_service_token(&self, bot: &str) -> Result<ServiceTokenReceipt> {
+        self.rpc(
+            &["serviceTokens", "issue"],
+            json!({"botId": bot, "scopes": ["threads:read", "threads:write:assistant"]}),
+        )
+        .await
     }
     pub async fn avatar_style(&self) -> Result<String> {
         Ok(self.preferences().await?.avatar_style)
@@ -438,6 +478,21 @@ impl Rakazo {
             );
         }
         Ok(page)
+    }
+    /// Highest committed sequence in the conversation (one newest page).
+    /// Used to seed a fresh bridge watermark so enabling a watcher does not
+    /// replay history. The server rejects an out-of-range `before`, so this
+    /// deliberately omits the cursor instead of passing `i64::MAX`.
+    pub async fn head_seq(&self, bot: &str) -> Result<i64> {
+        let page: Page = self
+            .rpc(&["threads", "messages"], json!({"botId": bot}))
+            .await?;
+        Ok(page
+            .messages
+            .iter()
+            .map(|message| message.seq)
+            .max()
+            .unwrap_or(0))
     }
     /// Paginate backwards to the committed message sequence; never advance across a gap.
     pub async fn after(&self, bot: &str, seq: i64) -> Result<Vec<Message>> {

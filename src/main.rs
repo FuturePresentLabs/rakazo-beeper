@@ -59,6 +59,14 @@ enum Command {
         #[command(subcommand)]
         command: OhmCommand,
     },
+    /// Multi-agent AgentSmith roster bridge (Slice A). The roster command lives
+    /// in the bridge config; a roster failure is fatal (no orch fallback).
+    Bridge {
+        #[arg(long = "bridge-config", default_value = "config/agentsmith.toml")]
+        bridge_config: PathBuf,
+        #[command(subcommand)]
+        command: BridgeCommand,
+    },
     /// IRC client for the fleet bus (local rehearsal; hidden until the SSO answer).
     #[command(hide = true)]
     Irc {
@@ -137,6 +145,63 @@ enum OhmCommand {
         /// Poll once and exit (the degraded status is still printed explicitly).
         #[arg(long)]
         once: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeCommand {
+    /// Print the visible roster (orch + PMs + muse, workers only when visible).
+    Roster {
+        /// Emit one JSON object instead of tabs.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Supervise every visible agent: load the roster each interval, reconcile,
+    /// and deliver new user messages via `pi-notify`.
+    #[command(alias = "run")]
+    Serve {
+        /// Run one cycle and exit (the default).
+        #[arg(long)]
+        once: bool,
+        /// Run forever at this interval. The loop requires an explicit value.
+        #[arg(long, value_name = "SECONDS")]
+        interval_s: Option<u64>,
+    },
+    /// Seed every owned agent's watermark to its conversation head without
+    /// delivering. Run once before the first `serve` on an existing fleet.
+    Seed {
+        /// Limit to one agent (key, `pm:<vertical>`, or pi-notify target).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Issue one bot-bound service token per visible agent (owner session).
+    /// Prints only the bot id and the token file path. Nothing without --apply.
+    Provision {
+        #[arg(long)]
+        apply: bool,
+        /// Limit to one agent (key, `pm:<vertical>`, or pi-notify target).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Append one assistant reply as exactly one agent, with that agent's token.
+    Reply {
+        /// Agent key (`fleet-pm-fpl-v1`) or delivery target (`pm-fpl`).
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        text: String,
+        /// Idempotency key; generated when omitted.
+        #[arg(long)]
+        nonce: Option<String>,
+        /// Resolve and print the binding without sending anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Compare the roster with live agents and print per-agent state (no secrets).
+    Status {
+        /// Emit one JSON array instead of tabs.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -347,6 +412,13 @@ async fn run() -> Result<()> {
     }
     if let Command::Orch { command } = &cli.command {
         return orch_command(command).await;
+    }
+    if let Command::Bridge {
+        bridge_config,
+        command,
+    } = &cli.command
+    {
+        return bridge_command(bridge_config, command).await;
     }
     if let Command::Login {
         rakazo_url,
@@ -755,7 +827,7 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 .or_else(|| std::env::var_os("RAKAZO_ORCH_STATE_FILE").map(Into::into));
             let mut watch = Watch::new(
                 orch.rakazo.clone(),
-                PiNotify,
+                PiNotify::default(),
                 worker_name,
                 state_file,
                 allowlist.clone(),
@@ -921,6 +993,314 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
     Ok(())
 }
 
+/// Multi-agent AgentSmith roster bridge. A roster command failure is fatal in
+/// every subcommand: there is no "just orch" fallback.
+async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<()> {
+    use rakazo_beeper::orch::{
+        Orch,
+        agentsmith::{self, Agent, CommandRoster, RosterSource},
+        bridge::{BridgeConfig, SessionIssuer, TokenStore},
+        reply, supervisor,
+        supervisor::{PiNotifyDeliverer, Supervisor},
+        watch::WatchState,
+    };
+
+    let config = BridgeConfig::load(config_path).with_context(|| {
+        format!(
+            "bridge config {} (copy config/agentsmith.example.toml and set roster_command + host)",
+            config_path.display()
+        )
+    })?;
+    let host = config.host()?;
+
+    // Load the roster exactly the same way for every subcommand.
+    let load = |config: &BridgeConfig, host: &str| -> Result<Vec<Agent>> {
+        let source = CommandRoster::new(&config.agentsmith.roster_command)?;
+        let roster = source.fetch()?;
+        agentsmith::agents(&roster.rows, config.effective_hide_workers(&roster), host)
+    };
+    let token_present = |key: &str| TokenStore::new(&config.bridge.service_token_dir).exists(key);
+
+    match command {
+        BridgeCommand::Roster { json } => {
+            let agents = load(&config, &host)?;
+            if *json {
+                let rows: Vec<_> = agents
+                    .iter()
+                    .map(|agent| {
+                        serde_json::json!({
+                            "key": agent.key,
+                            "name": agent.name,
+                            "role": agent.role.as_str(),
+                            "host": agent.host,
+                            "owned": agent.host == host,
+                            "pane": agent.pane,
+                            "worker": agent.delivery,
+                            "offline": agent.offline,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "host": host,
+                        "hide_workers": config.bridge.hide_workers,
+                        "agents": rows,
+                    })
+                );
+            } else {
+                for agent in &agents {
+                    println!(
+                        "{}\t{}\thost={}\towned={}\tworker={}\tpane={}\toffline={}",
+                        agent.key,
+                        agent.role.as_str(),
+                        agent.host,
+                        agent.host == host,
+                        agent.delivery,
+                        agent.pane.as_deref().unwrap_or("-"),
+                        agent.offline
+                    );
+                }
+            }
+        }
+        BridgeCommand::Serve { once, interval_s } => {
+            let orch = Orch::from_env()?;
+            let deliverer = PiNotifyDeliverer::configured(
+                &config.bridge.notify_kind,
+                config.bridge.notify_urgent,
+            );
+            let mut supervisor = Supervisor::new(
+                orch.rakazo.clone(),
+                deliverer,
+                &config.bridge.state_dir,
+                &host,
+            )?;
+            let interval = match interval_s {
+                Some(seconds) if !once => Some(Duration::from_secs(*seconds)),
+                _ => None,
+            };
+            anyhow::ensure!(
+                interval.is_none_or(|interval| !interval.is_zero()),
+                "interval must be positive"
+            );
+            loop {
+                // Re-read the roster every interval so added/removed agents are
+                // reconciled. A failure is fatal for the whole process.
+                let agents = load(&config, &host)?;
+                let report = supervisor.cycle(&agents).await?;
+                println!(
+                    "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\terrors={}",
+                    host,
+                    report.agents,
+                    report.owned,
+                    report.foreign.join(","),
+                    report.created.join(","),
+                    report.archived.join(","),
+                    report.missing.join(","),
+                    report.delivered,
+                    report.deferred,
+                    report.duplicates,
+                    report.ignored,
+                    report.errors.join(" | ")
+                );
+                match interval {
+                    Some(interval) => tokio::time::sleep(interval).await,
+                    None => break,
+                }
+            }
+        }
+        BridgeCommand::Seed { agent } => {
+            let orch = Orch::from_env()?;
+            let agents = load(&config, &host)?;
+            let bots = orch.bots().await?;
+            for target in agents
+                .iter()
+                .filter(|target| target.host == host)
+                .filter(|target| agent.as_deref().is_none_or(|only| target.matches(only)))
+            {
+                if target.role == agentsmith::AgentRole::Muse {
+                    continue;
+                }
+                let Some(bot) = agentsmith::resolve_bot(&bots, &agents, target) else {
+                    println!("{}\tbot=-\tseeded=false\treason=missing", target.key);
+                    continue;
+                };
+                let watermark = supervisor::seed_watermark(
+                    &orch.rakazo,
+                    &config.bridge.state_dir,
+                    &host,
+                    target,
+                    bot,
+                )
+                .await?;
+                println!(
+                    "{}\thost={}\tbot={}\tthread={}\tseeded=true\twatermark={watermark}",
+                    target.key,
+                    target.host,
+                    bot.id,
+                    bot.thread_id.as_deref().unwrap_or(&bot.id)
+                );
+            }
+        }
+        BridgeCommand::Provision { apply, agent } => {
+            let orch = Orch::from_env()?;
+            let agents = load(&config, &host)?;
+            let bots = orch.bots().await?;
+            let store = TokenStore::new(&config.bridge.service_token_dir);
+            let issuer = SessionIssuer {
+                rakazo: orch.rakazo.clone(),
+            };
+            let report = rakazo_beeper::orch::bridge::provision(
+                &agents,
+                &bots,
+                &store,
+                &issuer,
+                *apply,
+                agent.as_deref(),
+            )
+            .await?;
+            for decision in &report.provisioned {
+                // Never print token material; only the binding and the path.
+                println!(
+                    "{}\tbot={}\tpath={}\t{}",
+                    decision.agent_key,
+                    decision.bot_id,
+                    decision.token_path.display(),
+                    if decision.issued {
+                        "issued"
+                    } else if *apply {
+                        "present"
+                    } else {
+                        "would-issue"
+                    }
+                );
+            }
+            for (key, reason) in &report.skipped {
+                println!("{key}\tskipped={reason}");
+            }
+        }
+        BridgeCommand::Reply {
+            agent,
+            text,
+            nonce,
+            dry_run,
+        } => {
+            let orch = Orch::from_env()?;
+            let agents = load(&config, &host)?;
+            let bots = orch.bots().await?;
+            let target = agents
+                .iter()
+                .find(|candidate| candidate.matches(agent))
+                .with_context(|| format!("no roster agent matches {agent}"))?;
+            anyhow::ensure!(
+                target.host == host,
+                "{} belongs to host {}; this supervisor is {host}",
+                target.key,
+                target.host
+            );
+            let bot = agentsmith::resolve_bot(&bots, &agents, target)
+                .with_context(|| format!("{} has no live Rakazo bot", target.key))?;
+            let nonce = nonce.clone().unwrap_or_else(reply::nonce);
+            if *dry_run {
+                println!(
+                    "agent={}\thost={}\tbot={}\tthread={}\tdry_run=true",
+                    target.key,
+                    target.host,
+                    bot.id,
+                    bot.thread_id.as_deref().unwrap_or(&bot.id)
+                );
+                return Ok(());
+            }
+            let store = TokenStore::new(&config.bridge.service_token_dir);
+            let appender = rakazo_beeper::orch::bridge::RakazoAppender {
+                base: orch.rakazo.base().clone(),
+                space: orch.space.clone(),
+            };
+            let receipt = rakazo_beeper::orch::bridge::reply(
+                &store,
+                &appender,
+                &agents,
+                &bots,
+                &target.key,
+                &bot.id,
+                text,
+                &nonce,
+            )
+            .await?;
+            println!(
+                "agent={}\thost={}\tbot={}\tmessage={}\tseq={}\tnonce={}",
+                target.key, target.host, bot.id, receipt.message_id, receipt.seq, nonce
+            );
+        }
+        BridgeCommand::Status { json } => {
+            let orch = Orch::from_env()?;
+            let agents = load(&config, &host)?;
+            let bots = orch.bots().await?;
+            let mut tracked = std::collections::BTreeMap::new();
+            for agent in agents.iter().filter(|agent| agent.host == host) {
+                let state_file =
+                    supervisor::state_file(&config.bridge.state_dir, &host, &agent.key)?;
+                let state = WatchState::load(Some(&state_file))?;
+                tracked.insert(
+                    agent.key.clone(),
+                    supervisor::Tracked {
+                        agent: agent.clone(),
+                        state,
+                        state_file,
+                        bot_id: agentsmith::resolve_bot(&bots, &agents, agent)
+                            .map(|bot| bot.id.clone()),
+                        missing: agent.role != agentsmith::AgentRole::Muse
+                            && agentsmith::resolve_bot(&bots, &agents, agent).is_none(),
+                    },
+                );
+            }
+            if *json {
+                let rows: Vec<_> = agents
+                    .iter()
+                    .map(|agent| {
+                        let tracked = tracked.get(&agent.key);
+                        let state = tracked.map(|tracked| &tracked.state);
+                        let bot = agentsmith::resolve_bot(&bots, &agents, agent);
+                        serde_json::json!({
+                            "key": agent.key,
+                            "role": agent.role.as_str(),
+                            "host": agent.host,
+                            "owned": agent.host == host,
+                            "worker": agent.delivery,
+                            "pane": agent.pane,
+                            "offline": agent.offline,
+                            "bot_id": bot.map(|bot| bot.id.clone()),
+                            "thread": state.and_then(|state| state.thread_id.clone())
+                                .or_else(|| bot.map(|bot| bot.thread_id.clone().unwrap_or_else(|| bot.id.clone()))),
+                            "watermark": state.map(|state| state.last_seq).unwrap_or(0),
+                            "last_delivered_id": state.and_then(|state| state.last_delivered_id.clone()),
+                            "last_poll_ok": state.and_then(|state| state.last_poll_ok),
+                            "last_poll_at": state.and_then(|state| state.last_poll_at.clone()),
+                            "last_error": state.and_then(|state| state.last_error.clone()),
+                            "missing": tracked.is_some_and(|tracked| tracked.missing),
+                            "relay_only": bot.and_then(|bot| bot.relay_only),
+                            "token_present": token_present(&agent.key),
+                            "delivery_backend": "pi-notify",
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                for row in supervisor::status_rows(
+                    &agents,
+                    &bots,
+                    &tracked,
+                    &host,
+                    "pi-notify",
+                    &token_present,
+                ) {
+                    println!("{row}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
 /// Read the allowlist and fail unless it names the same space as the session.
 fn allowlist(orch: &rakazo_beeper::orch::Orch) -> Result<rakazo_beeper::orch::Allowlist> {
     let allowlist = rakazo_beeper::orch::Allowlist::from_env()?;
