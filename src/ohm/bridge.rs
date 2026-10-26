@@ -463,6 +463,7 @@ mod tests {
     fn config(routes: Vec<Route>) -> OhmConfig {
         OhmConfig {
             base_url: None,
+            agents: Vec::new(),
             allow_send: false,
             state_file: None,
             orchestrator_targets: vec!["%0".into()],
