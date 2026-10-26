@@ -133,23 +133,46 @@ messages). Nothing upstream was created or changed.
 
 ## Roster
 
-One root agent and five PM children. Names are stable because the roster key is
-also the server-side idempotency key, and because child resolution uses the name.
+The roster is **derived from data**, never from a hardcoded PM array. Two
+sources are joined at read time:
 
-| key | Rakazo conversation name | kind | parent |
-| --- | --- | --- | --- |
-| `fleet-orch-v1` | Fleet Orchestrator | root | — |
-| `fleet-pm-agentsmith-v1` | PM · Agentsmith | child | Fleet Orchestrator |
-| `fleet-pm-edgerunner-v1` | PM · Edgerunner | child | Fleet Orchestrator |
-| `fleet-pm-fpl-v1` | PM · FPL | child | Fleet Orchestrator |
-| `fleet-pm-fpl-cloud-v1` | PM · FPL Cloud | child | Fleet Orchestrator |
-| `fleet-pm-marbles-v1` | PM · Marbles | child | Fleet Orchestrator |
+| source | what it contributes |
+| --- | --- |
+| `verticals.toml` (`PI_PM_VERTICALS`, else `PI_PM_ROOT`/`PI_AGENT_HOME`, else `~/.pi/agent`) | the canonical vertical list |
+| `pi-pm list --tsv` | live session, pane, phase and worker count |
 
-**Transmog is excluded while that vertical is paused.** Do not create
-`fleet-pm-transmog-v1`; when the vertical resumes, add its entry back to `PMS`
-in `src/orch.rs` and create it through the orchestrator, following the same
-naming rules. `orch list` and `orch ensure` intentionally do not mention it, so
-a paused vertical cannot be started by accident.
+A vertical in the file is always a roster entry. A missing live row means
+**offline**, not absent, and a pane is never invented. A vertical opts out of
+routing with an explicit `paused = true`; it stays visible as paused so it cannot
+be started by accident, but it is excluded from the routing table.
+
+Stable identities are derived from the vertical slug:
+
+| kind | key | name |
+| --- | --- | --- |
+| root | `fleet-orch-v1` | `Fleet Orchestrator` |
+| PM | `fleet-pm-<vertical>-v1` | `PM · <Title>` |
+
+`<Title>` preserves the acronyms already used by live PM children
+(`fpl` -> `FPL`, `fpl-cloud` -> `FPL Cloud`, `ivr` -> `IVR`) so a derived name
+cannot drift from an existing child and create a duplicate. Adding a vertical is
+a data edit; `rakazo-beeper orch roster` proves it without a source change.
+
+`src/fleet/route.rs` is built from the same entries (`Orch::route_table`):
+`orch` -> `pm:<vertical>`, a PM row parented under `orch`, conversation from the
+matched bot (`threadId`, or `botId`), pane from live state. Unknown, paused and
+pane-less conversations resolve to `Unrouted`; there is no orchestrator
+fallback. The root pane is explicit (`RAKAZO_ORCH_PANE`) rather than guessed
+from the focused tmux pane; without it the root is `Unrouted` too.
+
+Useful read-only commands (no Rakazo session needed for `roster`):
+
+```sh
+rakazo-beeper orch roster           # derived roster + live/offline state
+rakazo-beeper orch roster --json
+rakazo-beeper orch list             # same roster matched to live Rakazo agents
+rakazo-beeper orch route --json     # conversation -> pane routing table
+```
 
 The root is created with `notifyOnFinish = false` and `computerMode = team`.
 A fleet entry must never claim the deployment's shared computer.

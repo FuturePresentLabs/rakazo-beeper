@@ -8,12 +8,16 @@
 //! Design and gaps: `docs/orchestrator-in-rakazo.md`.
 
 pub mod reply;
+pub mod roster;
 pub mod watch;
 
+use crate::fleet::{BotKey, Entry as RouteEntry, Table};
 use crate::rakazo::{Bot, NewBot, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use url::Url;
+
+pub use roster::{Entry, Kind, Live, ORCH_KEY, ORCH_NAME, orchestrator_entry};
 
 /// The single production conversation this process may read and reply to.
 ///
@@ -79,85 +83,50 @@ impl Allowlist {
     }
 }
 
-/// How an entry is matched to an agent and how it may be created.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// Created with `bots.create`; our own `spawnKey` is the idempotency key.
-    Root,
-    /// A real sub-chat under the orchestrator. Only the orchestrator's own
-    /// `spawn_bot` tool can set `parentBotId`; no client RPC exposes it.
-    Child,
-}
-
-/// One local pane that should appear as a Rakazo conversation.
-#[derive(Clone, Copy, Debug)]
-pub struct Entry {
-    /// Stable local name. For roots this is the server-side idempotency key.
-    pub key: &'static str,
-    pub name: &'static str,
-    pub title: &'static str,
-    pub description: &'static str,
-    pub kind: Kind,
-}
-
-const ORCH: Entry = Entry {
-    key: "fleet-orch-v1",
-    name: "Fleet Orchestrator",
-    title: "Local fleet orchestrator (pi)",
-    description: "Runs on the operator's machine. Triages escalations, dispatches fleet workers, and reports merged work.",
-    kind: Kind::Root,
-};
-
-const PMS: [Entry; 5] = [
-    Entry {
-        key: "fleet-pm-agentsmith-v1",
-        name: "PM · Agentsmith",
-        title: "Agentsmith vertical PM",
-        description: "Single-threaded PM for the agentsmith vertical: fleet tooling, bus, IRC and reaper glue.",
-        kind: Kind::Child,
-    },
-    // Transmog is paused, so it deliberately has no live entry. Re-add its
-    // `fleet-pm-transmog-v1` entry when the vertical is resumed.
-    Entry {
-        key: "fleet-pm-edgerunner-v1",
-        name: "PM · Edgerunner",
-        title: "Edgerunner vertical PM",
-        description: "Single-threaded PM for the edgerunner vertical (native agent sessions, ACP, sandboxes).",
-        kind: Kind::Child,
-    },
-    Entry {
-        key: "fleet-pm-fpl-v1",
-        name: "PM · FPL",
-        title: "FPL core vertical PM",
-        description: "Single-threaded PM for FPL core repos and the Rakazo bridge itself.",
-        kind: Kind::Child,
-    },
-    Entry {
-        key: "fleet-pm-fpl-cloud-v1",
-        name: "PM · FPL Cloud",
-        title: "FPL cloud vertical PM",
-        description: "Single-threaded PM for FPL cloud, shroud and hosted deployments.",
-        kind: Kind::Child,
-    },
-    Entry {
-        key: "fleet-pm-marbles-v1",
-        name: "PM · Marbles",
-        title: "Marbles vertical PM",
-        description: "Single-threaded PM for the marbles issue tracker and its workers.",
-        kind: Kind::Child,
-    },
-];
-
-pub fn roster() -> Vec<Entry> {
-    let mut entries = Vec::with_capacity(PMS.len() + 1);
-    entries.push(ORCH);
-    entries.extend(PMS);
-    entries
+/// The production roster: orchestrator plus every vertical in `verticals.toml`,
+/// joined with live `pi-pm` state. A missing verticals file is an error (we must
+/// not silently show an empty fleet); missing live state only marks entries
+/// offline.
+pub fn roster() -> Result<Vec<Entry>> {
+    roster::load()
 }
 
 pub struct Orch {
     pub rakazo: Rakazo,
     pub space: String,
+}
+
+/// Fleet route key for a roster entry. The orchestrator is `orch`; every PM is
+/// `pm:<vertical>`, derived from the same stable key shown in `orch list`.
+pub fn route_key(entry: &Entry) -> Result<BotKey> {
+    match entry.kind {
+        Kind::Root => Ok(BotKey::Orch),
+        Kind::Child => entry
+            .vertical()
+            .map(BotKey::pm)
+            .context("PM roster key is not of the form fleet-pm-<vertical>-v1"),
+    }
+}
+
+/// Match live agents to roster entries without needing a Rakazo session. Roots
+/// match on the create idempotency key; children match by exact name under the
+/// live orchestrator's `parentBotId`.
+pub fn resolve<'a>(bots: &'a [Bot], entry: &Entry) -> Option<&'a Bot> {
+    match entry.kind {
+        Kind::Root => bots.iter().find(|bot| {
+            bot.archived_at.is_none() && bot.spawn_key.as_deref() == Some(entry.key.as_str())
+        }),
+        Kind::Child => {
+            let root = bots.iter().find(|bot| {
+                bot.archived_at.is_none() && bot.spawn_key.as_deref() == Some(ORCH_KEY)
+            })?;
+            bots.iter().find(|bot| {
+                bot.archived_at.is_none()
+                    && bot.parent_bot_id.as_deref() == Some(root.id.as_str())
+                    && bot.name == entry.name
+            })
+        }
+    }
 }
 
 impl Orch {
@@ -199,21 +168,41 @@ impl Orch {
     /// our `spawnKey` (only the orchestrator's `spawn_bot` tool creates them), so
     /// they are matched by name under the live orchestrator's `parentBotId`.
     pub fn resolve<'a>(&self, bots: &'a [Bot], entry: &Entry) -> Option<&'a Bot> {
-        match entry.kind {
-            Kind::Root => bots.iter().find(|bot| {
-                bot.archived_at.is_none() && bot.spawn_key.as_deref() == Some(entry.key)
-            }),
-            Kind::Child => {
-                let root = bots.iter().find(|bot| {
-                    bot.archived_at.is_none() && bot.spawn_key.as_deref() == Some(ORCH.key)
-                })?;
-                bots.iter().find(|bot| {
-                    bot.archived_at.is_none()
-                        && bot.parent_bot_id.as_deref() == Some(root.id.as_str())
-                        && bot.name == entry.name
-                })
+        resolve(bots, entry)
+    }
+
+    /// Build the routing table from the *same* derived roster.
+    ///
+    /// A vertical that is paused, offline, or has no pane becomes an explicit
+    /// [`fleet::Resolution::Unrouted`] row; it never falls back to the
+    /// orchestrator. Unknown conversations are unrouted by [`Table::resolve`].
+    pub fn route_table(&self, bots: &[Bot], roster: &[Entry]) -> Result<Table> {
+        let mut entries = Vec::with_capacity(roster.len());
+        for entry in roster.iter().filter(|entry| !entry.paused) {
+            let bot = self.resolve(bots, entry);
+            let conversation =
+                bot.map(|bot| bot.thread_id.clone().unwrap_or_else(|| bot.id.clone()));
+            let notify = match entry.kind {
+                Kind::Root => "orchestrator".to_string(),
+                Kind::Child => format!("pm:{}", entry.vertical().unwrap_or(&entry.key)),
+            };
+            let mut row = RouteEntry::new(
+                route_key(entry)?,
+                conversation,
+                entry.pane().map(str::to_string),
+                Some(notify),
+            )
+            .with_paused(entry.paused);
+            if entry.kind == Kind::Child {
+                row = row.with_parent(BotKey::Orch);
             }
+            let row = match bot.map(|bot| bot.id.clone()) {
+                Some(bot_id) => row.with_bot_id(bot_id),
+                None => row,
+            };
+            entries.push(row);
         }
+        Table::new(entries).map_err(Into::into)
     }
 
     /// Text that asks the orchestrator to nest one PM sub-chat.
@@ -240,12 +229,12 @@ impl Orch {
         );
         self.rakazo
             .create_bot(&NewBot {
-                name: entry.name,
-                title: entry.title,
-                description: entry.description,
-                instructions: entry.description,
+                name: &entry.name,
+                title: &entry.title,
+                description: &entry.description,
+                instructions: &entry.description,
                 notify_on_finish: false,
-                spawn_key: entry.key,
+                spawn_key: &entry.key,
                 // A fleet entry must never take over the deployment's shared computer.
                 computer_mode: "team",
             })
@@ -282,12 +271,60 @@ impl Orch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::Resolution;
+    use crate::orch::roster::Vertical;
+    use std::collections::BTreeMap;
+
+    fn vertical(name: &str, paused: bool) -> Vertical {
+        Vertical {
+            name: name.to_string(),
+            owner: Some(name.to_string()),
+            scope: None,
+            paused,
+        }
+    }
+
+    fn bot(id: &str, spawn: Option<&str>, archived: Option<&str>) -> Bot {
+        Bot {
+            id: id.into(),
+            name: "x".into(),
+            color: String::new(),
+            title: String::new(),
+            description: String::new(),
+            space_id: "space".into(),
+            thread_id: None,
+            parent_bot_id: None,
+            spawn_key: spawn.map(str::to_string),
+            archived_at: archived.map(str::to_string),
+            capabilities: None,
+        }
+    }
+
+    fn orch() -> Orch {
+        Orch {
+            rakazo: Rakazo::from_parts(
+                Url::parse("https://agents.example.test").unwrap(),
+                "token",
+                "space",
+            )
+            .unwrap(),
+            space: "space".into(),
+        }
+    }
 
     #[test]
-    fn roster_is_unique_and_has_one_parent() {
-        let entries = roster();
+    fn roster_is_unique_and_has_one_root() {
+        let entries = roster::from_parts(
+            &[
+                vertical("agentsmith", false),
+                vertical("fpl", false),
+                vertical("fpl-cloud", false),
+                vertical("marbles", false),
+            ],
+            &BTreeMap::new(),
+        );
         assert_eq!(entries.iter().filter(|e| e.kind == Kind::Root).count(), 1);
-        let mut keys: Vec<_> = entries.iter().map(|e| e.key).collect();
+        let mut keys: Vec<_> = entries.iter().map(|e| e.key.as_str()).collect();
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), entries.len());
@@ -300,50 +337,108 @@ mod tests {
 
     #[test]
     fn resolution_ignores_archived_and_foreign_agents() {
-        let bot = |id: &str, spawn: Option<&str>, archived: Option<&str>| Bot {
-            id: id.into(),
-            name: "x".into(),
-            color: String::new(),
-            title: String::new(),
-            description: String::new(),
-            space_id: "space".into(),
-            thread_id: None,
-            parent_bot_id: None,
-            spawn_key: spawn.map(str::to_string),
-            archived_at: archived.map(str::to_string),
-            capabilities: None,
-        };
-        let orch = Orch {
-            rakazo: Rakazo::from_parts(
-                Url::parse("https://agents.example.test").unwrap(),
-                "token",
-                "space",
-            )
-            .unwrap(),
-            space: "space".into(),
-        };
+        let orch = orch();
         let mut bots = vec![
             bot("a", Some("other-v1"), None),
-            bot("b", Some(ORCH.key), Some("2026-01-01T00:00:00Z")),
-            bot("c", Some(ORCH.key), None),
+            bot("b", Some(ORCH_KEY), Some("2026-01-01T00:00:00Z")),
+            bot("c", Some(ORCH_KEY), None),
         ];
-        assert_eq!(orch.resolve(&bots, &ORCH).map(|b| b.id.as_str()), Some("c"));
-        // A PM resolves only as an exact-name child of the live orchestrator.
-        let mut child = bot("d", Some("run:spawn_bot:hash"), None);
-        let marbles = roster()
-            .into_iter()
+        let entries = roster::from_parts(
+            &[vertical("marbles", false), vertical("fpl", false)],
+            &BTreeMap::new(),
+        );
+        let root = &entries[0];
+        let marbles = entries
+            .iter()
             .find(|entry| entry.key == "fleet-pm-marbles-v1")
             .unwrap();
-        child.name = marbles.name.to_string();
+        let fpl = entries
+            .iter()
+            .find(|entry| entry.key == "fleet-pm-fpl-v1")
+            .unwrap();
+        assert_eq!(orch.resolve(&bots, root).map(|b| b.id.as_str()), Some("c"));
+        // A PM resolves only as an exact-name child of the live orchestrator.
+        let mut child = bot("d", Some("run:spawn_bot:hash"), None);
+        child.name = marbles.name.clone();
         child.parent_bot_id = Some("c".into());
         bots.push(child);
         assert_eq!(
-            orch.resolve(&bots, &marbles).map(|b| b.id.as_str()),
+            orch.resolve(&bots, marbles).map(|b| b.id.as_str()),
             Some("d")
         );
         assert!(
-            orch.resolve(&bots, &roster()[1]).is_none(),
+            orch.resolve(&bots, fpl).is_none(),
             "a child must belong to the live orchestrator"
         );
+    }
+
+    #[test]
+    fn route_table_uses_derived_entries_and_never_falls_back_to_orch() {
+        let orch = orch();
+        let entries = roster::from_parts(
+            &[
+                vertical("fpl", false),
+                vertical("transmog", true),
+                vertical("marbles", false),
+            ],
+            &roster::parse_live_tsv("fpl\tpm-fpl\t%40\tlive:node\treview\t1\t-\t0\n"),
+        );
+        let mut bots = vec![bot("orch-bot", Some(ORCH_KEY), None)];
+        for (id, key) in [
+            ("fpl-bot", "fleet-pm-fpl-v1"),
+            ("marbles-bot", "fleet-pm-marbles-v1"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.key == key).unwrap();
+            let mut child = bot(id, Some("run:spawn_bot:hash"), None);
+            child.name = entry.name.clone();
+            child.parent_bot_id = Some("orch-bot".into());
+            bots.push(child);
+        }
+        let table = orch.route_table(&bots, &entries).expect("valid table");
+
+        // Live PM routes to its own pane.
+        assert_eq!(
+            table.resolve("fpl-bot"),
+            Resolution::Routed {
+                bot: BotKey::pm("fpl"),
+                pane: "%40".to_string(),
+            }
+        );
+        // Offline PM is present but unrouted; no orchestrator fallback.
+        match table.resolve("marbles-bot") {
+            Resolution::Unrouted { reason } => assert!(reason.contains("no pane"), "{reason}"),
+            other => panic!("expected Unrouted, got {other:?}"),
+        }
+        // Paused verticals are not inserted into the routing table at all.
+        assert!(!table.contains_key(&BotKey::pm("transmog")));
+        match table.resolve("transmog-bot") {
+            Resolution::Unrouted { reason } => assert!(reason.contains("unknown"), "{reason}"),
+            other => panic!("expected Unrouted, got {other:?}"),
+        }
+        // Unknown conversations never resolve to the orchestrator.
+        match table.resolve("not-a-conversation") {
+            Resolution::Unrouted { reason } => assert!(!reason.contains("orch"), "{reason}"),
+            other => panic!("expected Unrouted, got {other:?}"),
+        }
+        // PM rows stay parented under orch.
+        for entry in table
+            .entries()
+            .iter()
+            .filter(|e| !matches!(e.bot_key(), BotKey::Orch))
+        {
+            assert_eq!(entry.parent(), Some(&BotKey::Orch), "{}", entry.bot_key());
+        }
+    }
+
+    #[test]
+    fn route_keys_are_derived_from_roster_keys() {
+        let entries = roster::from_parts(
+            &[vertical("fpl-cloud", false), vertical("agentsmith", false)],
+            &BTreeMap::new(),
+        );
+        assert_eq!(route_key(&entries[0]).unwrap(), BotKey::Orch);
+        assert_eq!(route_key(&entries[1]).unwrap(), BotKey::pm("agentsmith"));
+        assert_eq!(route_key(&entries[2]).unwrap(), BotKey::pm("fpl-cloud"));
+        assert_eq!(entries[1].vertical(), Some("agentsmith"));
     }
 }

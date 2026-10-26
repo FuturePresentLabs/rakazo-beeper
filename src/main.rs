@@ -167,7 +167,24 @@ enum OrchCommand {
     /// Confirm the session, its owner, and the resolved space.
     Whoami,
     /// List agents visible to this session, marking roster entries.
-    List,
+    List {
+        /// Emit one JSON array instead of tabs.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the derived roster (orchestrator + every configured vertical)
+    /// without a Rakazo session. Live state comes from `pi-pm list --tsv`.
+    Roster {
+        /// Emit one JSON array instead of tabs.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the conversation -> pane routing table derived from the roster.
+    Route {
+        /// Emit one JSON array instead of tabs.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare the roster with live agents. Reports only unless --apply.
     Ensure {
         /// Create missing entries (idempotent per entry's spawnKey).
@@ -452,8 +469,95 @@ async fn shutdown() -> Result<()> {
 const ORCH_HELP: &str = "set RAKAZO_ORCH_TOKEN_FILE (owner-only file) or RAKAZO_ORCH_TOKEN, RAKAZO_ORCH_SPACE_ID, \
      and for watch/reply/status RAKAZO_ORCH_BOT_ID + RAKAZO_ORCH_THREAD_ID";
 
+/// Print the derived roster. `bots` is `None` for the offline `orch roster`
+/// view; when present, each entry is matched to its live Rakazo agent.
+fn print_roster(
+    entries: &[rakazo_beeper::orch::Entry],
+    bots: Option<&[rakazo_beeper::rakazo::Bot]>,
+    json: bool,
+) -> Result<()> {
+    use rakazo_beeper::orch;
+
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let bot = bots.and_then(|bots| orch::resolve(bots, entry));
+            let live = entry.live.as_ref();
+            (
+                entry,
+                bot,
+                live.map(|live| {
+                    format!(
+                        "{}:{}{}",
+                        live.pane.as_deref().unwrap_or("<no-pane>"),
+                        live.status,
+                        if live.phase.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":{}", live.phase)
+                        }
+                    )
+                }),
+            )
+        })
+        .collect();
+
+    if json {
+        let value: Vec<_> = rows
+            .iter()
+            .map(|(entry, bot, live)| {
+                serde_json::json!({
+                    "key": entry.key,
+                    "name": entry.name,
+                    "title": entry.title,
+                    "kind": entry.kind.as_str(),
+                    "paused": entry.paused,
+                    "bot_id": bot.map(|bot| bot.id.as_str()),
+                    "parent_bot_id": bot.and_then(|bot| bot.parent_bot_id.as_deref()),
+                    "live": entry.live.as_ref().map(|state| serde_json::json!({
+                        "session": state.session,
+                        "pane": state.pane,
+                        "status": state.status,
+                        "phase": state.phase,
+                        "workers": state.workers,
+                    })),
+                    "pane": live,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    for (entry, bot, live) in rows {
+        let id = bot.map(|bot| bot.id.as_str()).unwrap_or("-");
+        let state = match (bot, entry.paused) {
+            (_, true) => "paused",
+            (Some(_), false) => "present",
+            (None, false) => "missing",
+        };
+        println!(
+            "{}\t{}\t{}\t{}\t{}\tlive={}",
+            id,
+            entry.name,
+            entry.key,
+            entry.kind.as_str(),
+            state,
+            live.as_deref().unwrap_or("offline"),
+        );
+    }
+    Ok(())
+}
+
 async fn orch_command(command: &OrchCommand) -> Result<()> {
-    use rakazo_beeper::orch::{Orch, roster};
+    use rakazo_beeper::orch::{Entry, Kind, Orch, roster};
+
+    // The roster and its route table are local: they need no Rakazo session, so
+    // an offline host can still see every configured vertical.
+    if let OrchCommand::Roster { json } = command {
+        print_roster(&roster::load()?, None, *json)?;
+        return Ok(());
+    }
 
     let orch = Orch::from_env().with_context(|| ORCH_HELP.to_string())?;
     match command {
@@ -467,30 +571,59 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 orch.space
             );
         }
-        OrchCommand::List => {
+        OrchCommand::Roster { .. } => unreachable!("handled before the session is required"),
+        OrchCommand::List { json } => {
             let bots = orch.bots().await?;
-            let mut roster_ids = std::collections::HashSet::new();
-            for entry in roster() {
-                match orch.resolve(&bots, &entry) {
-                    Some(bot) => {
-                        roster_ids.insert(bot.id.clone());
-                        println!(
-                            "{}\t{}\t{}\tparent={}",
-                            bot.id,
-                            entry.name,
-                            entry.key,
-                            bot.parent_bot_id.as_deref().unwrap_or("-")
-                        );
-                    }
-                    None => println!("-\t{}\t{}\tmissing", entry.name, entry.key),
+            let entries = roster::load()?;
+            if *json {
+                print_roster(&entries, Some(&bots), true)?;
+            } else {
+                print_roster(&entries, Some(&bots), false)?;
+                let roster_ids: std::collections::HashSet<_> = entries
+                    .iter()
+                    .filter_map(|entry| orch.resolve(&bots, entry).map(|bot| bot.id.clone()))
+                    .collect();
+                for bot in bots.iter().filter(|bot| !roster_ids.contains(&bot.id)) {
+                    println!("{}\t{}\t(not a fleet entry)", bot.id, bot.name);
                 }
             }
-            for bot in bots.iter().filter(|bot| !roster_ids.contains(&bot.id)) {
-                println!("{}\t{}\t(not a fleet entry)", bot.id, bot.name);
+        }
+        OrchCommand::Route { json } => {
+            let bots = orch.bots().await?;
+            let entries = roster::load()?;
+            let table = orch.route_table(&bots, &entries)?;
+            if *json {
+                let rows: Vec<_> = table
+                    .entries()
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "key": row.bot_key().as_key(),
+                            "conversation": row.conversation_id(),
+                            "pane": row.pane_id(),
+                            "paused": row.is_paused(),
+                            "parent": row.parent().map(|parent| parent.as_key()),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for row in table.entries() {
+                    println!(
+                        "{}\t{}\t{}\tpaused={}\tparent={}",
+                        row.bot_key(),
+                        row.conversation_id().unwrap_or("-"),
+                        row.pane_id().unwrap_or("<unrouted>"),
+                        row.is_paused(),
+                        row.parent()
+                            .map(|parent| parent.as_key())
+                            .unwrap_or_else(|| "-".into()),
+                    );
+                }
             }
         }
         OrchCommand::Ensure { apply, only } => {
-            let entries: Vec<_> = roster()
+            let entries: Vec<_> = roster::load()?
                 .into_iter()
                 .filter(|entry| {
                     only.is_empty()
@@ -503,13 +636,17 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             anyhow::ensure!(!entries.is_empty(), "no roster entry matched --only");
             let bots = orch.bots().await?;
             for entry in entries {
+                if entry.paused {
+                    println!("paused\t-\t{}\t{}", entry.name, entry.key);
+                    continue;
+                }
                 match orch.resolve(&bots, &entry) {
                     Some(bot) => println!("present\t{}\t{}\t{}", bot.id, entry.name, entry.key),
-                    None if *apply && entry.kind == rakazo_beeper::orch::Kind::Root => {
+                    None if *apply && entry.kind == Kind::Root => {
                         let bot = orch.create(&entry).await?;
                         println!("created\t{}\t{}\t{}", bot.id, entry.name, entry.key);
                     }
-                    None if entry.kind == rakazo_beeper::orch::Kind::Child => println!(
+                    None if entry.kind == Kind::Child => println!(
                         "missing\t-\t{}\t{}\t(child: run `orch spawn {}`)",
                         entry.name, entry.key, entry.key
                     ),
@@ -521,26 +658,37 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             }
         }
         OrchCommand::Spawn { key } => {
-            let entry = roster()
-                .into_iter()
+            let entries = roster::load()?;
+            let entry: &Entry = entries
+                .iter()
                 .find(|entry| entry.key == key.as_str() || entry.name == key.as_str())
                 .with_context(|| format!("no roster entry matches {key}"))?;
             anyhow::ensure!(
-                entry.kind == rakazo_beeper::orch::Kind::Child,
+                entry.kind == Kind::Child,
                 "{} is a root entry; `orch ensure --apply` creates it",
                 entry.name
             );
+            anyhow::ensure!(
+                !entry.paused,
+                "{} is paused in verticals.toml; resume the vertical before spawning it",
+                entry.name
+            );
             let bots = orch.bots().await?;
-            let root = orch
-                .resolve(&bots, &roster()[0])
-                .context("orchestrator entry missing; run `orch ensure --apply` first")?;
-            if let Some(child) = orch.resolve(&bots, &entry) {
+            let root = entries
+                .iter()
+                .find(|entry| entry.kind == Kind::Root)
+                .context("roster is missing its orchestrator entry")
+                .and_then(|entry| {
+                    orch.resolve(&bots, entry)
+                        .context("orchestrator entry missing; run `orch ensure --apply` first")
+                })?;
+            if let Some(child) = orch.resolve(&bots, entry) {
                 println!("present\t{}\t{}\t{}", child.id, entry.name, entry.key);
                 return Ok(());
             }
             let nonce = format!("spawn-{}-{}", entry.key, random_nonce());
             let seq = orch
-                .say(&root.id, &Orch::spawn_prompt(&entry), &nonce)
+                .say(&root.id, &Orch::spawn_prompt(entry), &nonce)
                 .await?;
             println!("spawning\tseq={seq}\tnonce={nonce}\t{}", entry.name);
         }
@@ -746,9 +894,9 @@ async fn resolve_id(orch: &rakazo_beeper::orch::Orch, needle: &str) -> Result<St
         .filter(|bot| {
             bot.id == needle
                 || bot.spawn_key.as_deref() == Some(needle)
-                || roster()
-                    .iter()
-                    .any(|entry| entry.key == needle && bot.spawn_key.as_deref() == Some(entry.key))
+                || roster().unwrap_or_default().iter().any(|entry| {
+                    entry.key == needle && bot.spawn_key.as_deref() == Some(entry.key.as_str())
+                })
                 || bot.name == needle
         })
         .collect();

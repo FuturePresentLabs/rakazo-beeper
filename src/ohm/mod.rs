@@ -93,7 +93,12 @@ impl OhmConfig {
             );
         }
         let mut ids = HashSet::new();
-        let roster: HashSet<&str> = crate::orch::roster().iter().map(|e| e.key).collect();
+        // The orchestrator key is static; PM keys come from verticals.toml.
+        // A missing file (CI, fresh host) must not reject an orchestrator route,
+        // but it must still reject any PM key we cannot verify.
+        let entries =
+            crate::orch::roster().unwrap_or_else(|_| vec![crate::orch::orchestrator_entry()]);
+        let roster: HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
         for route in &self.routes {
             ensure!(ids.insert(route.chat_id), "duplicate ohm route chat_id");
             ensure!(
