@@ -185,16 +185,24 @@ when the deployment does not expose it yet).
 
 ## Deployed on Studio
 
+Current deployment (2026-10-27, branch `pi/agent-bridge-slice-a` at `27904c1`):
+
 ```text
 tmux session: rakazo-bridge
-runner:       ~/.local/bin/rakazo-bridge-supervisor.sh  (restart loop)
-binary:       ~/.local/bin/rakazo-beeper-bridge
+runner:       <repo>/scripts/rakazo-bridge-supervisor.sh  (restart + watchdog)
+binary:       <repo>/target/debug/rakazo-beeper
 config:       ~/.config/rakazo/agentsmith.toml
 log:          ~/.local/share/rakazo/bridge/supervisor.log
 state:        ~/.local/share/rakazo/bridge/averys-mac-studio/<key>.json
 ```
 
-Live proof (2026-10-26 UTC):
+The older `~/.local/bin/rakazo-beeper-bridge` and
+`~/.local/bin/rakazo-bridge-supervisor.sh` still exist but are **stale** (their
+hashes differ from this branch). Until they are reinstalled, the tmux session
+tracks the worktree build; a reboot does not restore it (no LaunchAgent). That
+is the remaining deployment gap.
+
+Live proof (2026-10-26 UTC, first slice):
 
 * `10:09:57Z` one user message sent to `PM · FPL` (thread
   `cmvov58zu003fkuff061fxjka`).
@@ -208,6 +216,21 @@ Live proof (2026-10-26 UTC):
 * The hosted PM still produced its own `#2 bot "No response. Try again."` for
   the inbound row: the server-side `relayOnly` flag is not exposed on this
   deployment yet (`relay_only: null`), so that ack is not from the bridge.
+
+Live proof after the resident/watchdog fix (2026-10-27 UTC):
+
+* `23:36:40Z` one `orch say` user message (seq 7) to `PM · FPL`; this ran on the
+  new build, after the supervisor restart.
+* `23:37:18Z` `fleet-pm-fpl-v1` watermark moved 6 -> 8, `last_poll_ok=true`,
+  `last_delivered_id=cmvrbrgg8000gkpffk4bwe5xg`. The `pm-fpl` tty mtime and
+  pane hash changed; `pm-rakazo` and `pm-marbles` both kept the **identical**
+  mtime and pane hash.
+* `23:37:35Z` `bridge reply --agent pm:fpl` appended exactly one row (`#9`,
+  marker count `1`, bot `cmvov58zt003ekuff4mux8qna`, thread
+  `cmvov58zu003fkuff061fxjka`); rows before/after were 9 -> 10.
+* The hosted echo was row `#8 bot "No response. Try again."`; the bridge
+  reported `ignored=1` for it and did not append it. `relay_only: null` is still
+  the server-side reason (human escalation E-958 item 1).
 
 Rollback:
 
