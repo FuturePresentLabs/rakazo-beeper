@@ -9,9 +9,11 @@ Two hard rules:
 * **No SSH transport and no pane paste.** The only local delivery primitive is
   `pi-notify` (durable outbox + the inbox-delivery extension). There is no
   `pi-tmux send`/`send-keys` path anywhere in this slice.
-* **No guessed fleet shape.** The roster command is the source of truth; a
-  failure is fatal (no "just orch" fallback), a row without a `host` is an error,
-  and a foreign-host row is reported but never delivered by this box.
+* **No guessed fleet shape.** The roster command is the source of truth; a row
+  without a `host` is an error and a foreign-host row is reported but never
+  delivered by this box. A roster failure is fatal for one-shot subcommands (no
+  "just orch" fallback); in resident mode (`serve --interval-s N`) it is a
+  `cycle-error roster:` line plus a capped backoff, not a process exit.
 
 ## The roster source (verified)
 
@@ -219,3 +221,57 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.fpl.rakazo-orch-inbo
 Remove `~/.config/rakazo/agentsmith.toml` and the host-scoped state dir to reset
 local watermarks. No production server was modified; the Beeper bridge is
 unchanged.
+
+
+## Resident mode and the supervisor (2026-10-27)
+
+`serve` (alias `run`) without `--interval-s` is **one-shot**: it runs exactly one
+cycle and exits 0, printing `one-shot: ran 1 cycle, exiting (use --interval-s N
+for resident mode)` to stderr. That is why a wrapper that only restarts on a
+non-zero exit leaves the fleet unserved: the process looks dead while the
+wrapper thinks it finished cleanly.
+
+Resident mode requires the explicit flag. `--interval-s 0` is rejected;
+`--interval-s 1` is accepted with a warning (the roster command spawns
+`pi-agentsmith`, so less than 2s is not a sane cadence). In resident mode a
+roster or cycle failure logs `cycle-error roster: <err>` / `cycle-error: <err>`
+and retries after `min(interval * 3, 300s)`, never shorter than the interval.
+The process exits only on an unrecoverable condition (bad config, missing token
+file). `os error 35` (EAGAIN from a fork under load) is exactly the transient
+case this covers.
+
+### Runbook
+
+Binary and config live on Studio; the launcher is committed at
+`scripts/rakazo-bridge-supervisor.sh`. It resolves the binary from
+`RAKAZO_BRIDGE_BIN`, then `target/release/rakazo-beeper`, then
+`target/debug/rakazo-beeper`; it never reads or writes a token.
+
+```bash
+CFG=$HOME/.config/rakazo/agentsmith.toml
+export RAKAZO_ORCH_TOKEN_FILE=$HOME/.rakazo/orch-session.json
+export RAKAZO_ORCH_SPACE_ID=b66f30cc72e5beac43f6b9ad9c0d5c9b
+
+# 1. Foreground (one cycle is a mistake: always pass --interval-s).
+./target/debug/rakazo-beeper bridge --bridge-config "$CFG" serve --interval-s 10
+
+# 2. Background under the restart loop, in its own tmux session.
+tmux kill-session -t rakazo-bridge 2>/dev/null   # remove the dead pane first
+tmux new-session -d -s rakazo-bridge \
+  "RAKAZO_BRIDGE_CONFIG=$CFG RAKAZO_BRIDGE_INTERVAL=10 \
+   ./scripts/rakazo-bridge-supervisor.sh >> $HOME/.local/share/rakazo/bridge/supervisor.log 2>&1"
+
+# 3. Check liveness (state on disk is not liveness).
+pgrep -fl 'rakazo-beeper bridge'
+tmux list-panes -t rakazo-bridge -F '#{pane_id} #{pane_dead} #{pane_current_command}'
+./target/debug/rakazo-beeper bridge --bridge-config "$CFG" status --json
+
+# 4. Stop.
+tmux kill-session -t rakazo-bridge        # rollback: the whole resident bridge
+pkill -f 'rakazo-beeper bridge'           # the binary alone, if no tmux session
+```
+
+Log: `$HOME/.local/share/rakazo/bridge/supervisor.log` (launcher and bridge
+stdout/stderr; one timestamped `supervisor:` line per start and per restart).
+State: `$HOME/.local/share/rakazo/bridge/averys-mac-studio/<key>.json`.
+Never run two supervisors at once: they race on the same watermark files.

@@ -993,8 +993,19 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
     Ok(())
 }
 
-/// Multi-agent AgentSmith roster bridge. A roster command failure is fatal in
-/// every subcommand: there is no "just orch" fallback.
+/// Backoff after a failed cycle in resident mode: three intervals, capped at
+/// five minutes, and never shorter than the configured interval.
+fn cycle_backoff(interval: Duration) -> Duration {
+    interval
+        .saturating_mul(3)
+        .min(Duration::from_secs(300))
+        .max(interval)
+}
+
+/// Multi-agent AgentSmith roster bridge. A roster command failure is fatal for
+/// one-shot subcommands: there is no "just orch" fallback. In resident mode
+/// (`serve --interval-s N`) a failed roster command is a cycle error, not a
+/// process exit, because transient `EAGAIN` from a loaded fork is recoverable.
 async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<()> {
     use rakazo_beeper::orch::{
         Orch,
@@ -1064,6 +1075,25 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
             }
         }
         BridgeCommand::Serve { once, interval_s } => {
+            // Validate the loop mode before touching credentials: a bad interval
+            // is an operator error, not an auth failure.
+            let interval = match interval_s {
+                Some(seconds) if !once => Some(Duration::from_secs(*seconds)),
+                _ => None,
+            };
+            anyhow::ensure!(
+                interval.is_none_or(|interval| !interval.is_zero()),
+                "--interval-s must be positive"
+            );
+            if let Some(interval) = interval
+                && interval < Duration::from_secs(2)
+            {
+                tracing::warn!(
+                    ?interval,
+                    "--interval-s below 2s; the roster command is expensive"
+                );
+                eprintln!("warning: --interval-s below 2s; the roster command is expensive");
+            }
             let orch = Orch::from_env()?;
             let deliverer = PiNotifyDeliverer::configured(
                 &config.bridge.notify_kind,
@@ -1075,38 +1105,58 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 &config.bridge.state_dir,
                 &host,
             )?;
-            let interval = match interval_s {
-                Some(seconds) if !once => Some(Duration::from_secs(*seconds)),
-                _ => None,
-            };
-            anyhow::ensure!(
-                interval.is_none_or(|interval| !interval.is_zero()),
-                "interval must be positive"
-            );
+            let resident = interval.is_some();
             loop {
                 // Re-read the roster every interval so added/removed agents are
-                // reconciled. A failure is fatal for the whole process.
-                let agents = load(&config, &host)?;
-                let report = supervisor.cycle(&agents).await?;
-                println!(
-                    "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\terrors={}",
-                    host,
-                    report.agents,
-                    report.owned,
-                    report.foreign.join(","),
-                    report.created.join(","),
-                    report.archived.join(","),
-                    report.missing.join(","),
-                    report.delivered,
-                    report.deferred,
-                    report.duplicates,
-                    report.ignored,
-                    report.errors.join(" | ")
-                );
-                match interval {
-                    Some(interval) => tokio::time::sleep(interval).await,
+                // reconciled. In resident mode a roster or cycle failure is a
+                // cycle error: log it, back off, and keep supervising, because
+                // `os error 35` (EAGAIN from fork under load) is transient.
+                let mut failed = false;
+                match load(&config, &host) {
+                    Ok(agents) => match supervisor.cycle(&agents).await {
+                        Ok(report) => println!(
+                            "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\terrors={}",
+                            host,
+                            report.agents,
+                            report.owned,
+                            report.foreign.join(","),
+                            report.created.join(","),
+                            report.archived.join(","),
+                            report.missing.join(","),
+                            report.delivered,
+                            report.deferred,
+                            report.duplicates,
+                            report.ignored,
+                            report.errors.join(" | ")
+                        ),
+                        Err(error) if resident => {
+                            failed = true;
+                            eprintln!("cycle-error: {error:#}");
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    Err(error) if resident => {
+                        failed = true;
+                        eprintln!("cycle-error roster: {error:#}");
+                    }
+                    Err(error) => {
+                        return Err(error.context("roster command failed"));
+                    }
+                }
+                let delay = if failed {
+                    Some(cycle_backoff(
+                        interval.expect("resident mode has an interval"),
+                    ))
+                } else {
+                    interval
+                };
+                match delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
                     None => break,
                 }
+            }
+            if !resident {
+                eprintln!("one-shot: ran 1 cycle, exiting (use --interval-s N for resident mode)");
             }
         }
         BridgeCommand::Seed { agent } => {
@@ -1728,4 +1778,31 @@ async fn agent_serve(
         tokio::time::sleep(Duration::from_secs(interval)).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::cycle_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_is_three_intervals_capped_at_five_minutes() {
+        assert_eq!(
+            cycle_backoff(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            cycle_backoff(Duration::from_secs(200)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            cycle_backoff(Duration::from_secs(1)),
+            Duration::from_secs(3)
+        );
+        // Never shorter than the configured interval, even past the cap.
+        assert_eq!(
+            cycle_backoff(Duration::from_secs(900)),
+            Duration::from_secs(900)
+        );
+    }
 }
