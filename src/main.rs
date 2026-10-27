@@ -160,12 +160,13 @@ enum BridgeCommand {
     /// and deliver new user messages via `pi-notify`.
     #[command(alias = "run")]
     Serve {
-        /// Run one cycle and exit (the default).
+        /// Run exactly one cycle and exit. Resident is the default; a long-running
+        /// command must never look alive while it has already exited.
         #[arg(long)]
         once: bool,
-        /// Run forever at this interval. The loop requires an explicit value.
-        #[arg(long, value_name = "SECONDS")]
-        interval_s: Option<u64>,
+        /// Seconds between cycles in resident mode (default 10).
+        #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+        interval_s: u64,
     },
     /// Seed every owned agent's watermark to its conversation head without
     /// delivering. Run once before the first `serve` on an existing fleet.
@@ -1075,25 +1076,21 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
             }
         }
         BridgeCommand::Serve { once, interval_s } => {
-            // Validate the loop mode before touching credentials: a bad interval
-            // is an operator error, not an auth failure.
-            let interval = match interval_s {
-                Some(seconds) if !once => Some(Duration::from_secs(*seconds)),
-                _ => None,
-            };
-            anyhow::ensure!(
-                interval.is_none_or(|interval| !interval.is_zero()),
-                "--interval-s must be positive"
-            );
-            if let Some(interval) = interval
-                && interval < Duration::from_secs(2)
-            {
+            // Resident is the default: `serve` is a daemon, and a daemon that
+            // exits 0 after one iteration is indistinguishable from success to
+            // a restart wrapper. `--once` is the only way to ask for one cycle.
+            // Validate before touching credentials: a bad interval is an
+            // operator error, not an auth failure.
+            anyhow::ensure!(*interval_s > 0, "--interval-s must be positive");
+            let interval = Duration::from_secs(*interval_s);
+            if interval < Duration::from_secs(2) {
                 tracing::warn!(
                     ?interval,
                     "--interval-s below 2s; the roster command is expensive"
                 );
                 eprintln!("warning: --interval-s below 2s; the roster command is expensive");
             }
+            let resident = !*once;
             let orch = Orch::from_env()?;
             let deliverer = PiNotifyDeliverer::configured(
                 &config.bridge.notify_kind,
@@ -1105,7 +1102,6 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 &config.bridge.state_dir,
                 &host,
             )?;
-            let resident = interval.is_some();
             loop {
                 // Re-read the roster every interval so added/removed agents are
                 // reconciled. In resident mode a roster or cycle failure is a
@@ -1143,20 +1139,16 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                         return Err(error.context("roster command failed"));
                     }
                 }
+                if !resident {
+                    eprintln!("one-shot: --once ran 1 cycle, exiting");
+                    break;
+                }
                 let delay = if failed {
-                    Some(cycle_backoff(
-                        interval.expect("resident mode has an interval"),
-                    ))
+                    cycle_backoff(interval)
                 } else {
                     interval
                 };
-                match delay {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => break,
-                }
-            }
-            if !resident {
-                eprintln!("one-shot: ran 1 cycle, exiting (use --interval-s N for resident mode)");
+                tokio::time::sleep(delay).await;
             }
         }
         BridgeCommand::Seed { agent } => {
@@ -1803,6 +1795,45 @@ mod backoff_tests {
         assert_eq!(
             cycle_backoff(Duration::from_secs(900)),
             Duration::from_secs(900)
+        );
+    }
+}
+
+#[cfg(test)]
+mod serve_cli_tests {
+    use super::{BridgeCommand, Cli, Command};
+    use clap::Parser;
+
+    fn serve(args: &[&str]) -> (bool, u64) {
+        let cli = Cli::try_parse_from(args).expect("serve CLI must parse");
+        match cli.command {
+            Command::Bridge {
+                command: BridgeCommand::Serve { once, interval_s },
+                ..
+            } => (once, interval_s),
+            _ => panic!("expected bridge serve"),
+        }
+    }
+
+    #[test]
+    fn serve_defaults_to_resident_at_ten_seconds() {
+        let (once, interval_s) = serve(&["rakazo-beeper", "bridge", "serve"]);
+        assert!(!once, "serve must be resident by default");
+        assert_eq!(interval_s, 10);
+    }
+
+    #[test]
+    fn once_is_the_only_way_to_ask_for_a_single_cycle() {
+        let (once, _) = serve(&["rakazo-beeper", "bridge", "serve", "--once"]);
+        assert!(once);
+    }
+
+    #[test]
+    fn interval_is_explicit_and_never_zero() {
+        let (_, interval_s) = serve(&["rakazo-beeper", "bridge", "serve", "--interval-s", "5"]);
+        assert_eq!(interval_s, 5);
+        assert!(
+            Cli::try_parse_from(["rakazo-beeper", "bridge", "serve", "--interval-s", "0"]).is_ok()
         );
     }
 }
