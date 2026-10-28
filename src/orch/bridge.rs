@@ -85,6 +85,11 @@ fn hide_workers_default() -> bool {
     true
 }
 
+/// A reaction the server advertises, sent once per delivered inbound message.
+fn seen_reaction_default() -> String {
+    "👍".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsmithSection {
@@ -124,6 +129,11 @@ pub struct BridgeSection {
     /// value wins (one knob, documented in `docs/agent-bridge.md`).
     #[serde(default = "hide_workers_default")]
     pub hide_workers: bool,
+    /// Tapback posted on an inbound message once it was actually delivered to a
+    /// pane (`👍` by default, which the server advertises). Empty disables the
+    /// tapback; a reaction failure never fails or rewinds a delivery.
+    #[serde(default = "seen_reaction_default")]
+    pub seen_reaction: String,
     /// Optional ohm/beeper `[[agent]]` config. When set, `bridge status` reports
     /// each matching agent's real transport and a live Beeper probe instead of
     /// assuming Rakazo-only polling. No URL, no token value: a path only.
@@ -140,6 +150,7 @@ impl Default for BridgeSection {
             notify_kind: notify_kind_default(),
             notify_urgent: notify_urgent_default(),
             hide_workers: hide_workers_default(),
+            seen_reaction: seen_reaction_default(),
             agent_config: None,
         }
     }
@@ -180,6 +191,12 @@ impl BridgeConfig {
         ensure!(
             !self.bridge.state_dir.as_os_str().is_empty(),
             "bridge.state_dir must not be empty"
+        );
+        ensure!(
+            self.bridge.seen_reaction.is_empty()
+                || crate::rich::ALLOWED_REACTIONS.contains(&self.bridge.seen_reaction.as_str()),
+            "bridge.seen_reaction must be empty (disabled) or one of {:?}",
+            crate::rich::ALLOWED_REACTIONS
         );
         ensure!(
             !self.bridge.service_token_dir.as_os_str().is_empty(),
@@ -349,6 +366,7 @@ pub trait ServiceAppender {
         bot: &str,
         text: &str,
         nonce: &str,
+        reply_to: Option<&str>,
     ) -> impl Future<Output = Result<AppendReceipt>> + Send;
 }
 
@@ -367,15 +385,19 @@ impl ServiceAppender for RakazoAppender {
         bot: &str,
         text: &str,
         nonce: &str,
+        reply_to: Option<&str>,
     ) -> impl Future<Output = Result<AppendReceipt>> + Send {
         let base = self.base.clone();
         let space = self.space.clone();
         let bot = bot.to_string();
         let text = text.to_string();
         let nonce = nonce.to_string();
+        let reply_to = reply_to.map(str::to_string);
         async move {
             let client = Rakazo::from_service_parts(base, token, &space)?;
-            client.append_assistant(&bot, &text, &nonce, None).await
+            client
+                .append_assistant(&bot, &text, &nonce, reply_to.as_deref())
+                .await
         }
     }
 }
@@ -485,6 +507,7 @@ pub async fn reply<A: ServiceAppender>(
     bot_id: &str,
     text: &str,
     nonce: &str,
+    reply_to: Option<&str>,
 ) -> Result<AppendReceipt> {
     ensure!(!text.trim().is_empty(), "refusing to send an empty reply");
     let agent = agents
@@ -505,7 +528,7 @@ pub async fn reply<A: ServiceAppender>(
         bot_id
     );
     let token = store.read(&agent.key)?;
-    appender.append(&token, bot_id, text, nonce).await
+    appender.append(&token, bot_id, text, nonce, reply_to).await
 }
 
 #[cfg(test)]
@@ -558,6 +581,8 @@ mod tests {
         .unwrap();
         assert!(config.bridge.hide_workers);
         assert_eq!(config.bridge.notify_kind, "steer");
+        assert_eq!(config.bridge.seen_reaction, "👍");
+        assert!(config.validate().is_ok());
         assert!(config.bridge.notify_urgent);
         assert!(
             toml::from_str::<BridgeConfig>("[bridge]\nhide_workers = false\n[unknown]\nx = 1")
@@ -662,9 +687,12 @@ mod tests {
         }
     }
 
+    /// (token, bot, text, nonce, reply_to)
+    type AppendCalls = Vec<(String, String, String, String, Option<String>)>;
+
     #[derive(Default)]
     struct RecordingAppender {
-        calls: Mutex<Vec<(String, String, String, String)>>,
+        calls: Mutex<AppendCalls>,
     }
 
     impl ServiceAppender for RecordingAppender {
@@ -674,12 +702,14 @@ mod tests {
             bot: &str,
             text: &str,
             nonce: &str,
+            reply_to: Option<&str>,
         ) -> impl Future<Output = Result<AppendReceipt>> + Send {
             self.calls.lock().unwrap().push((
                 token.to_string(),
                 bot.to_string(),
                 text.to_string(),
                 nonce.to_string(),
+                reply_to.map(str::to_string),
             ));
             let receipt = AppendReceipt {
                 message_id: "m1".into(),
@@ -838,6 +868,7 @@ mod tests {
             "fpl-bot",
             "hello",
             "nonce-1",
+            None,
         )
         .await
         .unwrap();
@@ -846,6 +877,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "token-fpl", "used the FPL token only");
         assert_eq!(calls[0].1, "fpl-bot");
+        assert_eq!(calls[0].4, None, "reply_to is absent by default");
 
         // Asking for the FPL agent but naming the marbles bot is refused with no
         // call at all: one agent can never send as another bot.
@@ -858,6 +890,7 @@ mod tests {
             "marbles-bot",
             "wrong bot",
             "nonce-2",
+            None,
         )
         .await
         .unwrap_err();
@@ -877,6 +910,7 @@ mod tests {
             "orch-bot",
             "hi",
             "nonce-3",
+            None,
         )
         .await
         .unwrap_err();
@@ -888,19 +922,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reply_to_threads_the_answer_under_the_inbound_message() {
+        let (agents, bots) = fixture();
+        let dir = TempDir::new().unwrap();
+        let store = TokenStore::new(dir.path());
+        store.write("fleet-pm-fpl-v1", "token-fpl").unwrap();
+        let appender = RecordingAppender::default();
+        reply(
+            &store,
+            &appender,
+            &agents,
+            &bots,
+            "fleet-pm-fpl-v1",
+            "fpl-bot",
+            "answer",
+            "nonce-1",
+            Some("inbound-42"),
+        )
+        .await
+        .unwrap();
+        let calls = appender.calls.lock().unwrap().clone();
+        assert_eq!(calls[0].4.as_deref(), Some("inbound-42"));
+    }
+
+    #[tokio::test]
     async fn an_unknown_agent_and_muse_have_no_reply_path() {
         let (agents, bots) = fixture();
         let dir = TempDir::new().unwrap();
         let store = TokenStore::new(dir.path());
         let appender = RecordingAppender::default();
         assert!(
-            reply(&store, &appender, &agents, &bots, "pm-nope", "x", "t", "n")
-                .await
-                .is_err()
-        );
-        let error = reply(&store, &appender, &agents, &bots, "muse", "m", "t", "n")
+            reply(
+                &store, &appender, &agents, &bots, "pm-nope", "x", "t", "n", None
+            )
             .await
-            .unwrap_err();
+            .is_err()
+        );
+        let error = reply(
+            &store, &appender, &agents, &bots, "muse", "m", "t", "n", None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("transport-backed"),
             "{error:#}"

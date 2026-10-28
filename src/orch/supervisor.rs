@@ -136,6 +136,10 @@ pub struct CycleReport {
     pub deferred: usize,
     pub duplicates: usize,
     pub ignored: usize,
+    /// Seen tapbacks posted after a first delivery.
+    pub seen: usize,
+    /// Seen tapbacks that failed; delivery is unaffected.
+    pub seen_failed: usize,
     pub errors: Vec<String>,
 }
 
@@ -145,6 +149,8 @@ impl CycleReport {
         self.duplicates += report.duplicates;
         self.ignored += report.ignored;
         self.deferred += report.deferred;
+        self.seen += report.seen;
+        self.seen_failed += report.seen_failed;
     }
 }
 
@@ -154,6 +160,10 @@ pub struct Supervisor<S: RakazoSource, D: Deliverer> {
     state_dir: PathBuf,
     host: String,
     tracked: BTreeMap<String, Tracked>,
+    /// Tapback posted once per first delivery. Empty means disabled.
+    seen_reaction: String,
+    /// `--bridge-config` path appended to the delivered reply hint.
+    reply_hint_config: Option<PathBuf>,
 }
 
 impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
@@ -177,7 +187,22 @@ impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
             state_dir: state_dir.into(),
             host: host.trim().to_string(),
             tracked: BTreeMap::new(),
+            seen_reaction: String::new(),
+            reply_hint_config: None,
         })
+    }
+
+    /// Enable the seen tapback (`[bridge] seen_reaction`). Empty disables it and
+    /// makes zero `threads.react` calls.
+    pub fn with_seen_reaction(mut self, reaction: impl Into<String>) -> Self {
+        self.seen_reaction = reaction.into();
+        self
+    }
+
+    /// Enable the reply hint line in delivered text with this `--bridge-config`.
+    pub fn with_reply_hint_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.reply_hint_config = Some(path.into());
+        self
     }
 
     pub fn host(&self) -> &str {
@@ -346,6 +371,8 @@ impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
                 tracked,
                 &agent.delivery,
                 &bot_id,
+                &self.seen_reaction,
+                self.reply_hint_config.as_deref(),
             )
             .await
             {
@@ -480,6 +507,8 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
     tracked: &mut Tracked,
     delivery: &str,
     bot_id: &str,
+    seen_reaction: &str,
+    reply_hint_config: Option<&Path>,
 ) -> Result<Report> {
     tracked.state.last_poll_at = Some(now_rfc3339());
     let mut messages = source.fetch_after(bot_id, tracked.state.last_seq).await?;
@@ -516,7 +545,11 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
             continue;
         }
         let reference = format!("rakazo:{conversation}:{}", message.id);
-        let text = format!("[{reference}] {}", summarize(&tracked.agent.name, &message));
+        let mut text = format!("[{reference}] {}", summarize(&tracked.agent.name, &message));
+        if let Some(config) = reply_hint_config {
+            text.push('\n');
+            text.push_str(&reply_hint(config, &tracked.agent.key, &message.id));
+        }
         // Persist earlier progress before the side effect, then advance past
         // this message only once the deliverer accepted it.
         if changed {
@@ -539,6 +572,26 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
             report.deferred += 1;
             continue;
         }
+        // "Received, working": only the first delivery ever adds it, and the
+        // deterministic nonce makes a retry a replay rather than a second add.
+        if !seen_reaction.is_empty() {
+            let nonce = format!("seen:{}", message.id);
+            match source
+                .react(bot_id, &message.id, seen_reaction, &nonce)
+                .await
+            {
+                Ok(()) => report.seen += 1,
+                Err(error) => {
+                    // Best-effort: log and keep the delivery and the watermark.
+                    report.seen_failed += 1;
+                    tracing::warn!(
+                        agent = %tracked.agent.key,
+                        message = %message.id,
+                        "seen tapback failed: {error:#}"
+                    );
+                }
+            }
+        }
         tracked.state.record_delivered(&message.id);
         tracked.state.last_delivered_id = Some(message.id.clone());
         tracked.state.delivered_total += 1;
@@ -556,6 +609,32 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
     tracked.state.last_error = None;
     save_tracked(tracked)?;
     Ok(report)
+}
+
+/// The one command that lets an agent answer without being told twice. Kept
+/// terse, never carries a token, and preserves the `[rakazo:<thread>:<id>]`
+/// reference prefix already in the delivered text.
+fn reply_hint(config: &Path, agent_key: &str, message_id: &str) -> String {
+    format!(
+        "[reply: rakazo-beeper bridge --bridge-config {} reply --agent {} --reply-to {} --text \"<answer>\"]",
+        shell_arg(&config.to_string_lossy()),
+        agent_key,
+        message_id
+    )
+}
+
+/// Quote one argument only when it would otherwise split.
+fn shell_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=,".contains(c))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn save_tracked(tracked: &Tracked) -> Result<()> {
@@ -724,6 +803,8 @@ mod tests {
         pages: Mutex<HashMap<String, Vec<Message>>>,
         created: Mutex<Vec<NewAgentBot>>,
         archived: Mutex<Vec<String>>,
+        reacts: Mutex<Vec<(String, String, String, String)>>,
+        react_fail: bool,
         bots_fail: bool,
     }
 
@@ -742,6 +823,10 @@ mod tests {
 
         fn archived(&self) -> Vec<String> {
             self.archived.lock().unwrap().clone()
+        }
+
+        fn reacts(&self) -> Vec<(String, String, String, String)> {
+            self.reacts.lock().unwrap().clone()
         }
     }
 
@@ -779,6 +864,30 @@ mod tests {
             self.bots.lock().unwrap().push(bot.clone());
             self.created.lock().unwrap().push(spec);
             async move { Ok(bot) }
+        }
+
+        fn react(
+            &self,
+            bot: &str,
+            message: &str,
+            reaction: &str,
+            nonce: &str,
+        ) -> impl Future<Output = Result<()>> + Send {
+            let fail = self.react_fail;
+            if !fail {
+                self.reacts.lock().unwrap().push((
+                    bot.to_string(),
+                    message.to_string(),
+                    reaction.to_string(),
+                    nonce.to_string(),
+                ));
+            }
+            async move {
+                if fail {
+                    anyhow::bail!("scripted reaction failure");
+                }
+                Ok(())
+            }
         }
 
         fn archive_bot(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
@@ -1222,6 +1331,124 @@ mod tests {
         let tracked = supervisor.tracked("fleet-orch-v1").unwrap();
         assert_eq!(tracked.state.last_seq, 0);
         assert!(!tracked.state.delivered("m1"));
+    }
+
+    fn seen_supervisor(
+        dir: &TempDir,
+        source: FakeSource,
+        reaction: &str,
+    ) -> Supervisor<FakeSource, FakeDeliverer> {
+        supervisor(dir, source, FakeDeliverer::default())
+            .with_seen_reaction(reaction)
+            .with_reply_hint_config("/etc/rakazo/agentsmith.toml")
+    }
+
+    #[tokio::test]
+    async fn a_first_delivery_posts_exactly_one_seen_tapback() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍");
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.seen_failed, 0);
+        let reacts = supervisor.source.reacts();
+        assert_eq!(reacts.len(), 1, "one add per message lifetime");
+        assert_eq!(reacts[0].0, "orch-bot");
+        assert_eq!(reacts[0].1, "m1");
+        assert_eq!(reacts[0].2, "👍");
+        assert_eq!(
+            reacts[0].3, "seen:m1",
+            "idempotent nonce from the message id"
+        );
+
+        // A replay of the same row is a duplicate and must not react again.
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(supervisor.source.reacts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_seen_tapback_on_duplicates_echoes_or_bot_rows() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert(
+            "orch-bot".to_string(),
+            vec![
+                message("m1", 1, "user", "first"),
+                message("m2", 2, "bot", "not ours"),
+                message("m1", 3, "user", "first"),
+            ],
+        );
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍");
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.ignored, 1);
+        assert_eq!(supervisor.source.reacts().len(), 1);
+        assert_eq!(supervisor.source.reacts()[0].1, "m1");
+    }
+
+    #[tokio::test]
+    async fn a_reaction_failure_does_not_change_counters_or_the_watermark() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let source = FakeSource {
+            react_fail: true,
+            ..FakeSource::with(bots, pages)
+        };
+        let mut supervisor = seen_supervisor(&dir, source, "👍");
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.delivered, 1, "delivery still counts");
+        assert_eq!(report.duplicates, 0);
+        assert_eq!(report.seen, 0);
+        assert_eq!(report.seen_failed, 1);
+        assert_eq!(
+            supervisor.tracked("fleet-orch-v1").unwrap().state.last_seq,
+            7,
+            "a failed tapback never rewinds the watermark"
+        );
+        assert_eq!(supervisor.deliverer.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_seen_reaction_makes_zero_react_calls() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "");
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.seen, 0);
+        assert_eq!(report.seen_failed, 0);
+        assert!(supervisor.source.reacts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivered_text_carries_the_exact_reply_command() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "");
+        supervisor.cycle(&agents).await.unwrap();
+        let text = &supervisor.deliverer.calls()[0].4;
+        assert!(
+            text.contains("[rakazo:thread-orch-bot:m1]"),
+            "reference prefix kept: {text}"
+        );
+        assert!(
+            text.contains(
+                "[reply: rakazo-beeper bridge --bridge-config /etc/rakazo/agentsmith.toml reply --agent fleet-orch-v1 --reply-to m1 --text \"<answer>\"]"
+            ),
+            "reply hint missing: {text}"
+        );
     }
 
     #[tokio::test]
