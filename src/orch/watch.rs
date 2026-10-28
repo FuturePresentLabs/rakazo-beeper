@@ -14,11 +14,11 @@
 //! never advances the watermark.
 
 use crate::orch::Allowlist;
-use crate::rakazo::{Bot, Message, NewBot, Rakazo};
+use crate::rakazo::{Bot, Message, NewBot, Rakazo, Reaction};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     path::{Path, PathBuf},
     process::Command,
@@ -54,6 +54,15 @@ pub trait RakazoSource {
     fn bots(&self) -> impl Future<Output = Result<Vec<Bot>>> + Send;
     fn fetch_after(&self, bot: &str, seq: i64)
     -> impl Future<Output = Result<Vec<Message>>> + Send;
+
+    /// Newest committed page, used only to observe tapback transitions on
+    /// messages that were already delivered. Sources that cannot read it
+    /// inherit an empty page, so reaction polling is opt-in and never changes
+    /// the message watermark.
+    fn fetch_recent(&self, bot: &str) -> impl Future<Output = Result<Vec<Message>>> + Send {
+        let _ = bot;
+        async move { Ok(Vec::new()) }
+    }
 
     /// Idempotent `bots.create`. Sources that cannot create bots (tests,
     /// read-only clients) inherit a fail-closed default.
@@ -103,6 +112,12 @@ impl RakazoSource for Rakazo {
         seq: i64,
     ) -> impl Future<Output = Result<Vec<Message>>> + Send {
         Rakazo::after(self, bot, seq)
+    }
+
+    fn fetch_recent(&self, bot: &str) -> impl Future<Output = Result<Vec<Message>>> + Send {
+        let client = self.clone();
+        let bot = bot.to_string();
+        async move { Ok(client.recent_page(&bot).await?.messages) }
     }
 
     fn create_bot(&self, bot: NewAgentBot) -> impl Future<Output = Result<Bot>> + Send {
@@ -282,6 +297,9 @@ impl Notifier for FakeNotifier {
 pub const MAX_DELIVERED_IDS: usize = 512;
 /// The notification body keeps one line and at most this many text characters.
 pub const SNIPPET_CHARS: usize = 240;
+/// Bound on remembered reaction keys. The full ref is retained so an emoji is
+/// delivered exactly once per message even across restarts.
+pub const MAX_REACTION_KEYS: usize = 1024;
 
 /// Persisted binding + dedupe watermark.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -318,6 +336,26 @@ pub struct WatchState {
     pub last_poll_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Tapbacks already observed, keyed by the stable
+    /// `rakazo:<conversation>:<message>:<emoji>` ref.
+    #[serde(default)]
+    pub reactions: BTreeMap<String, ReactionState>,
+    /// True after the first reaction scan. That scan records the current state
+    /// without notifying, so enabling a watcher never replays old tapbacks.
+    #[serde(default)]
+    pub reactions_initialized: bool,
+    /// Total reaction lines handed to the notifier since this state was created.
+    #[serde(default)]
+    pub reactions_total: u64,
+}
+
+/// Last observed state of one tapback ref.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionState {
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub mine: bool,
 }
 
 impl WatchState {
@@ -364,6 +402,10 @@ impl WatchState {
             self.last_seq = 0;
             self.delivered_ids.clear();
             self.last_delivered_id = None;
+            // Reaction refs are conversation-scoped. A new thread starts with a
+            // new baseline so its existing tapbacks are not replayed either.
+            self.reactions.clear();
+            self.reactions_initialized = false;
         }
     }
 
@@ -374,6 +416,53 @@ impl WatchState {
             .as_deref()
             .is_some_and(|nonce| self.own_nonces.iter().any(|own| own == nonce))
     }
+
+    /// Has this exact reaction ref been observed before? The key is stable, so
+    /// it is also the idempotency key for a re-poll after a crash.
+    pub fn reaction_known(&self, reference: &str) -> bool {
+        self.reactions.contains_key(reference)
+    }
+
+    /// Record a reaction's current count/mine transition. Returns `true` when
+    /// the stored state changed.
+    pub fn update_reaction(&mut self, reference: &str, reaction: &Reaction) -> bool {
+        let next = ReactionState {
+            count: reaction.count,
+            mine: reaction.mine,
+        };
+        match self.reactions.get_mut(reference) {
+            Some(previous) if *previous == next => false,
+            Some(previous) => {
+                *previous = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remember a reaction ref. The map is bounded; keys are evicted in
+    /// lexicographic order once it grows past [`MAX_REACTION_KEYS`].
+    pub fn record_reaction(&mut self, reference: &str, reaction: &Reaction) {
+        self.reactions.insert(
+            reference.to_string(),
+            ReactionState {
+                count: reaction.count,
+                mine: reaction.mine,
+            },
+        );
+        while self.reactions.len() > MAX_REACTION_KEYS {
+            let Some(oldest) = self.reactions.keys().next().cloned() else {
+                break;
+            };
+            self.reactions.remove(&oldest);
+        }
+    }
+}
+
+/// Stable ref for one tapback. Repeats are idempotent at the notifier because
+/// the ref does not include count or a poll timestamp.
+pub fn reaction_ref(conversation: &str, message_id: &str, emoji: &str) -> String {
+    format!("rakazo:{conversation}:{message_id}:{emoji}")
 }
 
 /// One poll's outcome.
@@ -388,6 +477,8 @@ pub struct Report {
     pub seen: usize,
     /// Seen tapbacks that failed. Best-effort: delivery still counts.
     pub seen_failed: usize,
+    /// New inbound tapbacks delivered through the notifier.
+    pub reactions: usize,
 }
 
 /// Watches exactly one bound agent's conversation.
@@ -581,6 +672,56 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
         if changed {
             self.save()?;
         }
+
+        // Observe tapbacks after the text watermark is persisted. `fetch_recent`
+        // returns the newest page (including already-delivered rows), so a
+        // reaction on an old message is visible without replaying history into
+        // the message path.
+        let baseline = !self.state.reactions_initialized;
+        let conversation = self.conversation()?.to_string();
+        let recent = self.source.fetch_recent(&bot.id).await?;
+        let mut changed = false;
+        for message in &recent {
+            for reaction in &message.reactions {
+                if reaction.count == 0 || reaction.emoji.trim().is_empty() {
+                    continue;
+                }
+                let reference = reaction_ref(&conversation, &message.id, reaction.emoji.as_str());
+                if self.state.reaction_known(&reference) {
+                    changed |= self.state.update_reaction(&reference, reaction);
+                    continue;
+                }
+                if baseline {
+                    // First scan records the present without waking anyone.
+                    self.state.record_reaction(&reference, reaction);
+                    changed = true;
+                    continue;
+                }
+                let text = format!(
+                    "[{reference}] {}",
+                    summarize_reaction(&bot.name, message, reaction)
+                );
+                if changed {
+                    self.save()?;
+                    changed = false;
+                }
+                self.notifier
+                    .notify(&self.worker, &reference, &text)
+                    .with_context(|| format!("notify {reference}"))?;
+                self.state.record_reaction(&reference, reaction);
+                self.state.reactions_total += 1;
+                self.state.last_delivered_id = Some(message.id.clone());
+                self.save()?;
+                report.reactions += 1;
+            }
+        }
+        if baseline {
+            self.state.reactions_initialized = true;
+            changed = true;
+        }
+        if changed {
+            self.save()?;
+        }
         Ok(report)
     }
 
@@ -628,6 +769,14 @@ pub fn summarize(bot_name: &str, message: &Message) -> String {
     )
 }
 
+/// One compact tapback line, distinct from a text delivery.
+pub fn summarize_reaction(bot_name: &str, message: &Message, reaction: &Reaction) -> String {
+    format!(
+        "[rakazo] {bot_name} #{} reaction {} count={} mine={} on {}",
+        message.seq, reaction.emoji, reaction.count, reaction.mine, message.id
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +819,15 @@ mod tests {
             reply_to_message_id: None,
             reply_quote: None,
             run_id: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn reaction(emoji: &str, count: u64, mine: bool) -> Reaction {
+        Reaction {
+            emoji: emoji.into(),
+            count,
+            mine,
         }
     }
 
@@ -677,6 +835,7 @@ mod tests {
     struct FakeSource {
         bots: Vec<Bot>,
         pages: Mutex<VecDeque<Vec<Message>>>,
+        recent: Mutex<VecDeque<Vec<Message>>>,
     }
 
     impl FakeSource {
@@ -684,7 +843,13 @@ mod tests {
             Self {
                 bots,
                 pages: Mutex::new(pages.into()),
+                recent: Mutex::new(VecDeque::new()),
             }
+        }
+
+        fn with_recent(mut self, pages: Vec<Vec<Message>>) -> Self {
+            self.recent = Mutex::new(pages.into());
+            self
         }
     }
 
@@ -702,6 +867,11 @@ mod tests {
             // Return the scripted page verbatim (the real `after` filters, but
             // replaying rows is what proves the id/seq dedupe holds).
             let page = self.pages.lock().unwrap().pop_front().unwrap_or_default();
+            async move { Ok(page) }
+        }
+
+        fn fetch_recent(&self, _bot: &str) -> impl Future<Output = Result<Vec<Message>>> + Send {
+            let page = self.recent.lock().unwrap().pop_front().unwrap_or_default();
             async move { Ok(page) }
         }
     }
@@ -923,6 +1093,89 @@ mod tests {
         assert!(!state.delivered("m1"));
         assert_eq!(state.delivered_total, 1, "counters are kept");
         assert_eq!(state.thread_id.as_deref(), Some("thread-2"));
+    }
+
+    #[tokio::test]
+    async fn an_existing_reaction_is_a_baseline_and_is_not_notified() {
+        let mut msg = message("m1", 7, "user", "hello");
+        msg.reactions = vec![reaction("👍", 1, false)];
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![vec![msg.clone()]])
+            .with_recent(vec![vec![msg.clone()], vec![msg]]);
+        let mut watcher = watch(source, FakeNotifier::default(), None, allowlist("b1"));
+        watcher.bind().await.unwrap();
+
+        let first = watcher.poll_once().await.unwrap();
+        assert_eq!(first.delivered, 1, "the text still arrives");
+        assert_eq!(first.reactions, 0, "existing tapbacks are a baseline");
+        assert_eq!(watcher.notifier.calls().len(), 1);
+
+        let second = watcher.poll_once().await.unwrap();
+        assert_eq!(second.delivered, 0);
+        assert_eq!(second.reactions, 0, "an unchanged re-poll is silent");
+        assert_eq!(watcher.notifier.calls().len(), 1);
+        assert!(watcher.state().reactions_initialized);
+    }
+
+    #[tokio::test]
+    async fn a_new_reaction_notifies_once_with_a_stable_ref() {
+        let plain = message("m1", 7, "user", "hello");
+        let mut reacted = plain.clone();
+        reacted.reactions = vec![reaction("👍", 1, false)];
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![vec![plain.clone()]])
+            .with_recent(vec![
+                vec![plain.clone()],
+                vec![reacted.clone()],
+                vec![reacted],
+            ]);
+        let mut watcher = watch(source, FakeNotifier::default(), None, allowlist("b1"));
+        watcher.bind().await.unwrap();
+
+        assert_eq!(watcher.poll_once().await.unwrap().reactions, 0);
+        let second = watcher.poll_once().await.unwrap();
+        assert_eq!(second.reactions, 1, "a new emoji is one line");
+        let calls = watcher.notifier.calls();
+        assert_eq!(calls.len(), 2, "one text delivery plus one tapback");
+        assert_eq!(calls[1].1, "rakazo:thread-b1:m1:👍");
+        assert!(calls[1].2.contains("reaction 👍"));
+        assert!(calls[1].2.contains("count=1"));
+
+        let third = watcher.poll_once().await.unwrap();
+        assert_eq!(third.reactions, 0, "no duplicate line on re-poll");
+        assert_eq!(watcher.notifier.calls().len(), 2);
+        assert_eq!(watcher.state().reactions_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_count_updates_state_without_duplicating_the_line() {
+        let mut one = message("m1", 7, "user", "hello");
+        one.reactions = vec![reaction("👍", 1, false)];
+        let mut two = one.clone();
+        two.reactions = vec![reaction("👍", 2, true)];
+        let source = FakeSource::new(vec![bot("b1", "Orch")], vec![vec![one.clone()]])
+            .with_recent(vec![vec![one], vec![two.clone()], vec![two]]);
+        let mut watcher = watch(source, FakeNotifier::default(), None, allowlist("b1"));
+        watcher.bind().await.unwrap();
+
+        assert_eq!(watcher.poll_once().await.unwrap().reactions, 0);
+        assert_eq!(watcher.poll_once().await.unwrap().reactions, 0);
+        assert_eq!(watcher.state().reactions["rakazo:thread-b1:m1:👍"].count, 2);
+        assert!(
+            watcher.state().reactions["rakazo:thread-b1:m1:👍"].mine,
+            "the mine transition is persisted"
+        );
+        assert_eq!(watcher.notifier.calls().len(), 1, "text only, no duplicate");
+    }
+
+    #[test]
+    fn the_reaction_ref_is_stable_and_names_the_emoji() {
+        assert_eq!(
+            reaction_ref("thread-1", "message-9", "😂"),
+            "rakazo:thread-1:message-9:😂"
+        );
+        assert_eq!(
+            reaction_ref("thread-1", "message-9", "😂"),
+            reaction_ref("thread-1", "message-9", "😂")
+        );
     }
 
     #[test]

@@ -85,6 +85,18 @@ pub struct Preferences {
     #[serde(default)]
     pub attachment_mime_types: Option<Vec<String>>,
 }
+/// One tapback row on a message. The server advertises the fixed set in
+/// [`crate::rich::ALLOWED_REACTIONS`]; `mine` is from the reading session.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reaction {
+    pub emoji: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub mine: bool,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -102,6 +114,10 @@ pub struct Message {
     pub reply_quote: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Current tapback state. `threads.messages` returns these on every row, so
+    /// the poller observes transitions rather than a one-shot event.
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -506,15 +522,19 @@ impl Rakazo {
     /// replay history. The server rejects an out-of-range `before`, so this
     /// deliberately omits the cursor instead of passing `i64::MAX`.
     pub async fn head_seq(&self, bot: &str) -> Result<i64> {
-        let page: Page = self
-            .rpc(&["threads", "messages"], json!({"botId": bot}))
-            .await?;
+        let page = self.recent_page(bot).await?;
         Ok(page
             .messages
             .iter()
             .map(|message| message.seq)
             .max()
             .unwrap_or(0))
+    }
+    /// Newest committed page. Used to observe tapback state on messages that
+    /// were already delivered, without replaying the whole conversation.
+    pub async fn recent_page(&self, bot: &str) -> Result<Page> {
+        self.rpc(&["threads", "messages"], json!({"botId": bot}))
+            .await
     }
     /// Paginate backwards to the committed message sequence; never advance across a gap.
     pub async fn after(&self, bot: &str, seq: i64) -> Result<Vec<Message>> {

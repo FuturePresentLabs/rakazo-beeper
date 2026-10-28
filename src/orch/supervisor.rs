@@ -27,7 +27,8 @@
 
 use super::agentsmith::{Agent, AgentRole, ORCH_KEY, WORKER_PREFIX, resolve_bot, safe_key};
 use super::watch::{
-    NewAgentBot, PiNotify, RakazoSource, Report, WatchState, now_rfc3339, summarize, write_state,
+    NewAgentBot, PiNotify, RakazoSource, Report, WatchState, now_rfc3339, reaction_ref, summarize,
+    summarize_reaction, write_state,
 };
 use crate::rakazo::Bot;
 use anyhow::{Context, Result, ensure};
@@ -140,6 +141,8 @@ pub struct CycleReport {
     pub seen: usize,
     /// Seen tapbacks that failed; delivery is unaffected.
     pub seen_failed: usize,
+    /// New inbound tapbacks delivered from the poller's reaction model.
+    pub reactions: usize,
     pub errors: Vec<String>,
 }
 
@@ -151,6 +154,7 @@ impl CycleReport {
         self.deferred += report.deferred;
         self.seen += report.seen;
         self.seen_failed += report.seen_failed;
+        self.reactions += report.reactions;
     }
 }
 
@@ -605,6 +609,63 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
     if changed {
         save_tracked(tracked)?;
     }
+
+    // Tapbacks are state, not rows: fetch the newest page (which still includes
+    // already-delivered messages) and emit only transitions. The first scan
+    // establishes a baseline without waking anyone.
+    let baseline = !tracked.state.reactions_initialized;
+    let recent = source.fetch_recent(bot_id).await?;
+    let mut changed = false;
+    for message in &recent {
+        for reaction in &message.reactions {
+            if reaction.count == 0 || reaction.emoji.trim().is_empty() {
+                continue;
+            }
+            let reference = reaction_ref(&conversation, &message.id, reaction.emoji.as_str());
+            if tracked.state.reaction_known(&reference) {
+                changed |= tracked.state.update_reaction(&reference, reaction);
+                continue;
+            }
+            if baseline {
+                tracked.state.record_reaction(&reference, reaction);
+                changed = true;
+                continue;
+            }
+            let text = format!(
+                "[{reference}] {}",
+                summarize_reaction(&tracked.agent.name, message, reaction)
+            );
+            if changed {
+                save_tracked(tracked)?;
+                changed = false;
+            }
+            let outcome = deliverer
+                .deliver(
+                    &tracked.agent.key,
+                    &tracked.agent.host,
+                    delivery,
+                    delivery_target(&tracked.agent).as_deref(),
+                    &text,
+                    &reference,
+                )
+                .with_context(|| format!("deliver {reference}"))?;
+            if outcome == Delivery::Deferred {
+                report.deferred += 1;
+                continue;
+            }
+            tracked.state.record_reaction(&reference, reaction);
+            tracked.state.reactions_total += 1;
+            save_tracked(tracked)?;
+            report.reactions += 1;
+        }
+    }
+    if baseline {
+        tracked.state.reactions_initialized = true;
+        changed = true;
+    }
+    if changed {
+        save_tracked(tracked)?;
+    }
     tracked.state.last_poll_ok = Some(true);
     tracked.state.last_error = None;
     save_tracked(tracked)?;
@@ -739,7 +800,7 @@ pub const ROOT_KEY: &str = ORCH_KEY;
 mod tests {
     use super::*;
     use crate::orch::agentsmith::{Row, agents};
-    use crate::rakazo::Message;
+    use crate::rakazo::{Message, Reaction};
     use serde_json::json;
     use std::{collections::HashMap, future::Future, sync::Mutex};
     use tempfile::TempDir;
@@ -777,6 +838,15 @@ mod tests {
             reply_to_message_id: None,
             reply_quote: None,
             run_id: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn reaction(emoji: &str, count: u64, mine: bool) -> Reaction {
+        Reaction {
+            emoji: emoji.into(),
+            count,
+            mine,
         }
     }
 
@@ -801,6 +871,7 @@ mod tests {
     struct FakeSource {
         bots: Mutex<Vec<Bot>>,
         pages: Mutex<HashMap<String, Vec<Message>>>,
+        recent: Mutex<HashMap<String, Vec<Message>>>,
         created: Mutex<Vec<NewAgentBot>>,
         archived: Mutex<Vec<String>>,
         reacts: Mutex<Vec<(String, String, String, String)>>,
@@ -850,6 +921,17 @@ mod tests {
             // Replay the scripted rows verbatim so id/seq dedupe is tested.
             let page = self
                 .pages
+                .lock()
+                .unwrap()
+                .get(bot)
+                .cloned()
+                .unwrap_or_default();
+            async move { Ok(page) }
+        }
+
+        fn fetch_recent(&self, bot: &str) -> impl Future<Output = Result<Vec<Message>>> + Send {
+            let page = self
+                .recent
                 .lock()
                 .unwrap()
                 .get(bot)
@@ -1428,6 +1510,45 @@ mod tests {
         assert_eq!(report.seen, 0);
         assert_eq!(report.seen_failed, 0);
         assert!(supervisor.source.reacts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_reaction_reaches_the_deliverer_once() {
+        let (agents, bots) = fixture();
+        let plain = message("m1", 7, "user", "x");
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![plain.clone()]);
+        let dir = TempDir::new().unwrap();
+        let source = FakeSource::with(bots, pages);
+        source
+            .recent
+            .lock()
+            .unwrap()
+            .insert("orch-bot".to_string(), vec![plain.clone()]);
+        let mut supervisor = supervisor(&dir, source, FakeDeliverer::default());
+
+        let first = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(first.delivered, 1);
+        assert_eq!(first.reactions, 0, "the first scan is a baseline");
+
+        let mut reacted = plain;
+        reacted.reactions = vec![reaction("👍", 1, false)];
+        supervisor
+            .source
+            .recent
+            .lock()
+            .unwrap()
+            .insert("orch-bot".to_string(), vec![reacted.clone()]);
+        let second = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(second.reactions, 1);
+        let calls = supervisor.deliverer.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].5, "rakazo:thread-orch-bot:m1:👍");
+        assert!(calls[1].4.contains("reaction 👍"));
+
+        let third = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(third.reactions, 0, "no duplicate on re-poll");
+        assert_eq!(supervisor.deliverer.calls().len(), 2);
     }
 
     #[tokio::test]
