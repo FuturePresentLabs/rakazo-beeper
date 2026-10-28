@@ -4,7 +4,7 @@ use reqwest::{
     Client,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::fmt;
 use url::Url;
@@ -117,13 +117,35 @@ pub struct ServiceTokenReceipt {
     pub id: String,
     pub token: String,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendReceipt {
     pub seq: i64,
-    pub run_id: String,
+    /// Relay-only `threads.send` stores the message but starts no model run, so
+    /// the server's success shape carries `runId: null`. This is the documented
+    /// relay-only receipt contract, not a missing field.
     #[serde(default)]
+    pub run_id: Option<String>,
+    /// Some server versions send `runIds: null` for the same relay-only shape.
+    #[serde(default, deserialize_with = "default_on_null")]
     pub run_ids: Vec<String>,
+}
+impl SendReceipt {
+    /// The run started by this send, if any. Relay-only sends have none.
+    pub fn run(&self) -> Option<&str> {
+        self.run_id
+            .as_deref()
+            .or_else(|| self.run_ids.first().map(String::as_str))
+    }
+}
+/// Treat an explicit JSON `null` like a missing field, for server arrays that
+/// are nullable only on the no-run (relay-only) success path.
+fn default_on_null<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 impl Message {
     pub fn text(&self) -> String {

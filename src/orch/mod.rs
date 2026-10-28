@@ -15,7 +15,7 @@ pub mod supervisor;
 pub mod watch;
 
 use crate::fleet::{BotKey, Entry as RouteEntry, Table};
-use crate::rakazo::{Bot, NewBot, Rakazo};
+use crate::rakazo::{Bot, NewBot, Rakazo, SendReceipt};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use url::Url;
@@ -272,11 +272,11 @@ impl Orch {
     /// Post one message into an agent's Rakazo conversation.
     ///
     /// `nonce` is the caller's durable idempotency key: reusing it with the same
-    /// text reconciles, reusing it with different text must not happen.
-    pub async fn say(&self, bot: &str, text: &str, nonce: &str) -> Result<i64> {
+    /// text reconciles, reusing it with different text must not happen. A
+    /// relay-only conversation returns a receipt with no run id.
+    pub async fn say(&self, bot: &str, text: &str, nonce: &str) -> Result<SendReceipt> {
         ensure!(!text.trim().is_empty(), "refusing to send an empty message");
-        let receipt = self.rakazo.send_routed(bot, text, &[], None, nonce).await?;
-        Ok(receipt.seq)
+        self.rakazo.send_routed(bot, text, &[], None, nonce).await
     }
 
     /// Append a local orchestrator reply as a bot message. Requires the
