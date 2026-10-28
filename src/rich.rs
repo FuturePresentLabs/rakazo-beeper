@@ -20,6 +20,17 @@ pub struct Part {
 /// these; anything else is rejected server-side rather than shown as a reaction.
 pub const ALLOWED_REACTIONS: [&str; 6] = ["👍", "👎", "❤️", "😂", "🎉", "😮"];
 
+fn canonical_reaction(reaction: &str) -> Option<&'static str> {
+    ALLOWED_REACTIONS.iter().copied().find(|allowed| {
+        reaction
+            .chars()
+            .filter(|character| !matches!(character, '\u{fe0e}' | '\u{fe0f}'))
+            .eq(allowed
+                .chars()
+                .filter(|character| !matches!(character, '\u{fe0e}' | '\u{fe0f}')))
+    })
+}
+
 /// @implements github:mautrix/go@v0.28.1 event/capabilities.go RoomFeatures -- protocol signaling, not bridge implementation
 pub fn room_features(preferences: &crate::rakazo::Preferences) -> Value {
     // Compatibility snapshot: older Rakazo me responses advertise the size limit
@@ -331,6 +342,8 @@ impl TenantRuntime {
             let reaction = content["m.relates_to"]["key"]
                 .as_str()
                 .ok_or(Rejected("Reaction is missing its emoji."))?;
+            let reaction = canonical_reaction(reaction)
+                .ok_or(Rejected("Rakazo does not support this reaction."))?;
             self.rakazo
                 .react(&binding.bot, &target.rakazo_id, reaction, &nonce)
                 .await?;
