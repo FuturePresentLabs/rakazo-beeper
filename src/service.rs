@@ -375,7 +375,7 @@ impl TenantRuntime {
             self.store.cache_avatar(&self.config.id, "", &hash, &uri)?;
             uri
         };
-        if !cached.is_some_and(|profile| profile.applied_hash == hash) {
+        if cached.is_none_or(|profile| profile.applied_hash != hash) {
             self.matrix.bridge_identity(&uri).await?;
             self.store.applied_profile(&self.config.id, "", &hash)?;
         }

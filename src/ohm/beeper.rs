@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn send_without_id_is_a_protocol_error() {
-        let http = FakeHttp::default();
+        let http = FakeHttp;
         let client = BeeperClient::new(
             Some("http://127.0.0.1:23373"),
             Token::from_test("secret-token"),
