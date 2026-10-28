@@ -208,6 +208,12 @@ async fn mock(
                 }
             }
             "/rpc/threads/react" => {
+                if !matches!(
+                    args["reaction"].as_str(),
+                    Some("👍" | "👎" | "❤️" | "😂" | "🎉" | "😮")
+                ) {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({})));
+                }
                 if !state
                     .messages
                     .iter()
@@ -722,7 +728,7 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
     let parent = f.runtime.store.links(&binding, "message-0").unwrap()[0]
         .matrix_id
         .clone();
-    let reaction = json!({"event_id":"$reaction","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":parent,"key":"❤️"}}});
+    let reaction = json!({"event_id":"$reaction","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":parent,"key":"👍\u{fe0f}"}}});
     f.remote
         .lock()
         .unwrap()
@@ -735,6 +741,12 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
     f.runtime.poll_binding(&binding).await.unwrap();
     {
         let mut remote = f.remote.lock().unwrap();
+        let (_, reaction_body, _) = remote
+            .requests
+            .iter()
+            .find(|(path, _, _)| path == "/rpc/threads/react")
+            .unwrap();
+        assert_eq!(reaction_body["json"]["reaction"], "👍");
         assert!(
             remote.rakazo_nonces.is_empty(),
             "react must never invoke threads/send"
@@ -752,6 +764,7 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
             .find(|event| event["type"] == "m.reaction")
             .unwrap();
         assert_eq!(reaction["content"]["m.relates_to"]["event_id"], parent);
+        assert_eq!(reaction["content"]["m.relates_to"]["key"], "👍");
     }
     let reply = json!({"event_id":"$reply","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.text","body":"> <@agent:example.test> parent\n\nReal reply","m.relates_to":{"m.in_reply_to":{"event_id":parent}}}});
     f.runtime
