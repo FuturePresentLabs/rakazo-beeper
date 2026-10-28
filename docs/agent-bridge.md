@@ -67,6 +67,7 @@ service_token_dir = "/Users/ajmwagar/.rakazo/tokens"
 notify_kind = "steer"
 notify_urgent = true
 hide_workers = true
+seen_reaction = "👍"   # "" disables; 👍 means "received, working"
 ```
 
 `host` is mandatory: `[bridge] host` first, then `PI_AGENT_HOST`. There is no
@@ -87,6 +88,8 @@ $BIN bridge --bridge-config $CFG seed [--agent ...]  # watermark to head, no del
 $BIN bridge --bridge-config $CFG run --interval-s 5  # alias: serve
 $BIN bridge --bridge-config $CFG provision --apply --agent pm:fpl
 $BIN bridge --bridge-config $CFG reply --agent pm:fpl --text '…'
+$BIN bridge --bridge-config $CFG reply --agent pm:fpl --reply-to <msgid> --text '…'
+$BIN bridge --bridge-config $CFG reply --agent pm:fpl --from-pane pm-fpl
 ```
 
 ### Migration: seed before serving
@@ -174,7 +177,24 @@ agent key, so a new worker name cannot inherit an old identity's credential.
 
 ```bash
 $BIN bridge reply --agent pm:fpl --text '…'
+$BIN bridge reply --agent pm:fpl --reply-to <msgid> --from-pane pm-fpl
 ```
+
+`--reply-to` sets `replyToMessageId` on `threads.appendAssistant`, so the answer
+is threaded under the human's message (absent by default).
+
+`--from-pane <worker>` reads that worker's **last assistant block** from
+`tmux capture-pane -p -t <pane>`, strips pi's TUI chrome/footer/tool-call echo,
+and posts it. It refuses (`pane-missing`, `pane-empty`, `pane-no-answer`,
+`pane-not-an-answer`) rather than guessing, and its nonce is derived from
+(agent, reply-to, text), so a retry is a replay rather than a second reply.
+`--text` and `--from-pane` are mutually exclusive.
+
+On every first delivery the supervisor also posts the configured
+`[bridge] seen_reaction` tapback on the inbound message (one add per message
+lifetime, deterministic `seen:<msgid>` nonce, never on duplicates/bot rows). A
+reaction failure is logged (`report.seen_failed`) and never fails the delivery
+or rewinds the watermark. The tapback is not removed when the reply lands.
 
 The reply resolves the agent through the roster, refuses if the requested bot is
 not that agent's, reads exactly that agent's token, and calls
@@ -182,6 +202,10 @@ not that agent's, reads exactly that agent's token, and calls
 PM can send as another bot. Every bot this slice creates is `relayOnly = true`;
 existing PM bots keep their server-side flag (status reports `relay_only: null`
 when the deployment does not expose it yet).
+
+Typing indicators are **not** implemented: the RPC surface this bridge uses
+exposes no typing method, so that is an upstream/fpl request rather than
+something the bridge can fake.
 
 ## Deployed on Studio
 

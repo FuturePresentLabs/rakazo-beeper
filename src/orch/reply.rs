@@ -108,6 +108,28 @@ pub fn nonce() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
+    shaped(bytes)
+}
+
+/// A deterministic UUID-shaped idempotency key.
+///
+/// `--from-pane` uses this so a retry of the same answer is a replay, never a
+/// second assistant message: the same (agent, reply-to, text) maps to the same
+/// nonce across processes and restarts.
+pub fn nonce_for(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    shaped(bytes)
+}
+
+fn shaped(mut bytes: [u8; 16]) -> String {
     // RFC 9562 version 4, variant 1.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -251,5 +273,17 @@ mod tests {
         let parts: Vec<_> = value.split('-').map(str::len).collect();
         assert_eq!(parts, vec![8, 4, 4, 4, 12]);
         assert_eq!(&value[14..15], "4");
+    }
+
+    #[test]
+    fn a_derived_nonce_is_stable_and_input_specific() {
+        let first = nonce_for(&["pm:viceroy", "m-1", "the answer"]);
+        assert_eq!(first, nonce_for(&["pm:viceroy", "m-1", "the answer"]));
+        assert_ne!(first, nonce_for(&["pm:viceroy", "m-2", "the answer"]));
+        assert_eq!(
+            first.split('-').map(str::len).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert_eq!(&first[14..15], "4");
     }
 }

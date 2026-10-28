@@ -16,6 +16,10 @@ pub struct Part {
     pub content: Value,
 }
 
+/// Reactions the Rakazo server advertises and accepts. A tapback must be one of
+/// these; anything else is rejected server-side rather than shown as a reaction.
+pub const ALLOWED_REACTIONS: [&str; 6] = ["👍", "👎", "❤️", "😂", "🎉", "😮"];
+
 /// @implements github:mautrix/go@v0.28.1 event/capabilities.go RoomFeatures -- protocol signaling, not bridge implementation
 pub fn room_features(preferences: &crate::rakazo::Preferences) -> Value {
     // Compatibility snapshot: older Rakazo me responses advertise the size limit
@@ -72,7 +76,7 @@ pub fn room_features(preferences: &crate::rakazo::Preferences) -> Value {
             );
         }
     }
-    let mut features = json!({"file":files,"max_text_length":64000,"reply":2,"thread":1,"reaction":1,"allowed_reactions":["👍","👎","❤️","😂","🎉","😮"],"edit":-2,"delete":-2,"location_message":-2,"poll":-2});
+    let mut features = json!({"file":files,"max_text_length":64000,"reply":2,"thread":1,"reaction":1,"allowed_reactions":ALLOWED_REACTIONS,"edit":-2,"delete":-2,"location_message":-2,"poll":-2});
     features["id"] = json!(stable_id(&["rakazo-rich-v3", &features.to_string()]));
     features
 }
@@ -410,7 +414,7 @@ impl TenantRuntime {
         if message.role == "user"
             && message.reply_to_message_id.is_some()
             && message.blocks.len() == 1
-            && matches!(text.as_str(), "👍" | "👎" | "❤️" | "😂" | "🎉" | "😮")
+            && ALLOWED_REACTIONS.contains(&text.as_str())
         {
             // Preserve old flattened emoji bubbles rather than duplicating them
             // as a second reaction during an upgrade.

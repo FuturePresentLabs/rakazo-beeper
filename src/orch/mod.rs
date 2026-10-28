@@ -9,6 +9,7 @@
 
 pub mod agentsmith;
 pub mod bridge;
+pub mod pane;
 pub mod reply;
 pub mod roster;
 pub mod supervisor;

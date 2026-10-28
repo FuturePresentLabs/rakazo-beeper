@@ -70,6 +70,20 @@ pub trait RakazoSource {
         async move { anyhow::bail!("this roster source cannot archive bots") }
     }
 
+    /// Best-effort tapback on an inbound message. Sources that cannot react
+    /// inherit a fail-closed default: the supervisor logs the failure and still
+    /// keeps the delivery, so this is never a reason to rewind the watermark.
+    fn react(
+        &self,
+        bot: &str,
+        message: &str,
+        reaction: &str,
+        nonce: &str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        let _ = (bot, message, reaction, nonce);
+        async move { anyhow::bail!("this roster source cannot react") }
+    }
+
     /// Highest committed sequence in a conversation, used only to seed a fresh
     /// state file so enabling a supervisor does not replay history into panes.
     fn latest_seq(&self, bot: &str) -> impl Future<Output = Result<i64>> + Send {
@@ -114,6 +128,21 @@ impl RakazoSource for Rakazo {
         let client = self.clone();
         let bot = bot.to_string();
         async move { client.archive_bot(&bot).await }
+    }
+
+    fn react(
+        &self,
+        bot: &str,
+        message: &str,
+        reaction: &str,
+        nonce: &str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        let client = self.clone();
+        let bot = bot.to_string();
+        let message = message.to_string();
+        let reaction = reaction.to_string();
+        let nonce = nonce.to_string();
+        async move { client.react(&bot, &message, &reaction, &nonce).await }
     }
 
     fn latest_seq(&self, bot: &str) -> impl Future<Output = Result<i64>> + Send {
@@ -355,6 +384,10 @@ pub struct Report {
     pub ignored: usize,
     /// Rows the deliverer did not accept yet (watermark retained).
     pub deferred: usize,
+    /// Seen tapbacks posted (one per first delivery, never on duplicates).
+    pub seen: usize,
+    /// Seen tapbacks that failed. Best-effort: delivery still counts.
+    pub seen_failed: usize,
 }
 
 /// Watches exactly one bound agent's conversation.

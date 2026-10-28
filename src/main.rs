@@ -189,9 +189,17 @@ enum BridgeCommand {
         /// Agent key (`fleet-pm-fpl-v1`) or delivery target (`pm-fpl`).
         #[arg(long)]
         agent: String,
+        /// The answer. Mutually exclusive with --from-pane.
+        #[arg(long, conflicts_with = "from_pane")]
+        text: Option<String>,
+        /// Read the worker's last assistant answer from its live tmux pane.
+        #[arg(long, conflicts_with = "text")]
+        from_pane: Option<String>,
+        /// Thread the answer under this inbound message id.
         #[arg(long)]
-        text: String,
-        /// Idempotency key; generated when omitted.
+        reply_to: Option<String>,
+        /// Idempotency key; generated when omitted (deterministic for
+        /// --from-pane, so a retry is a replay and never a second reply).
         #[arg(long)]
         nonce: Option<String>,
         /// Resolve and print the binding without sending anything.
@@ -1021,7 +1029,7 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
         Orch,
         agentsmith::{self, Agent, CommandRoster, RosterSource},
         bridge::{BridgeConfig, SessionIssuer, TokenStore},
-        reply, supervisor,
+        pane, reply, supervisor,
         supervisor::{PiNotifyDeliverer, Supervisor},
         watch::WatchState,
     };
@@ -1110,7 +1118,9 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 deliverer,
                 &config.bridge.state_dir,
                 &host,
-            )?;
+            )?
+            .with_seen_reaction(config.bridge.seen_reaction.clone())
+            .with_reply_hint_config(config_path);
             loop {
                 // Re-read the roster every interval so added/removed agents are
                 // reconciled. In resident mode a roster or cycle failure is a
@@ -1233,6 +1243,8 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
         BridgeCommand::Reply {
             agent,
             text,
+            from_pane,
+            reply_to,
             nonce,
             dry_run,
         } => {
@@ -1251,14 +1263,43 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
             );
             let bot = agentsmith::resolve_bot(&bots, &agents, target)
                 .with_context(|| format!("{} has no live Rakazo bot", target.key))?;
-            let nonce = nonce.clone().unwrap_or_else(reply::nonce);
+            // Exactly one answer source. `--from-pane` resolves a worker name
+            // to its rosters pane, or uses the value as a raw tmux target.
+            let (text, source) = match (text.as_deref(), from_pane.as_deref()) {
+                (Some(text), None) => (text.to_string(), "text"),
+                (None, Some(worker)) => {
+                    let pane = agents
+                        .iter()
+                        .find(|candidate| candidate.matches(worker))
+                        .and_then(|candidate| candidate.pane.clone())
+                        .unwrap_or_else(|| worker.to_string());
+                    (
+                        pane::from_pane(&pane).with_context(|| {
+                            format!("read last answer from pane {pane} for {}", target.key)
+                        })?,
+                        "pane",
+                    )
+                }
+                (Some(_), Some(_)) => unreachable!("clap forbids both"),
+                (None, None) => {
+                    anyhow::bail!("reply needs --text \"<answer>\" or --from-pane <worker>")
+                }
+            };
+            let nonce = nonce.clone().unwrap_or_else(|| match source {
+                "pane" => {
+                    reply::nonce_for(&[&target.key, reply_to.as_deref().unwrap_or(""), &text])
+                }
+                _ => reply::nonce(),
+            });
             if *dry_run {
                 println!(
-                    "agent={}\thost={}\tbot={}\tthread={}\tdry_run=true",
+                    "agent={}\thost={}\tbot={}\tthread={}\tsource={}\treply_to={}\tdry_run=true",
                     target.key,
                     target.host,
                     bot.id,
-                    bot.thread_id.as_deref().unwrap_or(&bot.id)
+                    bot.thread_id.as_deref().unwrap_or(&bot.id),
+                    source,
+                    reply_to.as_deref().unwrap_or("")
                 );
                 return Ok(());
             }
@@ -1274,13 +1315,20 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 &bots,
                 &target.key,
                 &bot.id,
-                text,
+                &text,
                 &nonce,
+                reply_to.as_deref(),
             )
             .await?;
             println!(
-                "agent={}\thost={}\tbot={}\tmessage={}\tseq={}\tnonce={}",
-                target.key, target.host, bot.id, receipt.message_id, receipt.seq, nonce
+                "agent={}\thost={}\tbot={}\tmessage={}\tseq={}\tnonce={}\treply_to={}",
+                target.key,
+                target.host,
+                bot.id,
+                receipt.message_id,
+                receipt.seq,
+                nonce,
+                reply_to.as_deref().unwrap_or("")
             );
         }
         BridgeCommand::Status { json } => {
