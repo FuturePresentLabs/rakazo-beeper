@@ -9,13 +9,16 @@
 //!   `base_url`/`[[routes]]`).
 //! - `transport = "ohmos"` — the self-hosted provisioning
 //!   `agent-conversations` API used for Muse (`[[agent]]`).
+//! - `transport = "beeper"` — the Beeper Desktop local HTTP API (Muse/WhatsApp
+//!   without the phone/Iroh or ohmOS hop).
 //!
 //! Offline by default: there is no production base URL and `send` is refused
 //! unless a config explicitly sets `allow_send = true` (msgd) or an `[[agent]]`
-//! base URL is present (ohmos). See `docs/ohm-config.example.toml` and
+//! base URL is present (ohmos/beeper). See `docs/ohm-config.example.toml` and
 //! `docs/ohm-client.md`.
 
 pub mod agent_conversations;
+pub mod beeper;
 pub mod bridge;
 pub mod msgd;
 pub mod ohmos;
@@ -32,6 +35,10 @@ use std::{
 pub use agent_conversations::{
     AgentConversationsClient, AgentError, AgentHttp, CatalogItem, ExpectedNativeIdentity,
     NativeMessage, ProbeReport, SendReceipt, Snapshot, Token, UreqAgentHttp, stable_request_id,
+};
+pub use beeper::{
+    BeeperChat, BeeperClient, BeeperHttp, BeeperMessage, BeeperProbeReport, BeeperStatus,
+    BeeperTransport, UreqBeeperHttp,
 };
 pub use bridge::{
     Bridge, BridgeState, CommandRunner, FakeNotifier, FakePaneIo, OrchestratorNotifier, PaneIo,
@@ -97,6 +104,8 @@ pub enum AgentTransportKind {
     /// The legacy ohm-msgd daemon. Configured through the top-level
     /// `base_url`/`[[routes]]`, not through an `[[agent]]` entry.
     Msgd,
+    /// Beeper Desktop's local HTTP API (`http://127.0.0.1:23373` by default).
+    Beeper,
 }
 
 /// One external agent on a native conversation.
@@ -118,6 +127,9 @@ pub struct AgentConfig {
     /// The id returned by `GET /agent-conversations`, e.g.
     /// `whatsapp:1807055946647697@bot`.
     pub conversation_id: Option<String>,
+    /// The Beeper chat id (`GET /v1/chats` → `items[].id`). Required to serve
+    /// or send on `transport = "beeper"`; `agent-probe` can list ids without it.
+    pub chat_id: Option<String>,
     /// Native identity sent on outbound as a precondition.
     pub platform: Option<Platform>,
     pub remote_id: Option<String>,
@@ -158,14 +170,27 @@ impl AgentConfig {
     }
 
     pub fn token_path(&self) -> Result<PathBuf> {
-        if let Some(path) = agent_conversations::token_file_from_env(&self.key) {
+        let env_path = match self.transport {
+            AgentTransportKind::Beeper => beeper::token_file_from_env(&self.key),
+            _ => agent_conversations::token_file_from_env(&self.key),
+        };
+        if let Some(path) = env_path {
             return Ok(path);
         }
         self.token_file.clone().with_context(|| {
             format!(
-                "agent {} has no token_file and OHM_{}_TOKEN_FILE is unset",
+                "agent {} has no token_file and {} is unset",
                 self.key,
-                self.key.to_uppercase().replace('-', "_")
+                match self.transport {
+                    AgentTransportKind::Beeper => format!(
+                        "BEEPER_{}_TOKEN_FILE",
+                        self.key.to_uppercase().replace('-', "_")
+                    ),
+                    _ => format!(
+                        "OHM_{}_TOKEN_FILE",
+                        self.key.to_uppercase().replace('-', "_")
+                    ),
+                }
             )
         })
     }
@@ -184,10 +209,27 @@ impl AgentConfig {
                  msgd configuration instead (no implicit fallback)",
                 self.key
             ),
+            AgentTransportKind::Beeper => {
+                if let Some(chat_id) = &self.chat_id {
+                    ensure!(
+                        !chat_id.trim().is_empty(),
+                        "agent {} chat_id must not be empty",
+                        self.key
+                    );
+                }
+            }
         }
         if let Some(base) = &self.base_url {
-            agent_conversations::validate_base_url(base)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            match self.transport {
+                AgentTransportKind::Beeper => {
+                    beeper::validate_base_url(base)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                _ => {
+                    agent_conversations::validate_base_url(base)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+            }
         }
         ensure!(
             self.poll_seconds >= 1,
@@ -290,5 +332,53 @@ impl OhmConfig {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn beeper_toml(base_url: &str) -> String {
+        format!(
+            r#"
+[[agent]]
+key = "muse"
+kind = "external"
+transport = "beeper"
+base_url = "{base_url}"
+token_file = "/tmp/beeper-token"
+chat_id = "chat-1"
+platform = "WhatsApp"
+label = "Muse"
+worker = "muse"
+poll_seconds = 10
+limit = 50
+"#
+        )
+    }
+
+    #[test]
+    fn beeper_agent_parses_and_validates() {
+        let config: OhmConfig = toml::from_str(&beeper_toml("http://127.0.0.1:23373")).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agents[0].transport, AgentTransportKind::Beeper);
+        assert_eq!(config.agents[0].chat_id.as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn beeper_plain_http_is_loopback_only() {
+        let config: OhmConfig = toml::from_str(&beeper_toml("http://beeper.example")).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("loopback"), "{error}");
+    }
+
+    #[test]
+    fn msgd_selection_is_still_rejected_explicitly() {
+        let text = beeper_toml("http://127.0.0.1:23373")
+            .replace("transport = \"beeper\"", "transport = \"msgd\"");
+        let config: OhmConfig = toml::from_str(&text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("msgd"), "{error}");
     }
 }

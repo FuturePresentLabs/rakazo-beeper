@@ -181,3 +181,94 @@ path are untouched and keep working throughout.
 - No worker bots are created here; workers are Slice A with
   `hide_workers=true` by default.
 - Muse is transport-backed in this slice: no Rakazo bot is created for it.
+
+## Beeper Desktop local API (Muse/WhatsApp without ohmOS)
+
+Status: **offline-complete, live leg BLOCKED on two human steps.** The provider,
+durable ledger, typed errors and hermetic loopback tests are in place. The real
+machine currently has **nothing listening on `127.0.0.1:23373`** and **no
+`~/.config/rakazo/beeper-token`**, so the live probe reports the named blockers
+`not-enabled` / `token-missing` instead of inventing a success. Both are human
+actions; the bridge never enables the app and never creates the token.
+
+Beeper Desktop ships a versioned local HTTP API (`Beeper Client API`, base
+`http://127.0.0.1:23373`, bearer auth). This transport uses the plain HTTP API,
+not MCP:
+
+| call | use |
+| --- | --- |
+| `GET /v1/info` | is the local API enabled and is the bearer accepted? |
+| `GET /v1/chats?limit=N` | resolve the chat id once; probe prints ids/names only |
+| `GET /v1/chats/{chatID}` | configured chat status |
+| `GET /v1/chats/{chatID}/messages?limit=N` | inbound poll |
+| `POST /v1/chats/{chatID}/messages` | outbound reply → `pendingMessageID` |
+
+### Rules this transport keeps
+
+- **Offline by default.** No `base_url` means zero network calls.
+- **Identity is the Beeper message id** (`id`), never text and never an index.
+  The durable ledger is `muse-beeper.json`, separate from `muse-ohmos.json`.
+- **One delivery per message, including across a restart.** `isSender = true`
+  rows are suppressed. A delivery failure fails closed and does not advance the
+  ledger.
+- **Delivery still goes through `pi-notify`,** with
+  `--ref rakazo:beeper:<chatID>:<messageID>`. No pane paste, no SSH.
+- **Outbound records the returned id before reporting success.** Beeper has no
+  idempotency key on POST; on a transport error the client does exactly one
+  bounded "did my id land?" re-read of the newest 25 messages. If the exact text
+  from us is there it reports queued with that id; otherwise it returns the
+  original typed error and the caller retries.
+- **Token hygiene.** The bridge reads the **path only**. Startup/status prints
+  the path and a masked last-4 fingerprint (`token=/path (…a1b2)`), never the
+  value. The file must be `0600`; group/world-readable is a typed refusal, not a
+  warning. `Debug` is redacted.
+- **Typed outcomes.** `401` → `unauthorized`, `404` on a chat route →
+  `chat-not-found`, connection refused → `not-enabled` (reads as "Beeper local
+  API is not enabled"), missing token → `token-missing`, no `base_url` →
+  `offline`.
+
+### Commands
+
+```sh
+# Read-only: live status + chat ids/names only. Never the token or message text.
+rakazo-beeper ohm --ohm-config ohm.toml agent-probe --agent muse
+
+# One poll (exits non-zero and prints the typed code on failure).
+rakazo-beeper ohm --ohm-config ohm.toml agent-serve --agent muse --once
+
+# Loop; delivers once via `pi-notify --kind steer --urgent`.
+rakazo-beeper ohm --ohm-config ohm.toml agent-serve --agent muse
+
+# Real outbound; retries with the same request id do not double-send.
+rakazo-beeper ohm --ohm-config ohm.toml agent-reply --agent muse --text "…"
+```
+
+`bridge status --json` reads the optional `[bridge] agent_config` path and, for a
+`transport = "beeper"` roster agent, adds `"transport": "beeper"` plus one live
+`GET /v1/info`; `last_poll_ok` / `last_error` are therefore truthful. The text
+status prints the same path + masked fingerprint line.
+
+### Human steps to make the live leg real (not code)
+
+1. Open Beeper Desktop → Settings → Integrations, enable the local API (listener
+   on `127.0.0.1:23373`).
+2. Write the token to `~/.config/rakazo/beeper-token` (`0600`):
+   `mkdir -p ~/.config/rakazo && chmod 700 ~/.config/rakazo && printf '%s' '<token>' > ~/.config/rakazo/beeper-token && chmod 600 ~/.config/rakazo/beeper-token`
+
+### Migration to agora `sh-whatsapp` (one config edit, later)
+
+Option 2 stays a config change, not a rediscovery. Change only the `[[agent]]`
+block:
+
+```toml
+transport = "sh-whatsapp"
+base_url = "http://<agora-one>:<port>"
+token_file = "/path/to/agora-token"
+# keep chat_id / platform / worker / poll_seconds / limit
+```
+
+It needs **sshd/cert access on agora-one OR a reachable endpoint+token**.
+**BLOCKED on host access:** agora-one answers ping but its sshd closes
+connections, so no certificate can be installed and no endpoint can be verified.
+`agent-probe` prints this same one-liner when a Beeper probe fails, so the path
+is not lost.

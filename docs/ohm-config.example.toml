@@ -58,3 +58,49 @@ limit = 50
 # Durable dedupe/idempotency ledger. Optional; defaults to
 # $RAKAZO_BRIDGE_STATE_DIR (or ~/.local/state/rakazo/bridge)/muse-ohmos.json.
 # state_file = "/home/ajmwagar/.local/state/rakazo/bridge/muse-ohmos.json"
+
+# ---------------------------------------------------------------------------
+# Beeper Desktop local HTTP API (transport = "beeper").
+#
+# This is the path off ohmOS: Beeper Desktop already holds the WhatsApp account,
+# so there is no phone/Iroh hop and no ohmOS dependency. It is OFF until the
+# human enables the local API in Beeper Desktop (Settings -> Integrations) and
+# writes a token file. The bridge only reads the PATH; the value is never printed
+# or logged. The file must be owner-only (0600) or the bridge refuses with a
+# typed error.
+#
+# No base_url => OFFLINE: zero network calls. A refused connection is the typed
+# `not-enabled`, not a generic failure.
+[[agent]]
+key = "muse"
+kind = "external"
+transport = "beeper"
+base_url = "http://127.0.0.1:23373"
+# Owner-only (0600). BEEPER_MUSE_TOKEN_FILE overrides this when set.
+token_file = "/home/ajmwagar/.config/rakazo/beeper-token"
+# Resolve once from GET /v1/chats (agent-probe prints ids and names, no text).
+chat_id = "<beeper chat id>"
+platform = "WhatsApp"
+label = "Muse"
+worker = "muse"
+poll_seconds = 10
+limit = 50
+# Durable dedupe/idempotency ledger. Optional; defaults to
+# $RAKAZO_BRIDGE_STATE_DIR (or ~/.local/state/rakazo/bridge)/muse-beeper.json.
+# state_file = "/home/ajmwagar/.local/state/rakazo/bridge/muse-beeper.json"
+#
+# Inbound: only `isSender = false` messages with a non-empty Beeper id are
+# delivered, once each, with `--ref rakazo:beeper:<chatID>:<messageID>`.
+# Outbound: POST /v1/chats/<chatID>/messages; the returned pendingMessageID is
+# written to the ledger before success is reported. Beeper has no idempotency
+# key, so on a transport error the client does one bounded "did my id land?"
+# re-read before returning the error.
+#
+# Migration one-liner (blocked, see docs/ohm-client.md): to switch to the agora
+# `sh-whatsapp` adapter later, change only this block to
+#   transport = "sh-whatsapp"
+#   base_url = "http://<agora-one>:<port>"
+#   token_file = "/path/to/agora-token"
+# and keep chat_id/worker/limit. It needs sshd/cert access on agora-one OR a
+# reachable endpoint+token; agora-one answers ping but its sshd closes
+# connections, so neither can be installed or verified today.

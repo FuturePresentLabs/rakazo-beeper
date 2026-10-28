@@ -124,6 +124,11 @@ pub struct BridgeSection {
     /// value wins (one knob, documented in `docs/agent-bridge.md`).
     #[serde(default = "hide_workers_default")]
     pub hide_workers: bool,
+    /// Optional ohm/beeper `[[agent]]` config. When set, `bridge status` reports
+    /// each matching agent's real transport and a live Beeper probe instead of
+    /// assuming Rakazo-only polling. No URL, no token value: a path only.
+    #[serde(default)]
+    pub agent_config: Option<PathBuf>,
 }
 
 impl Default for BridgeSection {
@@ -135,6 +140,7 @@ impl Default for BridgeSection {
             notify_kind: notify_kind_default(),
             notify_urgent: notify_urgent_default(),
             hide_workers: hide_workers_default(),
+            agent_config: None,
         }
     }
 }
@@ -178,6 +184,13 @@ impl BridgeConfig {
         ensure!(
             !self.bridge.service_token_dir.as_os_str().is_empty(),
             "bridge.service_token_dir must not be empty"
+        );
+        ensure!(
+            self.bridge
+                .agent_config
+                .as_deref()
+                .is_none_or(|path| !path.as_os_str().is_empty()),
+            "bridge.agent_config must not be empty when set"
         );
         Ok(())
     }
