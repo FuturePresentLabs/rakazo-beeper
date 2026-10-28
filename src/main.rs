@@ -797,10 +797,13 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 return Ok(());
             }
             let nonce = format!("spawn-{}-{}", entry.key, random_nonce());
-            let seq = orch
+            let receipt = orch
                 .say(&root.id, &Orch::spawn_prompt(entry), &nonce)
                 .await?;
-            println!("spawning\tseq={seq}\tnonce={nonce}\t{}", entry.name);
+            println!(
+                "spawning\tseq={}\tnonce={}\t{}",
+                receipt.seq, nonce, entry.name
+            );
         }
         OrchCommand::Show { bot, limit } => {
             let id = resolve_id(&orch, bot).await?;
@@ -811,8 +814,14 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
         OrchCommand::Say { bot, text, nonce } => {
             let id = resolve_id(&orch, bot).await?;
             let nonce = nonce.clone().unwrap_or_else(random_nonce);
-            let seq = orch.say(&id, text, &nonce).await?;
-            println!("sent\tseq={seq}\tnonce={nonce}");
+            let receipt = orch.say(&id, text, &nonce).await?;
+            match receipt.run() {
+                Some(run) => println!("sent\tseq={}\trun={}\tnonce={}", receipt.seq, run, nonce),
+                None => println!(
+                    "stored seq={} (no run: relay-only) nonce={}",
+                    receipt.seq, nonce
+                ),
+            }
         }
         OrchCommand::Watch {
             once,

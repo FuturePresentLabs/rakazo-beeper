@@ -390,7 +390,11 @@ impl TenantRuntime {
         let thread = (content["m.relates_to"]["rel_type"] == "m.thread")
             .then(|| content["m.relates_to"]["event_id"].as_str())
             .flatten();
-        for run in std::iter::once(&receipt.run_id).chain(receipt.run_ids.iter()) {
+        if let Some(run) = receipt.run() {
+            self.store
+                .save_run_route(binding, run, &event.event_id, thread)?;
+        }
+        for run in &receipt.run_ids {
             self.store
                 .save_run_route(binding, run, &event.event_id, thread)?;
         }
