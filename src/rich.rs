@@ -16,8 +16,9 @@ pub struct Part {
     pub content: Value,
 }
 
-/// Reactions the Rakazo server advertises and accepts. A tapback must be one of
-/// these; anything else is rejected server-side rather than shown as a reaction.
+/// Rakazo's server-side reaction allowlist. The orchestrator adapter validates
+/// against it, but Rakazo Beeper rooms intentionally do not advertise reactions
+/// because Rakazo cannot remove them.
 pub const ALLOWED_REACTIONS: [&str; 6] = ["👍", "👎", "❤️", "😂", "🎉", "😮"];
 
 fn canonical_reaction(reaction: &str) -> Option<&'static str> {
@@ -87,7 +88,7 @@ pub fn room_features(preferences: &crate::rakazo::Preferences) -> Value {
             );
         }
     }
-    let mut features = json!({"file":files,"max_text_length":64000,"reply":2,"thread":1,"reaction":1,"allowed_reactions":ALLOWED_REACTIONS,"edit":-2,"delete":-2,"location_message":-2,"poll":-2});
+    let mut features = json!({"file":files,"max_text_length":64000,"reply":2,"thread":1,"reaction":-2,"edit":-2,"delete":-2,"location_message":-2,"poll":-2});
     features["id"] = json!(stable_id(&["rakazo-rich-v3", &features.to_string()]));
     features
 }
@@ -117,6 +118,43 @@ struct Prepared {
 }
 
 impl TenantRuntime {
+    pub async fn clear_matrix_timeline(
+        &self,
+        binding: &Binding,
+        clear_event: &str,
+        event_cursor: i64,
+        preserve_rakazo_ids: &HashSet<String>,
+        preserve_run_ids: &HashSet<String>,
+    ) -> Result<()> {
+        let (preserved, obsolete): (Vec<_>, Vec<_>) = self
+            .store
+            .all_links(binding)?
+            .into_iter()
+            .partition(|link| preserve_rakazo_ids.contains(&link.rakazo_id));
+        if !obsolete.is_empty() {
+            self.matrix
+                .check_room(&binding.room, &binding.ghost, &self.config.owner)
+                .await?;
+        }
+        let mut redacted = HashSet::new();
+        for link in obsolete {
+            if redacted.insert(link.matrix_id.clone()) {
+                let transaction = stable_id(&[
+                    "thread-clear",
+                    &binding.tenant,
+                    &binding.bot,
+                    clear_event,
+                    &link.matrix_id,
+                ]);
+                self.matrix
+                    .redact(&binding.room, &binding.ghost, &link.matrix_id, &transaction)
+                    .await?;
+            }
+        }
+        self.store
+            .commit_thread_clear(binding, event_cursor, &preserved, preserve_run_ids)
+    }
+
     pub fn source_event_id(
         &self,
         binding: &Binding,
@@ -322,32 +360,38 @@ impl TenantRuntime {
         let raw = &event.content;
         let content = &raw["content"];
         if raw["type"] == "m.room.redaction" {
+            let target = raw["redacts"]
+                .as_str()
+                .or_else(|| content["redacts"].as_str())
+                .ok_or(Rejected("Removal is missing its target."))?;
+            let removed = self
+                .matrix
+                .event(&binding.room, &binding.ghost, target)
+                .await?;
+            if removed["type"] == "m.reaction" && removed["sender"] == self.config.owner {
+                ensure!(
+                    self.store.sent_event(binding, target)?,
+                    Rejected("This reaction was not bridged to Rakazo.")
+                );
+                tracing::warn!(
+                    tenant = %binding.tenant,
+                    bot = %binding.bot,
+                    event = %target,
+                    "Rakazo reactions are append-only; removed the Beeper reaction locally"
+                );
+                return Err(Rejected(
+                    "Removed in Beeper only; Rakazo does not support removing reactions.",
+                )
+                .into());
+            }
             return Err(
                 Rejected("Removing a Beeper message does not retract it from the agent.").into(),
             );
         }
         if raw["type"] == "m.reaction" {
-            ensure!(
-                content["m.relates_to"]["rel_type"] == "m.annotation",
-                Rejected("Unsupported reaction relationship.")
+            return Err(
+                Rejected("Reactions are disabled because Rakazo cannot remove them.").into(),
             );
-            let target = self
-                .target(
-                    binding,
-                    content["m.relates_to"]["event_id"]
-                        .as_str()
-                        .ok_or(Rejected("Reaction is missing its target."))?,
-                )
-                .await?;
-            let reaction = content["m.relates_to"]["key"]
-                .as_str()
-                .ok_or(Rejected("Reaction is missing its emoji."))?;
-            let reaction = canonical_reaction(reaction)
-                .ok_or(Rejected("Rakazo does not support this reaction."))?;
-            self.rakazo
-                .react(&binding.bot, &target.rakazo_id, reaction, &nonce)
-                .await?;
-            return Ok(None);
         }
         ensure!(
             raw["type"] == "m.room.message" || raw["type"] == "m.sticker",
@@ -422,12 +466,13 @@ impl TenantRuntime {
         let mut parts = Vec::new();
         let existing = self.store.links(binding, &message.id)?;
         let text = message.text();
-        // Rakazo itself projects a single-emoji owner reply as a quiet reaction.
-        // @implements github:FuturePresentLabs/fpl-agents@0d1fb12 packages/core/src/message-reactions.ts -- native reaction projection
+        // Rakazo stores a native reaction as an owner reply containing one
+        // allowlisted emoji. Project it as Matrix annotation while keeping the
+        // Beeper room's reaction capability disabled for user input.
         if message.role == "user"
             && message.reply_to_message_id.is_some()
             && message.blocks.len() == 1
-            && ALLOWED_REACTIONS.contains(&text.as_str())
+            && let Some(reaction) = canonical_reaction(&text)
         {
             // Preserve old flattened emoji bubbles rather than duplicating them
             // as a second reaction during an upgrade.
@@ -441,7 +486,7 @@ impl TenantRuntime {
                 return Ok(vec![Part {
                     key: "reaction".into(),
                     kind: "m.reaction".into(),
-                    content: json!({"m.relates_to":{"rel_type":"m.annotation","event_id":target,"key":text}}),
+                    content: json!({"m.relates_to":{"rel_type":"m.annotation","event_id":target,"key":reaction}}),
                 }]);
             }
         }
@@ -510,23 +555,6 @@ impl TenantRuntime {
         {
             for part in &mut parts {
                 part.content["m.relates_to"] = json!({"m.in_reply_to":{"event_id":target}});
-            }
-        }
-        // @implements url:https://spec.matrix.org/v1.16/client-server-api/#threading -- preserve the originating Beeper thread across the agent run
-        if message.role == "bot"
-            && let Some(run) = message.run_id.as_deref()
-            && let Some((parent, thread)) = self.store.run_route(binding, run)?
-        {
-            for part in &mut parts {
-                if let Some(root) = thread.as_deref() {
-                    let reply = part.content["m.relates_to"]["m.in_reply_to"]["event_id"]
-                        .as_str()
-                        .unwrap_or(&parent)
-                        .to_string();
-                    part.content["m.relates_to"] = json!({"rel_type":"m.thread","event_id":root,"is_falling_back":true,"m.in_reply_to":{"event_id":reply}});
-                } else if part.content["m.relates_to"].is_null() {
-                    part.content["m.relates_to"] = json!({"m.in_reply_to":{"event_id":parent}});
-                }
             }
         }
         Ok(parts)

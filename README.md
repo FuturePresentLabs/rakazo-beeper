@@ -12,8 +12,8 @@ FPL's Beachhead Shroud deployment is owned by
 [shared-infra](https://github.com/FuturePresentLabs/shared-infra/tree/deploy/rakazo-beeper/projects/rakazo-beeper).
 The source-owned `.fab/pipelines.json` publishes the immutable rootfs consumed by
 that deployment. The personal Beachhead tenant is live with six agent chats;
-text, attachments, audio files, quiet tapbacks, quoted replies, thread routing
-and restart without duplicate delivery were verified. The native user-service instructions below are for personal self-hosting.
+text, attachments, audio files, quoted replies, thread routing and restart without
+duplicate delivery were verified. The native user-service instructions below are for personal self-hosting.
 
 Text and supported attachments from the configured Beeper owner go to the
 agent's existing Rakazo thread. Completed replies, attachments and questions return
@@ -22,10 +22,11 @@ messages that originated in Beeper reuse their original events instead of echoin
 
 Quoted replies retain their targets. Agent replies to messages sent in a Beeper
 thread return to that thread, using the run ID returned by Rakazo. Threads still
-share the agent's Rakazo conversation and context. Quiet reactions support Rakazo's
-six emoji: 👍 👎 ❤️ 😂 🎉 😮. Adding a reaction does not start an agent run.
-If a reply targets source content that has no visible Beeper message, the reply
-is delivered without a quote; an emoji reply to that content remains text.
+share the agent's Rakazo conversation and context. Beeper reaction input is deliberately
+not advertised or accepted because Rakazo cannot remove reactions. Rakazo-originated
+reactions are displayed as native Matrix annotations attached to their target; existing
+historical reaction events remain untouched. If a reply targets source content that has no visible Beeper
+message, the reply is delivered without a quote.
 
 Agent messages render Markdown as sanitized Matrix HTML: headings, emphasis,
 links, lists, quotes, tables and fenced code blocks. The original Markdown remains
@@ -173,9 +174,10 @@ Node, Python, bridge framework, or proxy process is required to run this service
    every Beeper endpoint. `run` creates a ghost and private room for each selected
    agent, then invites the owner. Accept those room invitations in Beeper and
    send a text message. Bot discovery is constrained to the token's selected space.
-   `bot_ids = []` creates no rooms. Set `auto_bots = true` to keep the fleet in
-sync automatically: the orchestrator root, every child conversation (PMs), and
-Muse are added on discovery; explicit `bot_ids` are still honored. Archived or
+   `bot_ids = []` creates no rooms unless another selector is configured. Set
+`auto_bots = true` to keep the orchestrator root and every child conversation
+(PM) in sync. Use `auto_named_bots = ["Muse"]` for additional case-insensitive
+exact-name selections; no bot name is built into the bridge. Explicit IDs are still honored. Archived or
 removed bots stop being polled on the next tick. Stop the service before changing
 its configuration. Auto-discovery needs no restart for newly created PMs.
 

@@ -37,11 +37,14 @@ pub struct Tenant {
     pub rakazo_space_id: String,
     /// Explicitly opt individual bots into bridging. Empty means none.
     pub bot_ids: Vec<String>,
-    /// Automatically keep the fleet in sync: the orchestrator, every child
-    /// conversation (PMs), and the Muse agent. Explicit `bot_ids` are added
-    /// to this set. Removed/archived bots stop being polled on the next tick.
+    /// Automatically keep the orchestrator fleet in sync. Explicit `bot_ids`
+    /// are added to this set. Removed/archived bots stop being polled.
     #[serde(default)]
     pub auto_bots: bool,
+    /// Additional active bots selected by case-insensitive exact display name.
+    /// This is data, not policy: no bot name is hardcoded in bridge logic.
+    #[serde(default)]
+    pub auto_named_bots: Vec<String>,
     #[serde(default = "websocket_default")]
     pub websocket: bool,
 }
@@ -211,4 +214,28 @@ pub fn validate_url(url: &Url) -> Result<()> {
         bail!("upstream URLs require HTTPS except on loopback");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tenant;
+
+    #[test]
+    fn tenant_accepts_configurable_named_bots() {
+        let tenant = toml::from_str::<Tenant>(
+            r#"
+id = "personal"
+owner = "@owner:example.com"
+registration = "/tmp/registration.json"
+homeserver = "https://matrix.example.com"
+rakazo_url = "https://rakazo.example.com"
+rakazo_token_env = "RAKAZO_TOKEN"
+rakazo_space_id = "space-a"
+bot_ids = []
+auto_bots = true
+auto_named_bots = ["Muse"]
+"#,
+        );
+        assert!(tenant.is_ok());
+    }
 }

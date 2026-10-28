@@ -3,7 +3,7 @@ use crate::{
     matrix::Matrix,
     rakazo::Rakazo,
     stable_id,
-    store::{Binding, Inbound, Store},
+    store::{Binding, Inbound, MessageLink, Store},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -34,7 +34,7 @@ pub struct TenantRuntime {
     pub unsupported_encryption: AtomicBool,
     pub initialized: AtomicBool,
     /// The bot ids currently selected for this tenant. `discover` refreshes
-    /// this from the live space when `auto_bots` is enabled, so inbound/queued
+    /// this from the live space when automatic selectors are enabled, so inbound/queued
     /// delivery cannot keep using a stale allowlist between ticks.
     pub selected: std::sync::RwLock<std::collections::HashSet<String>>,
 }
@@ -103,6 +103,7 @@ fn select_bot_ids(
     bots: &[crate::rakazo::Bot],
     explicit: &[String],
     auto_bots: bool,
+    auto_named_bots: &[String],
 ) -> Vec<String> {
     use std::collections::HashSet;
     let mut seen = HashSet::new();
@@ -129,10 +130,14 @@ fn select_bot_ids(
                 }
             }
         }
-        for bot in bots.iter().filter(active) {
-            if bot.name.eq_ignore_ascii_case("muse") {
-                push(&bot.id);
-            }
+    }
+    for name in auto_named_bots {
+        for bot in bots
+            .iter()
+            .filter(active)
+            .filter(|bot| bot.name.eq_ignore_ascii_case(name))
+        {
+            push(&bot.id);
         }
     }
     for id in explicit {
@@ -221,16 +226,22 @@ impl TenantRuntime {
     }
 
     /// The live fleet selection. Explicit `bot_ids` are always included when
-    /// they are visible. With `auto_bots`, the orchestrator root, every direct
-    /// child conversation (PMs), and Muse are added automatically. This is
-    /// deliberately relationship-based rather than a display-name list: a new
-    /// PM appears without a code or config edit.
+    /// they are visible. `auto_bots` adds the orchestrator root and direct child
+    /// conversations; `auto_named_bots` adds configured exact names.
     fn selected_bot_ids(&self, bots: &[crate::rakazo::Bot]) -> Vec<String> {
-        select_bot_ids(bots, &self.config.bot_ids, self.config.auto_bots)
+        select_bot_ids(
+            bots,
+            &self.config.bot_ids,
+            self.config.auto_bots,
+            &self.config.auto_named_bots,
+        )
     }
 
     pub async fn discover(&self) -> Result<()> {
-        if !self.config.auto_bots && self.config.bot_ids.is_empty() {
+        if !self.config.auto_bots
+            && self.config.bot_ids.is_empty()
+            && self.config.auto_named_bots.is_empty()
+        {
             self.set_selected(std::iter::empty());
             self.initialized.store(true, Ordering::Relaxed);
             return Ok(());
@@ -243,6 +254,12 @@ impl TenantRuntime {
             return Ok(());
         }
         let preferences = self.rakazo.preferences().await?;
+        let space = self.rakazo.current_space().await?;
+        ensure!(
+            space.id == self.config.rakazo_space_id,
+            "Rakazo token resolved to a different Space"
+        );
+        let space_name = space.name.trim();
         let avatar_style = &preferences.avatar_style;
         let features = crate::rich::room_features(&preferences);
         let bridge_logo = self.sync_bridge_identity().await?;
@@ -253,8 +270,15 @@ impl TenantRuntime {
                 .find(|b| &b.id == bot_id)
                 .context("configured bot is not accessible in this Rakazo space")?;
             if let Some(binding) = bindings.iter().find(|b| b.bot == bot.id) {
-                self.sync_profile(binding, bot, avatar_style, &bridge_logo, &features)
-                    .await?;
+                self.sync_profile(
+                    binding,
+                    bot,
+                    space_name,
+                    avatar_style,
+                    &bridge_logo,
+                    &features,
+                )
+                .await?;
                 continue;
             }
             let snapshot = self.rakazo.snapshot(&bot.id).await?;
@@ -293,8 +317,15 @@ impl TenantRuntime {
                 .into_iter()
                 .find(|binding| binding.bot == bot.id)
                 .context("new binding missing")?;
-            self.sync_profile(&binding, bot, avatar_style, &bridge_logo, &features)
-                .await?;
+            self.sync_profile(
+                &binding,
+                bot,
+                space_name,
+                avatar_style,
+                &bridge_logo,
+                &features,
+            )
+            .await?;
             tracing::info!(tenant=%self.config.id,"provisioned agent chat");
         }
         self.set_selected(selected.iter());
@@ -306,6 +337,7 @@ impl TenantRuntime {
         &self,
         binding: &Binding,
         bot: &crate::rakazo::Bot,
+        space_name: &str,
         style: &str,
         bridge_logo: &str,
         features: &Value,
@@ -314,6 +346,7 @@ impl TenantRuntime {
         let applied_hash = stable_id(&[
             &avatar_hash,
             &bot.name,
+            space_name,
             bridge_logo,
             features["id"].as_str().unwrap(),
         ]);
@@ -341,7 +374,7 @@ impl TenantRuntime {
             .sync_profile(&binding.ghost, &binding.room, &bot.name, &avatar_uri)
             .await?;
         self.matrix
-            .bridge_info(binding, &bot.name, bridge_logo, &avatar_uri)
+            .bridge_info(binding, space_name, &bot.name, bridge_logo, &avatar_uri)
             .await?;
         self.matrix.rich_permissions(binding).await?;
         self.matrix.room_features(binding, features.clone()).await?;
@@ -354,7 +387,7 @@ impl TenantRuntime {
     async fn sync_bridge_identity(&self) -> Result<String> {
         // Empty bot ID is reserved for tenant-level branding; configured bot IDs are nonempty.
         let bytes = include_bytes!("../assets/fpl-logo.png");
-        let hash = stable_id(&["fpl-bridge-logo-v1", &hex::encode(bytes)]);
+        let hash = stable_id(&["rakazo-bridge-identity-v1", &hex::encode(bytes)]);
         let cached = self.store.profile(&self.config.id, "")?;
         let uri = if let Some(profile) = cached
             .as_ref()
@@ -414,7 +447,8 @@ impl TenantRuntime {
                         error.downcast_ref::<crate::media::Rejected>().unwrap()
                     );
                     let txn = stable_id(&[&binding.tenant, &pending.event.event_id, "rejected"]);
-                    self.matrix
+                    let notice_id = self
+                        .matrix
                         .send_event(
                             &binding.room,
                             &binding.ghost,
@@ -423,6 +457,17 @@ impl TenantRuntime {
                             serde_json::json!({"msgtype":"m.notice","body":text}),
                         )
                         .await?;
+                    self.store.link(
+                        binding,
+                        &MessageLink {
+                            rakazo_id: format!("bridge-notice:{}", pending.event.event_id),
+                            matrix_id: notice_id,
+                            part: "bridge-notice".into(),
+                            role: "bot".into(),
+                            kind: "m.room.message".into(),
+                            hash: stable_id(&[&text]),
+                        },
+                    )?;
                     self.store.fail(&self.config.id, pending.id)?;
                     tracing::warn!(tenant=%self.config.id,"event rejected; owner notified");
                 }
@@ -449,7 +494,74 @@ impl TenantRuntime {
                 .await?;
             return Ok(());
         }
+        let event_cursor = self
+            .store
+            .sync_cursor(binding, "thread-events")?
+            .unwrap_or(-1);
         let snapshot = self.rakazo.snapshot(&binding.bot).await?;
+        let head = self.rakazo.thread_head(&binding.bot).await?;
+        ensure!(
+            snapshot.thread_id == head.thread_id && snapshot.cursor == head.cursor,
+            "Rakazo thread changed during sync"
+        );
+        let events = self
+            .rakazo
+            .thread_events(&binding.bot, event_cursor, head.cursor)
+            .await?;
+        let mut previous = event_cursor;
+        for event in &events {
+            ensure!(
+                event.space_id == self.config.rakazo_space_id,
+                "Rakazo event belongs to a different Space"
+            );
+            ensure!(
+                event.bot_id == binding.bot,
+                "Rakazo event belongs to a different bot"
+            );
+            ensure!(
+                event.thread_id == head.thread_id,
+                "Rakazo event belongs to a different thread"
+            );
+            ensure!(
+                event.seq > previous && event.seq <= head.cursor,
+                "Rakazo event stream did not progress"
+            );
+            previous = event.seq;
+        }
+        if let Some(clear_index) = events
+            .iter()
+            .rposition(|event| event.kind == "thread.cleared")
+        {
+            let clear = &events[clear_index];
+            let mut preserve = std::collections::HashSet::new();
+            let mut preserve_runs = std::collections::HashSet::new();
+            for event in &events[clear_index + 1..] {
+                if event.kind == "thread.message.created" {
+                    preserve.insert(
+                        event.payload["messageId"]
+                            .as_str()
+                            .context("Rakazo message event is missing its message ID")?
+                            .to_owned(),
+                    );
+                    if let Some(run) = event.run_id.as_deref() {
+                        preserve_runs.insert(run.to_owned());
+                    }
+                    for run in event.payload["runIds"].as_array().into_iter().flatten() {
+                        preserve_runs.insert(
+                            run.as_str()
+                                .context("Rakazo message event contains an invalid run ID")?
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            self.clear_matrix_timeline(binding, &clear.id, clear.seq, &preserve, &preserve_runs)
+                .await?;
+        }
+        if event_cursor < head.cursor {
+            self.store
+                .set_sync_cursor(binding, "thread-events", head.cursor)?;
+        }
         if snapshot.busy() {
             return Ok(());
         }
@@ -572,7 +684,7 @@ mod selection_tests {
     }
 
     #[test]
-    fn auto_fleet_selects_orchestrator_children_and_muse_only() {
+    fn auto_fleet_selects_only_orchestrator_and_children_by_default() {
         let bots = vec![
             bot(
                 "orch",
@@ -587,8 +699,21 @@ mod selection_tests {
             bot("muse", "Muse", None, None, false),
             bot("old-pm", "PM · Old", Some("orch"), None, true),
         ];
-        let selected = select_bot_ids(&bots, &[], true);
-        assert_eq!(selected, vec!["orch", "pm-fpl", "pm-rakazo", "muse"]);
+        let selected = select_bot_ids(&bots, &[], true, &[]);
+        assert_eq!(selected, vec!["orch", "pm-fpl", "pm-rakazo"]);
+    }
+
+    #[test]
+    fn configured_named_bots_are_selected_without_hardcoded_policy() {
+        let bots = vec![
+            bot("muse", "Muse", None, None, false),
+            bot("oracle", "Oracle", None, None, false),
+            bot("old", "Muse", None, None, true),
+        ];
+        assert_eq!(
+            select_bot_ids(&bots, &[], false, &["mUsE".into()]),
+            vec!["muse"]
+        );
     }
 
     #[test]
@@ -605,7 +730,7 @@ mod selection_tests {
         ];
         let explicit = vec!["extra".to_string(), "missing".to_string()];
         assert_eq!(
-            select_bot_ids(&bots, &explicit, true),
+            select_bot_ids(&bots, &explicit, true, &[]),
             vec!["orch", "extra"]
         );
     }
@@ -622,9 +747,9 @@ mod selection_tests {
             ),
             bot("extra", "Extra", None, None, false),
         ];
-        assert!(select_bot_ids(&bots, &[], false).is_empty());
+        assert!(select_bot_ids(&bots, &[], false, &[]).is_empty());
         assert_eq!(
-            select_bot_ids(&bots, &["extra".into()], false),
+            select_bot_ids(&bots, &["extra".into()], false, &[]),
             vec!["extra"]
         );
     }

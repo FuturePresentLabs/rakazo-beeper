@@ -4,7 +4,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rakazo_beeper::{
@@ -55,8 +55,60 @@ struct Remote {
     matrix_transactions: HashMap<String, String>,
     incoming_events: HashMap<String, Value>,
     artifacts: HashMap<String, Value>,
+    thread_cursor: i64,
+    head_cursor: Option<i64>,
+    snapshot_cursor: Option<i64>,
+    head_thread_id: Option<String>,
+    snapshot_thread_id: Option<String>,
+    thread_events: Vec<Value>,
+    subscribe_chunks: Vec<Vec<u8>>,
+    redacted: HashSet<String>,
+    missing_redactions: HashSet<String>,
+    redaction_calls: usize,
+    fail_redaction_call: Option<usize>,
 }
 type Shared = Arc<Mutex<Remote>>;
+
+async fn mock_subscribe(
+    State(remote): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    assert_eq!(headers["authorization"], "Bearer test-rakazo-session");
+    assert_eq!(headers["x-rakazo-space-id"], "space-a");
+    assert_eq!(headers["accept"], "text/event-stream");
+    let input: Value = serde_json::from_slice(&body).unwrap();
+    let cursor = input["json"]["cursor"].as_i64().unwrap();
+    let state = remote.lock().unwrap();
+    let chunks = if state.subscribe_chunks.is_empty() {
+        let events = if state.thread_events.is_empty() && state.thread_cursor > cursor {
+            vec![
+                json!({"id":"synthetic-head","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":state.thread_cursor,"type":"thread.meta","createdAt":"2026-01-01T00:00:00Z","payload":{}}),
+            ]
+        } else {
+            state.thread_events.clone()
+        };
+        vec![
+            events
+                .iter()
+                .filter(|event| event["seq"].as_i64().unwrap() > cursor)
+                .map(|event| format!("data: {}\n\n", json!({"json":event})))
+                .collect::<String>()
+                .into_bytes(),
+        ]
+    } else {
+        state.subscribe_chunks.clone()
+    };
+    drop(state);
+    let body = Body::from_stream(futures_util::stream::iter(
+        chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+    ));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(body)
+        .unwrap()
+}
 
 async fn mock_media(State(remote): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     assert_eq!(
@@ -127,7 +179,14 @@ async fn mock(
             "/rpc/bots/list" => ok(
                 json!({"json":[{"id":"agent-a","name":state.bot_name.as_deref().unwrap_or("Ada"),"color":state.avatar_color.as_deref().unwrap_or("#3EC5A8")},{"id":"agent-b","name":"Grace","color":"#9B5CF6"}]}),
             ),
+            "/rpc/spaces/list" => ok(
+                json!({"json":{"current":{"id":"space-a","name":"Personal","bots":[],"groups":[],"externalConversations":[],"botSections":[]},"spaces":[]}}),
+            ),
             "/rpc/me" => ok(json!({"json":{"avatarStyle":"organic"}})),
+            "/rpc/threads/head" => ok(json!({"json":{
+                "threadId":state.head_thread_id.as_deref().unwrap_or("thread-a"),
+                "cursor":state.head_cursor.unwrap_or(state.thread_cursor)
+            }})),
             "/rpc/threads/get" => {
                 let latest = state
                     .messages
@@ -137,7 +196,7 @@ async fn mock(
                     .cloned()
                     .collect::<Vec<_>>();
                 ok(
-                    json!({"json":{"messages":latest,"run":if state.busy {json!({"status":"running"})}else{Value::Null},"activeRuns":[]}}),
+                    json!({"json":{"threadId":state.snapshot_thread_id.as_deref().unwrap_or("thread-a"),"cursor":state.snapshot_cursor.unwrap_or(state.thread_cursor),"messages":latest,"run":if state.busy {json!({"status":"running"})}else{Value::Null},"activeRuns":[]}}),
                 )
             }
             "/rpc/threads/messages" => {
@@ -390,6 +449,35 @@ async fn mock(
         }
         return ok(json!(members));
     }
+    if method == Method::PUT && path.contains("/redact/") {
+        state.redaction_calls += 1;
+        let event = path
+            .split("/redact/")
+            .nth(1)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        let event = percent_encoding::percent_decode_str(event)
+            .decode_utf8()
+            .unwrap()
+            .into_owned();
+        if state.missing_redactions.contains(&event) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"errcode":"M_NOT_FOUND","error":"event not found"})),
+            );
+        }
+        if state.fail_redaction_call == Some(state.redaction_calls) {
+            state.fail_redaction_call = None;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"redaction failed"})),
+            );
+        }
+        state.redacted.insert(event);
+        return ok(json!({"event_id":"$redaction"}));
+    }
     if method == Method::PUT && path.contains("/send/m.room.message/") {
         state
             .matrix_transactions
@@ -419,6 +507,7 @@ async fn fixture() -> Fixture {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
+        .route("/rpc/threads/subscribe", post(mock_subscribe))
         .route(
             "/_matrix/client/v1/media/download/{server}/{id}",
             get(mock_media),
@@ -440,6 +529,7 @@ async fn fixture() -> Fixture {
         rakazo_space_id: "space-a".into(),
         bot_ids: vec!["agent-a".into()],
         auto_bots: false,
+        auto_named_bots: vec![],
         websocket: false,
     };
     let bundle = json!({"homeserver_url":base,"homeserver_domain":"beeper.local","your_user_id":config.owner,
@@ -489,7 +579,8 @@ fn room_capabilities_follow_server_limits_and_do_not_advertise_edits_or_removals
     assert_eq!(features["file"]["m.audio"]["mime_types"]["audio/ogg"], 2);
     assert_eq!(features["file"]["m.image"]["max_size"], 1024);
     assert!(features["file"]["m.video"].is_null());
-    assert_eq!(features["allowed_reactions"].as_array().unwrap().len(), 6);
+    assert_eq!(features["reaction"], -2);
+    assert!(features["allowed_reactions"].is_null());
 }
 
 #[tokio::test]
@@ -518,7 +609,7 @@ async fn unavailable_source_attachments_are_visible_and_do_not_block_later_repli
 }
 
 #[tokio::test]
-async fn threaded_agent_reply_waits_for_an_ambiguous_send_receipt_and_keeps_its_thread() {
+async fn agent_output_does_not_invent_a_reply_relation_from_run_routing() {
     let f = fixture().await;
     f.remote.lock().unwrap().messages = vec![message(0, "bot", "thread root")];
     f.runtime.discover().await.unwrap();
@@ -562,12 +653,7 @@ async fn threaded_agent_reply_waits_for_an_ambiguous_send_receipt_and_keeps_its_
         .values()
         .find(|event| event["content"]["body"] == "threaded output")
         .unwrap();
-    assert_eq!(reply["content"]["m.relates_to"]["rel_type"], "m.thread");
-    assert_eq!(reply["content"]["m.relates_to"]["event_id"], root);
-    assert_eq!(
-        reply["content"]["m.relates_to"]["m.in_reply_to"]["event_id"],
-        "$thread-input"
-    );
+    assert!(reply["content"].get("m.relates_to").is_none());
 }
 
 #[tokio::test]
@@ -719,7 +805,7 @@ async fn source_media_preserves_types_and_replies_without_duplicate_uploads() {
 }
 
 #[tokio::test]
-async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_runs() {
+async fn rakazo_reactions_render_natively_while_beeper_reactions_remain_disabled() {
     let f = fixture().await;
     f.remote.lock().unwrap().messages = vec![message(0, "bot", "parent")];
     f.runtime.discover().await.unwrap();
@@ -729,28 +815,37 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
         .matrix_id
         .clone();
     let reaction = json!({"event_id":"$reaction","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":parent,"key":"👍\u{fe0f}"}}});
-    f.remote
-        .lock()
-        .unwrap()
-        .incoming_events
-        .insert("$reaction".into(), reaction.clone());
     f.runtime
         .ingest("reaction-txn", &json!({"events":[reaction]}))
         .unwrap();
     f.runtime.deliver_inbound().await.unwrap();
-    f.runtime.poll_binding(&binding).await.unwrap();
+    {
+        let remote = f.remote.lock().unwrap();
+        assert!(
+            remote
+                .requests
+                .iter()
+                .all(|(path, _, _)| path != "/rpc/threads/react")
+        );
+        assert!(remote.requests.iter().any(|(path, body, _)| {
+            path.contains("/send/m.room.message/")
+                && body["msgtype"] == "m.notice"
+                && body["body"]
+                    == "Could not bridge this event: Reactions are disabled because Rakazo cannot remove them."
+        }));
+        let notice = f
+            .runtime
+            .store
+            .all_links(&binding)
+            .unwrap()
+            .into_iter()
+            .find(|link| link.part == "bridge-notice")
+            .unwrap();
+        assert_eq!(notice.rakazo_id, "bridge-notice:$reaction");
+        assert_eq!(notice.matrix_id, "$delivered");
+    }
     {
         let mut remote = f.remote.lock().unwrap();
-        let (_, reaction_body, _) = remote
-            .requests
-            .iter()
-            .find(|(path, _, _)| path == "/rpc/threads/react")
-            .unwrap();
-        assert_eq!(reaction_body["json"]["reaction"], "👍");
-        assert!(
-            remote.rakazo_nonces.is_empty(),
-            "react must never invoke threads/send"
-        );
         let mut reply = message(2, "user", "👍");
         reply["replyToMessageId"] = json!("message-0");
         remote.messages.push(reply);
@@ -765,6 +860,9 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
             .unwrap();
         assert_eq!(reaction["content"]["m.relates_to"]["event_id"], parent);
         assert_eq!(reaction["content"]["m.relates_to"]["key"], "👍");
+        assert!(remote.history_events.values().all(|event| {
+            event["type"] != "m.room.message" || event["content"]["body"] != "👍"
+        }));
     }
     let reply = json!({"event_id":"$reply","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.text","body":"> <@agent:example.test> parent\n\nReal reply","m.relates_to":{"m.in_reply_to":{"event_id":parent}}}});
     f.runtime
@@ -780,6 +878,530 @@ async fn replies_and_tapbacks_reference_the_original_message_and_do_not_start_ru
         .unwrap();
     assert_eq!(body["json"]["text"], "Real reply");
     assert_eq!(body["json"]["replyToMessageId"], "message-0");
+}
+
+#[tokio::test]
+async fn an_unmapped_reaction_redaction_is_not_claimed_as_remote_removal() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let reaction = json!({"event_id":"$local-reaction","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$unmapped","key":"👍"}}});
+    let redaction = json!({"event_id":"$local-unreact","room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.redaction","redacts":"$local-reaction","content":{}});
+    f.remote
+        .lock()
+        .unwrap()
+        .incoming_events
+        .insert("$local-reaction".into(), reaction);
+    f.runtime
+        .ingest("local-unreact", &json!({"events":[redaction]}))
+        .unwrap();
+
+    f.runtime.deliver_inbound().await.unwrap();
+    assert!(
+        f.remote
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(path, body, _)| path.contains("/send/m.room.message/")
+                && body["msgtype"] == "m.notice"
+                && body["body"]
+                    == "Could not bridge this event: This reaction was not bridged to Rakazo.")
+    );
+}
+
+#[tokio::test]
+async fn thread_event_stream_accepts_utf8_split_across_transport_chunks() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let event = json!({"id":"meta-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.meta","createdAt":"2026-01-01T00:00:01Z","payload":{"label":"😀"}});
+    let frame = format!("data: {}\r\n\r\n", json!({"json":event})).into_bytes();
+    let emoji = frame
+        .windows("😀".len())
+        .position(|window| window == "😀".as_bytes())
+        .unwrap();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.thread_cursor = 1;
+        remote.subscribe_chunks = vec![frame[..emoji + 1].to_vec(), frame[emoji + 1..].to_vec()];
+    }
+
+    f.runtime.poll_binding(&binding).await.unwrap();
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_thread_identity_change_does_not_redact_or_advance() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.clear();
+        remote.thread_cursor = 1;
+        remote.snapshot_thread_id = Some("different-thread".into());
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+        ];
+    }
+
+    assert!(f.runtime.poll_binding(&binding).await.is_err());
+    assert!(f.remote.lock().unwrap().redacted.is_empty());
+    assert!(
+        !f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_newer_than_the_head_does_not_clear_routes_or_advance() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    f.runtime
+        .store
+        .save_run_route(&binding, "run-new", "$owner", Some("$thread-root"))
+        .unwrap();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.clear();
+        remote.head_cursor = Some(1);
+        remote.snapshot_cursor = Some(2);
+        remote.thread_cursor = 2;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+            json!({"id":"message-2","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":2,"type":"thread.message.created","runId":"run-new","createdAt":"2026-01-01T00:00:02Z","payload":{"messageId":"message-2","runIds":["run-new"]}}),
+        ];
+    }
+
+    assert!(f.runtime.poll_binding(&binding).await.is_err());
+    assert!(f.remote.lock().unwrap().redacted.is_empty());
+    assert_eq!(
+        f.runtime.store.run_route(&binding, "run-new").unwrap(),
+        Some(("$owner".into(), Some("$thread-root".into())))
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn foreign_clear_events_do_not_redact_or_advance() {
+    for (space, thread, bot) in [
+        ("space-foreign", "thread-a", "agent-a"),
+        ("space-a", "thread-foreign", "agent-a"),
+        ("space-a", "thread-a", "agent-foreign"),
+    ] {
+        let f = fixture().await;
+        f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+        f.runtime.discover().await.unwrap();
+        let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+        f.runtime.backfill_binding(&binding).await.unwrap();
+        {
+            let mut remote = f.remote.lock().unwrap();
+            remote.messages.clear();
+            remote.thread_cursor = 1;
+            remote.thread_events = vec![json!({
+                "id":"clear-foreign",
+                "spaceId":space,
+                "threadId":thread,
+                "botId":bot,
+                "seq":1,
+                "type":"thread.cleared",
+                "createdAt":"2026-01-01T00:00:01Z",
+                "payload":{}
+            })];
+        }
+
+        assert!(f.runtime.poll_binding(&binding).await.is_err());
+        assert!(f.remote.lock().unwrap().redacted.is_empty());
+        assert!(
+            !f.runtime
+                .store
+                .links(&binding, "message-0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.runtime
+                .store
+                .sync_cursor(&binding, "thread-events")
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_foreign_unhandled_event_does_not_advance_the_cursor() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.thread_cursor = 1;
+        remote.thread_events = vec![json!({
+            "id":"meta-foreign",
+            "spaceId":"space-foreign",
+            "threadId":"thread-a",
+            "botId":"agent-a",
+            "seq":1,
+            "type":"thread.meta",
+            "createdAt":"2026-01-01T00:00:01Z",
+            "payload":{}
+        })];
+    }
+
+    assert!(f.runtime.poll_binding(&binding).await.is_err());
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_thread_event_stream_does_not_commit_or_advance() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let old = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.clear();
+        remote.thread_cursor = 2;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+        ];
+    }
+    assert!(f.runtime.poll_binding(&binding).await.is_err());
+
+    assert!(f.remote.lock().unwrap().redacted.is_empty());
+    assert_eq!(
+        f.runtime.store.links(&binding, "message-0").unwrap()[0].matrix_id,
+        old
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_missing_mapped_event_does_not_block_the_rest_of_a_clear() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages =
+        vec![message(0, "user", "question"), message(1, "bot", "answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let missing = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+    let remaining = f.runtime.store.links(&binding, "message-1").unwrap()[0]
+        .matrix_id
+        .clone();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.missing_redactions.insert(missing.clone());
+        remote.messages.clear();
+        remote.thread_cursor = 1;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+        ];
+    }
+
+    f.runtime.poll_binding(&binding).await.unwrap();
+
+    let remote = f.remote.lock().unwrap();
+    assert!(!remote.redacted.contains(&missing));
+    assert!(remote.redacted.contains(&remaining));
+    drop(remote);
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-1")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_clear_redaction_retries_idempotently_before_committing() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages =
+        vec![message(0, "user", "question"), message(1, "bot", "answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.clear();
+        remote.thread_cursor = 1;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+        ];
+        remote.fail_redaction_call = Some(2);
+    }
+
+    assert!(f.runtime.poll_binding(&binding).await.is_err());
+    assert!(
+        !f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !f.runtime
+            .store
+            .links(&binding, "message-1")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        None
+    );
+    let first_transaction = f
+        .remote
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|(path, _, _)| path.contains("/redact/"))
+        .unwrap()
+        .0
+        .clone();
+
+    f.runtime.poll_binding(&binding).await.unwrap();
+    let remote = f.remote.lock().unwrap();
+    assert!(
+        remote
+            .requests
+            .iter()
+            .filter(|(path, _, _)| path == &first_transaction)
+            .count()
+            >= 2
+    );
+    drop(remote);
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-1")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_rakazo_clear_redacts_the_mapped_beeper_timeline() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages =
+        vec![message(0, "user", "question"), message(1, "bot", "answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let linked = ["message-0", "message-1"]
+        .into_iter()
+        .flat_map(|id| f.runtime.store.links(&binding, id).unwrap())
+        .map(|link| link.matrix_id)
+        .collect::<HashSet<_>>();
+    assert!(!linked.is_empty());
+
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages.clear();
+        remote.thread_cursor = 1;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+        ];
+    }
+    f.runtime.poll_binding(&binding).await.unwrap();
+
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.redacted, linked);
+    assert!(
+        remote
+            .requests
+            .iter()
+            .all(|(path, body, _)| !(path.contains("/send/m.room.message/")
+                && body["msgtype"] == "m.notice"))
+    );
+    drop(remote);
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-1")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_post_clear_run_keeps_its_internal_route_without_inventing_a_reply() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    f.runtime
+        .store
+        .save_run_route(&binding, "run-new", "$new-owner", Some("$thread-root"))
+        .unwrap();
+    let mut response = message(2, "bot", "new answer");
+    response["runId"] = json!("run-new");
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages = vec![response];
+        remote.thread_cursor = 2;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+            json!({"id":"event-2","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":2,"type":"thread.message.created","runId":"run-new","createdAt":"2026-01-01T00:00:02Z","payload":{"messageId":"message-2","runIds":["run-new"]}}),
+        ];
+    }
+
+    f.runtime.poll_binding(&binding).await.unwrap();
+
+    assert_eq!(
+        f.runtime.store.run_route(&binding, "run-new").unwrap(),
+        Some(("$new-owner".into(), Some("$thread-root".into())))
+    );
+    let remote = f.remote.lock().unwrap();
+    let delivered = remote
+        .history_events
+        .values()
+        .find(|event| event["content"]["body"] == "new answer")
+        .unwrap();
+    assert!(delivered["content"].get("m.relates_to").is_none());
+}
+
+#[tokio::test]
+async fn a_clear_event_followed_by_a_new_message_preserves_the_new_generation() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().messages = vec![message(0, "bot", "old answer")];
+    f.runtime.discover().await.unwrap();
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.backfill_binding(&binding).await.unwrap();
+    let old = f.runtime.store.links(&binding, "message-0").unwrap()[0]
+        .matrix_id
+        .clone();
+
+    let new_value = message(1, "bot", "new answer");
+    let new_message = serde_json::from_value(new_value.clone()).unwrap();
+    f.runtime
+        .relay_message(&binding, &new_message, false)
+        .await
+        .unwrap();
+    let new = f.runtime.store.links(&binding, "message-1").unwrap()[0]
+        .matrix_id
+        .clone();
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.messages = vec![new_value];
+        remote.thread_cursor = 2;
+        remote.thread_events = vec![
+            json!({"id":"clear-1","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":1,"type":"thread.cleared","createdAt":"2026-01-01T00:00:01Z","payload":{}}),
+            json!({"id":"event-2","spaceId":"space-a","threadId":"thread-a","botId":"agent-a","seq":2,"type":"thread.message.created","createdAt":"2026-01-01T00:00:02Z","payload":{"messageId":"message-1"}}),
+        ];
+    }
+    f.runtime.poll_binding(&binding).await.unwrap();
+
+    let remote = f.remote.lock().unwrap();
+    assert!(remote.redacted.contains(&old));
+    assert!(!remote.redacted.contains(&new));
+    drop(remote);
+    assert!(
+        f.runtime
+            .store
+            .links(&binding, "message-0")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.runtime.store.links(&binding, "message-1").unwrap()[0].matrix_id,
+        new
+    );
+    assert_eq!(
+        f.runtime
+            .store
+            .sync_cursor(&binding, "thread-events")
+            .unwrap(),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -1307,7 +1929,7 @@ async fn profile_pictures_sync_without_duplicate_uploads_and_retry_partial_updat
             content["protocol"]["avatar_url"],
             "mxc://beeper.local/avatar-1"
         );
-        assert_eq!(content["protocol"]["displayname"], "FPL Agents");
+        assert_eq!(content["protocol"]["displayname"], "Personal");
         assert_eq!(
             content["channel"]["avatar_url"],
             "mxc://beeper.local/avatar-3"
@@ -1857,8 +2479,10 @@ fn chunking_preserves_unicode_and_identifiers_cannot_collide_by_concatenation() 
 #[test]
 fn thread_run_states_keep_leased_and_unknown_runs_out_of_the_transcript() {
     for status in ["queued", "leased", "running", "unknown-future-state"] {
-        let snapshot: rakazo_beeper::rakazo::Snapshot =
-            serde_json::from_value(json!({"messages":[],"run":{"status":status}})).unwrap();
+        let snapshot: rakazo_beeper::rakazo::Snapshot = serde_json::from_value(
+            json!({"threadId":"thread-a","cursor":0,"messages":[],"run":{"status":status}}),
+        )
+        .unwrap();
         assert!(snapshot.busy(), "{status}");
     }
     for status in [
@@ -1868,8 +2492,10 @@ fn thread_run_states_keep_leased_and_unknown_runs_out_of_the_transcript() {
         "waiting_input",
         "waiting_takeover",
     ] {
-        let snapshot: rakazo_beeper::rakazo::Snapshot =
-            serde_json::from_value(json!({"messages":[],"run":{"status":status}})).unwrap();
+        let snapshot: rakazo_beeper::rakazo::Snapshot = serde_json::from_value(
+            json!({"threadId":"thread-a","cursor":0,"messages":[],"run":{"status":status}}),
+        )
+        .unwrap();
         assert!(!snapshot.busy(), "{status}");
     }
 }

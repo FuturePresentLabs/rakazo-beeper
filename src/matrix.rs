@@ -299,7 +299,7 @@ impl Matrix {
     }
 
     pub async fn bridge_identity(&self, avatar: &str) -> Result<()> {
-        self.register(&self.sender, "FPL Agents").await?;
+        self.register(&self.sender, "Rakazo").await?;
         self.ok(
             Method::PUT,
             &["profile", &self.sender, "avatar_url"],
@@ -314,12 +314,13 @@ impl Matrix {
     pub async fn bridge_info(
         &self,
         binding: &crate::store::Binding,
+        space_name: &str,
         name: &str,
         logo: &str,
         avatar: &str,
     ) -> Result<()> {
         let key = format!("rakazo://{}/{}", binding.tenant, binding.bot);
-        let content = json!({"bridgebot":self.sender,"creator":binding.ghost,"protocol":{"id":"rakazo","displayname":"FPL Agents","avatar_url":logo},"channel":{"id":binding.bot,"displayname":name,"avatar_url":avatar}});
+        let content = json!({"bridgebot":self.sender,"creator":binding.ghost,"protocol":{"id":"rakazo","displayname":space_name,"avatar_url":logo},"channel":{"id":binding.bot,"displayname":name,"avatar_url":avatar}});
         for event_type in ["m.bridge", "uk.half-shot.bridge"] {
             self.ok(
                 Method::PUT,
@@ -429,13 +430,18 @@ impl Matrix {
     }
 
     pub async fn redact(&self, room: &str, user: &str, id: &str, transaction: &str) -> Result<()> {
-        self.ok(
-            Method::PUT,
-            &["rooms", room, "redact", id, transaction],
-            user,
-            Some(json!({})),
-        )
-        .await?;
+        let (status, _) = self
+            .request(
+                Method::PUT,
+                &["rooms", room, "redact", id, transaction],
+                Some(user),
+                Some(json!({})),
+            )
+            .await?;
+        ensure!(
+            status.is_success() || status == StatusCode::NOT_FOUND,
+            "Matrix request returned HTTP {status}"
+        );
         Ok(())
     }
 

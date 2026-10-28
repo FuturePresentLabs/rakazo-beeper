@@ -17,10 +17,11 @@ rakazo_token_env = "RAKAZO_PERSONAL_TOKEN"
 rakazo_space_id = "YOUR_RAKAZO_SPACE_ID"
 # Run `rakazo-beeper bots --tenant personal` to discover IDs, then opt in.
 bot_ids = []
-# Keep the fleet in sync without editing this file: add the orchestrator, every
-# child conversation (PMs), and Muse on each discover tick. Explicit bot_ids are
-# added to the auto set. Removed/archived bots stop being polled.
+# Keep an orchestrator fleet in sync: add the root and direct child conversations.
+# Explicit bot_ids are added to the auto set. Removed/archived bots stop being polled.
 # auto_bots = true
+# Optionally select active bots by case-insensitive exact display name.
+# auto_named_bots = ["Muse"]
 websocket = true
 
 # For FPL hosting, append another [[tenants]] with a distinct id, registration,
