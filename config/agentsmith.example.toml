@@ -34,3 +34,8 @@ notify_urgent = true
 # upstream `bridge.hide_workers` in the roster payload wins over this value when
 # AgentSmith publishes it.
 hide_workers = true
+# Optional `[[agent]]` provider config (same file the hidden `ohm` commands use).
+# When set, `bridge status --json` reports each matching roster agent's real
+# `transport` and makes one live `GET /v1/info` for a Beeper agent, so
+# `last_poll_ok` is not a guess.
+# agent_config = "/Users/ajmwagar/.config/rakazo/ohm-muse.toml"

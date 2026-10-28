@@ -1278,6 +1278,14 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
             let orch = Orch::from_env()?;
             let agents = load(&config, &host)?;
             let bots = orch.bots().await?;
+            // Optional `[[agent]]` provider config. It is how a roster agent
+            // such as Muse advertises its real transport and live Beeper state.
+            let agent_configs = config
+                .bridge
+                .agent_config
+                .as_ref()
+                .map(|path| rakazo_beeper::ohm::OhmConfig::load(path))
+                .transpose()?;
             let mut tracked = std::collections::BTreeMap::new();
             for agent in agents.iter().filter(|agent| agent.host == host) {
                 let state_file =
@@ -1303,6 +1311,23 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                         let tracked = tracked.get(&agent.key);
                         let state = tracked.map(|tracked| &tracked.state);
                         let bot = agentsmith::resolve_bot(&bots, &agents, agent);
+                        let configured = agent_configs
+                            .as_ref()
+                            .and_then(|config| config.agents.iter().find(|a| a.key == agent.key));
+                        let transport = configured
+                            .map(|a| match a.transport {
+                                rakazo_beeper::ohm::AgentTransportKind::Beeper => "beeper",
+                                rakazo_beeper::ohm::AgentTransportKind::Ohmos => "ohmos",
+                                rakazo_beeper::ohm::AgentTransportKind::Msgd => "msgd",
+                            })
+                            .unwrap_or("rakazo");
+                        // One live GET /v1/info for a Beeper agent: a truthful
+                        // status, not "the token file exists".
+                        let beeper = configured
+                            .filter(|a| {
+                                a.transport == rakazo_beeper::ohm::AgentTransportKind::Beeper
+                            })
+                            .map(rakazo_beeper::ohm::beeper::status);
                         serde_json::json!({
                             "key": agent.key,
                             "role": agent.role.as_str(),
@@ -1311,17 +1336,23 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                             "worker": agent.delivery,
                             "pane": agent.pane,
                             "offline": agent.offline,
+                            "transport": transport,
                             "bot_id": bot.map(|bot| bot.id.clone()),
                             "thread": state.and_then(|state| state.thread_id.clone())
                                 .or_else(|| bot.map(|bot| bot.thread_id.clone().unwrap_or_else(|| bot.id.clone()))),
                             "watermark": state.map(|state| state.last_seq).unwrap_or(0),
                             "last_delivered_id": state.and_then(|state| state.last_delivered_id.clone()),
-                            "last_poll_ok": state.and_then(|state| state.last_poll_ok),
+                            "last_poll_ok": beeper.as_ref().map(|b| b.last_poll_ok)
+                                .or_else(|| state.and_then(|state| state.last_poll_ok)),
                             "last_poll_at": state.and_then(|state| state.last_poll_at.clone()),
-                            "last_error": state.and_then(|state| state.last_error.clone()),
+                            "last_error": beeper.as_ref().and_then(|b| b.last_error.clone())
+                                .or_else(|| state.and_then(|state| state.last_error.clone())),
                             "missing": tracked.is_some_and(|tracked| tracked.missing),
                             "relay_only": bot.and_then(|bot| bot.relay_only),
                             "token_present": token_present(&agent.key),
+                            "token_file": beeper.as_ref().and_then(|b| b.token_path.as_ref())
+                                .map(|p| p.display().to_string()),
+                            "token_fingerprint": beeper.as_ref().and_then(|b| b.token_fingerprint.clone()),
                             "delivery_backend": "pi-notify",
                         })
                     })
@@ -1337,6 +1368,16 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                     &token_present,
                 ) {
                     println!("{row}");
+                }
+                if let Some(config) = &agent_configs {
+                    for agent in &config.agents {
+                        if agent.transport == rakazo_beeper::ohm::AgentTransportKind::Beeper {
+                            println!(
+                                "{}",
+                                rakazo_beeper::ohm::beeper::status(agent).line(&agent.key)
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1588,17 +1629,24 @@ async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
 /// Load the owner-only bearer for one agent, or explain the one human command
 /// that obtains it. The value is never printed.
 fn agent_token(agent: &rakazo_beeper::ohm::AgentConfig) -> Result<rakazo_beeper::ohm::Token> {
-    use rakazo_beeper::ohm::agent_conversations::{TOKEN_ACQUISITION, Token};
+    use rakazo_beeper::ohm::{AgentTransportKind, agent_conversations::TOKEN_ACQUISITION};
     let path = agent.token_path()?;
-    Token::load(&path).map_err(|error| {
+    let acquisition = match agent.transport {
+        AgentTransportKind::Beeper => rakazo_beeper::ohm::beeper::TOKEN_ACQUISITION,
+        _ => TOKEN_ACQUISITION,
+    };
+    rakazo_beeper::ohm::Token::load(&path).map_err(|error| {
         anyhow::anyhow!(
-            "{error}\nobtain the token once with:\n  {TOKEN_ACQUISITION}\nUNVERIFIED: no live request was made"
+            "{error}\nobtain the token once with:\n  {acquisition}\nUNVERIFIED: no live request was made"
         )
     })
 }
 
 fn agent_probe(config: &rakazo_beeper::ohm::OhmConfig, selected: Option<&str>) -> Result<()> {
-    use rakazo_beeper::ohm::{AgentConversationsClient, UreqAgentHttp};
+    use rakazo_beeper::ohm::{
+        AgentConversationsClient, AgentTransportKind, BeeperClient, UreqAgentHttp, UreqBeeperHttp,
+        beeper,
+    };
     for agent in config.agents(selected)? {
         let Some(base) = agent.base_url.as_deref() else {
             println!(
@@ -1607,6 +1655,47 @@ fn agent_probe(config: &rakazo_beeper::ohm::OhmConfig, selected: Option<&str>) -
             );
             continue;
         };
+        if agent.transport == AgentTransportKind::Beeper {
+            let path = agent.token_path()?;
+            let token = match beeper::load_token(&path) {
+                Ok(token) => token,
+                Err(error) => {
+                    println!(
+                        "{}\ttoken={} (missing)\t{}",
+                        agent.key,
+                        path.display(),
+                        error.code()
+                    );
+                    println!(
+                        "{}\t{migration}",
+                        agent.key,
+                        migration = beeper::SH_WHATSAPP_MIGRATION
+                    );
+                    anyhow::bail!(
+                        "agent {} probe: {error}\nobtain the token once with:\n  {}",
+                        agent.key,
+                        beeper::TOKEN_ACQUISITION
+                    );
+                }
+            };
+            // Path + last 4 only: never the value.
+            println!("{}\t{}\ttransport=beeper", agent.key, token.describe(&path));
+            let client = BeeperClient::new(Some(base), token, UreqBeeperHttp::new())
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let report = client.probe(agent.chat_id.as_deref());
+            for line in report.lines() {
+                println!("{}\t{line}", agent.key);
+            }
+            if let Some(error) = report.errors.first() {
+                println!(
+                    "{}\t{migration}",
+                    agent.key,
+                    migration = beeper::SH_WHATSAPP_MIGRATION
+                );
+                anyhow::bail!("agent {} probe: {error}", agent.key);
+            }
+            continue;
+        }
         let token = agent_token(agent)?;
         let client = AgentConversationsClient::new(Some(base), token, UreqAgentHttp::new())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -1630,7 +1719,9 @@ fn agent_reply(
     dry_run: bool,
 ) -> Result<()> {
     use rakazo_beeper::ohm::{
-        AgentConversationsClient, ExpectedNativeIdentity, UreqAgentHttp, stable_request_id,
+        AgentBridge, AgentConversationsClient, AgentTransportKind, BeeperClient, BeeperTransport,
+        ExpectedNativeIdentity, PiNotifyDelivery, UreqAgentHttp, UreqBeeperHttp, beeper,
+        stable_request_id,
     };
     let agent = config
         .agents(Some(key))?
@@ -1643,15 +1734,66 @@ fn agent_reply(
             agent.key
         );
     };
+    let request_id = request_id
+        .map(str::to_string)
+        .unwrap_or_else(|| stable_request_id(&agent.key, text));
+
+    if agent.transport == AgentTransportKind::Beeper {
+        let chat_id = agent.chat_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent {} has no chat_id; read it from GET /v1/chats (agent-probe lists ids)",
+                agent.key
+            )
+        })?;
+        let path = agent.token_path()?;
+        let token = agent_token(agent)?;
+        println!("{}\t{}", agent.key, token.describe(&path));
+        let client = BeeperClient::new(Some(base), token, UreqBeeperHttp::new())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if dry_run {
+            // Status only: no text, no token, no send.
+            let report = client.probe(Some(&chat_id));
+            for line in report.lines() {
+                println!("{}\t{line}", agent.key);
+            }
+            println!("{}\tdry_run\tno message sent", agent.key);
+            if let Some(error) = report.errors.first() {
+                anyhow::bail!("agent {} dry run: {error}", agent.key);
+            }
+            return Ok(());
+        }
+        let state_file = beeper::default_state_file(&agent.key, agent.state_file.as_deref());
+        let transport = BeeperTransport::new(client, chat_id.clone(), agent.limit);
+        let mut bridge = AgentBridge::new(
+            transport,
+            PiNotifyDelivery::new(),
+            agent.worker().to_string(),
+            chat_id,
+            Some(state_file),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let report = bridge
+            .reply(&request_id, text)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let message_id = bridge
+            .state()
+            .sent
+            .get(&request_id)
+            .cloned()
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "{}\trequest_id={request_id}\tmessage_id={message_id}\tstatus={report:?}",
+            agent.key
+        );
+        return Ok(());
+    }
+
     let conversation = agent.conversation_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "agent {} has no conversation_id; read it from GET /agent-conversations",
             agent.key
         )
     })?;
-    let request_id = request_id
-        .map(str::to_string)
-        .unwrap_or_else(|| stable_request_id(&agent.key, text));
     let token = agent_token(agent)?;
     let client = AgentConversationsClient::new(Some(base), token, UreqAgentHttp::new())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -1695,7 +1837,8 @@ async fn agent_serve(
     once: bool,
 ) -> Result<()> {
     use rakazo_beeper::ohm::{
-        AgentBridge, AgentConversationsClient, OhmosTransport, PiNotifyDelivery, UreqAgentHttp,
+        AgentBridge, AgentConversationsClient, AgentTransportKind, BeeperClient, BeeperTransport,
+        OhmosTransport, PiNotifyDelivery, UreqAgentHttp, UreqBeeperHttp, beeper,
         default_state_file, identity,
     };
     let agents = config.agents(selected)?;
@@ -1712,6 +1855,44 @@ async fn agent_serve(
         );
         return Ok(());
     };
+    let interval = interval_seconds.unwrap_or_else(|| agent.poll_seconds());
+
+    if agent.transport == AgentTransportKind::Beeper {
+        let chat_id = agent.chat_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent {} has no chat_id; read it from GET /v1/chats (agent-probe lists ids)",
+                agent.key
+            )
+        })?;
+        let path = agent.token_path()?;
+        let token = agent_token(agent)?;
+        // Startup line: path + last 4 only, never the secret. `status()` also
+        // makes the one live GET /v1/info that proves the local API is enabled.
+        println!("{}\t{}\ttransport=beeper", agent.key, token.describe(&path));
+        let live = beeper::status(agent);
+        println!("{}\t{}", agent.key, live.line(&agent.key));
+        let client = BeeperClient::new(Some(base), token, UreqBeeperHttp::new())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let transport = BeeperTransport::new(client, chat_id.clone(), agent.limit);
+        let state_file = beeper::default_state_file(&agent.key, agent.state_file.as_deref());
+        let mut bridge = AgentBridge::new(
+            transport,
+            PiNotifyDelivery::new(),
+            agent.worker().to_string(),
+            chat_id,
+            Some(state_file.clone()),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        println!(
+            "{}\tserve\tworker={}\tstate={}\tinterval={}s",
+            agent.key,
+            agent.worker(),
+            state_file.display(),
+            interval
+        );
+        return run_agent_bridge(agent.key.as_str(), &mut bridge, interval, once).await;
+    }
+
     let conversation = agent
         .conversation_id
         .clone()
@@ -1734,7 +1915,6 @@ async fn agent_serve(
         Some(state_file.clone()),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let interval = interval_seconds.unwrap_or_else(|| agent.poll_seconds());
     println!(
         "{}\tserve\tworker={}\tstate={}\tinterval={}s",
         agent.key,
@@ -1742,29 +1922,40 @@ async fn agent_serve(
         state_file.display(),
         interval
     );
+    run_agent_bridge(agent.key.as_str(), &mut bridge, interval, once).await
+}
+
+async fn run_agent_bridge<T: rakazo_beeper::ohm::AgentTransport>(
+    key: &str,
+    bridge: &mut rakazo_beeper::ohm::AgentBridge<T, rakazo_beeper::ohm::PiNotifyDelivery>,
+    interval: u64,
+    once: bool,
+) -> Result<()> {
     loop {
+        let mut failed = false;
         match bridge.poll_once() {
             Ok(report) => {
                 if report.delivered > 0 || report.duplicates > 0 {
                     println!(
                         "{}\tdelivered={}\tduplicates={}\tsuppressed={}\tdropped={}",
-                        agent.key,
-                        report.delivered,
-                        report.duplicates,
-                        report.suppressed,
-                        report.dropped
+                        key, report.delivered, report.duplicates, report.suppressed, report.dropped
                     );
                 }
             }
             Err(error) if error.is_degraded() => {
                 // Explicit degraded status: never a silent success.
-                println!("{}\tdegraded\t{error}", agent.key);
+                println!("{key}\tdegraded\t{error}");
+                failed = true;
             }
             Err(error) => {
-                tracing::warn!(agent = %agent.key, %error, "agent poll failed; retrying");
+                println!("{}\t{}\t{}", key, error.code(), error);
+                failed = true;
             }
         }
         if once {
+            if failed {
+                anyhow::bail!("agent {key} poll failed");
+            }
             break;
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;

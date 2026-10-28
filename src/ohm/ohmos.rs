@@ -22,7 +22,7 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -59,6 +59,20 @@ pub enum AgentSendOutcome {
 pub trait AgentTransport {
     fn poll(&mut self) -> Result<Vec<AgentInbound>, AgentError>;
     fn send(&mut self, outbound: &AgentOutbound) -> Result<AgentSendOutcome, AgentError>;
+
+    /// The provider-specific stable reference used in `pi-notify --ref`. The
+    /// default is the ohmOS shape; Beeper overrides it to
+    /// `rakazo:beeper:<chatID>:<messageID>`.
+    fn reference(&self, conversation_id: &str, native_id: &str) -> String {
+        format!("rakazo:{conversation_id}:{native_id}")
+    }
+
+    /// The provider id of the last confirmed send (e.g. Beeper's pending message
+    /// id). `None` means the provider has no usable id. The bridge writes this
+    /// id into the durable ledger before reporting success.
+    fn last_receipt_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The real provider: one conversation over the ohmOS HTTP client.
@@ -268,6 +282,10 @@ pub struct AgentState {
     pub own_requests: BTreeSet<String>,
     #[serde(default)]
     pub replies: BTreeSet<String>,
+    /// request id → provider message id, written after a confirmed send. Kept
+    /// separate from `replies` so a retry can prove which native id landed.
+    #[serde(default)]
+    pub sent: BTreeMap<String, String>,
 }
 
 impl AgentState {
@@ -389,7 +407,7 @@ impl<T: AgentTransport, D: AgentDelivery> AgentBridge<T, D> {
             } else {
                 item.conversation_id
             };
-            let reference = format!("rakazo:{conversation}:{}", message.native_id);
+            let reference = self.transport.reference(&conversation, &message.native_id);
             let body = format!("[{reference}] {text}");
             self.delivery
                 .deliver(&self.worker, &reference, &body)
@@ -429,6 +447,12 @@ impl<T: AgentTransport, D: AgentDelivery> AgentBridge<T, D> {
             AgentSendOutcome::Queued => {
                 self.state.replies.insert(request_id.to_string());
                 self.state.own_requests.insert(request_id.to_string());
+                if let Some(message_id) = self.transport.last_receipt_id() {
+                    // Record the provider id *before* reporting success, so a
+                    // crash between send and save cannot re-post a duplicate.
+                    self.state.own_requests.insert(message_id.clone());
+                    self.state.sent.insert(request_id.to_string(), message_id);
+                }
                 self.save()?;
                 Ok(AgentReplyReport::Queued)
             }

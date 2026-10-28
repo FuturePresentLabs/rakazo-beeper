@@ -56,9 +56,17 @@ pub struct Token(String);
 impl Token {
     /// Read a token file. Owner-only (`0600`, or stricter) is enforced on Unix;
     /// the value is trimmed and must be non-empty with no control characters.
+    /// A missing file is the typed [`AgentError::TokenMissing`], not a generic
+    /// token error, so callers can print the acquisition instruction.
     pub fn load(path: &Path) -> Result<Self, AgentError> {
         let meta = std::fs::metadata(path).map_err(|error| {
-            AgentError::Token(format!("read token file {}: {error}", path.display()))
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AgentError::TokenMissing {
+                    path: path.display().to_string(),
+                }
+            } else {
+                AgentError::Token(format!("read token file {}: {error}", path.display()))
+            }
         })?;
         #[cfg(unix)]
         {
@@ -97,6 +105,31 @@ impl Token {
     pub fn header_value(&self) -> String {
         format!("Bearer {}", self.0)
     }
+
+    /// Last four characters only, for a human-recognisable status line. This is
+    /// deliberately not a hash of the secret and never includes the full value;
+    /// a token shorter than five characters is fully masked.
+    pub fn fingerprint(&self) -> String {
+        let chars: Vec<char> = self.0.chars().collect();
+        if chars.len() <= 4 {
+            "…".to_string()
+        } else {
+            let tail: String = chars[chars.len() - 4..].iter().collect();
+            format!("…{tail}")
+        }
+    }
+
+    /// A safe status fragment: `token=<path> (…a1b2)`. The path is not secret;
+    /// the value never appears.
+    pub fn describe(&self, path: &Path) -> String {
+        format!("token={} ({})", path.display(), self.fingerprint())
+    }
+
+    /// Test-only constructor; integration tests load real owner-only files.
+    #[cfg(test)]
+    pub fn from_test(value: &str) -> Self {
+        Self(value.to_string())
+    }
 }
 
 impl fmt::Debug for Token {
@@ -132,6 +165,11 @@ pub enum AgentError {
     Offline,
     /// HTTP 401: the bearer was missing, wrong, or revoked.
     Unauthorized { endpoint: String },
+    /// HTTP 404 for a chat-scoped request: the configured chat id is wrong.
+    ChatNotFound { endpoint: String },
+    /// Nothing is listening at the configured local endpoint. For Beeper this
+    /// means the Desktop local API is not enabled (a human app-settings step).
+    NotEnabled { endpoint: String },
     /// HTTP 502/503/504: the provisioning service is up but the phone/Iroh hop
     /// is not. Reported as degraded, never as queued/delivered.
     Degraded { endpoint: String, status: u16 },
@@ -143,7 +181,9 @@ pub enum AgentError {
     /// library's message; it never contains the token because the token is only
     /// sent in a header.
     Transport { endpoint: String, detail: String },
-    /// Token file missing, unreadable, or not owner-only. The path may be
+    /// Token file missing. Carries the path only, never a value.
+    TokenMissing { path: String },
+    /// Token file unreadable, empty, or not owner-only. The path may be
     /// printed; the token value may not (it is never included).
     Token(String),
     /// A local precondition (empty text, bad request id, missing conversation).
@@ -157,6 +197,13 @@ impl fmt::Display for AgentError {
             Self::Unauthorized { endpoint } => {
                 write!(f, "401 unauthorized for {endpoint}")
             }
+            Self::ChatNotFound { endpoint } => {
+                write!(f, "chat-not-found: no such chat at {endpoint}")
+            }
+            Self::NotEnabled { endpoint } => write!(
+                f,
+                "not-enabled: nothing is listening at {endpoint} (Beeper local API is not enabled)"
+            ),
             Self::Degraded { endpoint, status } => write!(
                 f,
                 "degraded: HTTP {status} from {endpoint} (phone/Iroh hop unavailable)"
@@ -167,6 +214,9 @@ impl fmt::Display for AgentError {
             }
             Self::Transport { endpoint, detail } => {
                 write!(f, "request to {endpoint} failed: {detail}")
+            }
+            Self::TokenMissing { path } => {
+                write!(f, "token-missing: token file {path} does not exist")
             }
             Self::Token(detail) => write!(f, "token: {detail}"),
             Self::Refused(detail) => write!(f, "refused: {detail}"),
@@ -182,8 +232,27 @@ impl AgentError {
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Unauthorized { .. } => Some(401),
+            Self::ChatNotFound { .. } => Some(404),
             Self::Degraded { status, .. } | Self::Http { status, .. } => Some(*status),
             _ => None,
+        }
+    }
+
+    /// Stable machine-readable code used by `bridge status` and probe output.
+    /// Never includes a token or message text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::ChatNotFound { .. } => "chat-not-found",
+            Self::NotEnabled { .. } => "not-enabled",
+            Self::Degraded { .. } => "degraded",
+            Self::Http { .. } => "http-error",
+            Self::Protocol { .. } => "protocol-error",
+            Self::Transport { .. } => "transport-error",
+            Self::TokenMissing { .. } => "token-missing",
+            Self::Token(_) => "token-error",
+            Self::Refused(_) => "refused",
         }
     }
 
