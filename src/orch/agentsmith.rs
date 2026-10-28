@@ -211,11 +211,22 @@ pub fn role(session: &str) -> Option<Role> {
 
 /// Explicit `role` first, then `session`. Unknown explicit roles are ignored so
 /// a future role (`muse`, `orch`) is not mis-read as a worker.
+///
+/// 2026-10-28 outage: the `pm-*` session rule is not enough on its own. A fleet
+/// worker pane can live *inside* a `pm-<vertical>` tmux session (observed:
+/// `review-engine` in session `pm-fleet`). That row was classified as the PM,
+/// producing a duplicate `fleet-pm-fleet-v1` key and failing the whole roster
+/// closed - every bridge cycle errored, so both inbound and outbound stopped.
+/// The PM chat is the row whose name IS its session; anything else sharing a
+/// `pm-*` session is a worker and is not the PM identity.
 pub fn row_role(row: &Row) -> Option<Role> {
     match row.role.as_deref().map(str::trim) {
         Some(role) if role.eq_ignore_ascii_case("pm") => Some(Role::Pm),
         Some(role) if role.eq_ignore_ascii_case("worker") => Some(Role::Worker),
-        _ => role(&row.session),
+        _ => match role(&row.session) {
+            Some(Role::Pm) if row.name.trim() != row.session.trim() => Some(Role::Worker),
+            other => other,
+        },
     }
 }
 
@@ -550,6 +561,21 @@ mod tests {
         assert_eq!(roster.rows.len(), 1);
         assert_eq!(roster.rows[0].host, STUDIO);
         assert_eq!(roster.rows[0].role.as_deref(), Some("pm"));
+    }
+
+    #[test]
+    fn a_worker_inside_a_pm_session_is_not_the_pm() {
+        // Regression: `review-engine` runs in tmux session `pm-fleet`; treating
+        // it as the PM duplicated `fleet-pm-fleet-v1` and failed the roster
+        // closed, stopping every bridge cycle.
+        let worker = row("review-engine", "pm-fleet", Some("%189"), "working");
+        assert_eq!(row_role(&worker), Some(Role::Worker));
+        let pm = row("pm-fleet", "pm-fleet", Some("%33"), "idle");
+        assert_eq!(row_role(&pm), Some(Role::Pm));
+        // An explicit role still wins in both directions.
+        let mut explicit = row("review-engine", "pm-fleet", Some("%189"), "working");
+        explicit.role = Some("pm".into());
+        assert_eq!(row_role(&explicit), Some(Role::Pm));
     }
 
     #[test]
