@@ -543,3 +543,63 @@ fn reference_is_the_required_beeper_shape() {
     let transport = BeeperTransport::new(client, CHAT.into(), 50);
     assert_eq!(transport.reference(CHAT, "m-1"), "rakazo:beeper:chat-1:m-1");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_with_empty_chat_id_lists_chats_instead_of_erroring() {
+    let dir = TempDir::new().unwrap();
+    let token_path = token_file(&dir);
+    let fixture = start_fixture(
+        CHAT,
+        vec![json!({"id": "m-1", "isSender": false, "text": "secret message text"})],
+    )
+    .await;
+    let client = BeeperClient::new(
+        Some(&fixture.base_url),
+        token(&token_path),
+        UreqBeeperHttp::new(),
+    )
+    .unwrap();
+    // `chat_id = ""` must not fail the probe: the chat list is the useful first
+    // run after the human enables the API.
+    let report = client.probe(Some(""));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.info_status, Some(200));
+    assert_eq!(report.chats_status, Some(200));
+    assert_eq!(report.chat_status, None);
+    assert_eq!(report.chats[0].0, "chat-1");
+    let text = report.lines().join("\n");
+    assert!(text.contains("chat_id\tchat-1\tMuse [WhatsApp]"), "{text}");
+    assert!(!text.contains("secret message text"), "{text}");
+    assert!(!text.contains(SECRET), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_chat_id_polls_and_sends_against_fixture_transport() {
+    let dir = TempDir::new().unwrap();
+    let token_path = token_file(&dir);
+    let fixture = start_fixture(
+        CHAT,
+        vec![json!({"id": "m-1", "isSender": false, "text": "hello"})],
+    )
+    .await;
+    let client = BeeperClient::new(
+        Some(&fixture.base_url),
+        token(&token_path),
+        UreqBeeperHttp::new(),
+    )
+    .unwrap();
+    let mut transport = BeeperTransport::new(client, CHAT.into(), 50);
+    let inbound = transport.poll().unwrap();
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].message.native_id, "m-1");
+    let outcome = transport
+        .send(&rakazo_beeper::ohm::AgentOutbound {
+            conversation_id: CHAT.into(),
+            request_id: "req-1".into(),
+            text: "answer".into(),
+            identity: None,
+        })
+        .unwrap();
+    assert_eq!(outcome, rakazo_beeper::ohm::AgentSendOutcome::Queued);
+    assert_eq!(fixture.posts(), 1);
+}

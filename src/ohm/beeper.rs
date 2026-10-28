@@ -422,7 +422,7 @@ impl<H: BeeperHttp> BeeperClient<H> {
                 report.errors.push(error);
             }
         }
-        if let Some(chat_id) = chat_id {
+        if let Some(chat_id) = chat_id.filter(|chat_id| !chat_id.trim().is_empty()) {
             report.chat_path = Some(chat_path(chat_id).unwrap_or_else(|_| chat_id.to_string()));
             match self.chat(chat_id) {
                 Ok(chat) => {
@@ -434,6 +434,11 @@ impl<H: BeeperHttp> BeeperClient<H> {
                     report.errors.push(error);
                 }
             }
+        } else {
+            // First run after the human enables the API: there is no chat_id
+            // yet. The chat list above is the useful answer; do not turn an
+            // absent/empty chat id into a probe failure.
+            report.chat_status = None;
         }
         report
     }
@@ -592,10 +597,38 @@ fn outcome_word(status: Option<u16>) -> &'static str {
     }
 }
 
+/// The chat id required by the poll/reply paths, or an actionable refusal.
+/// `agent-probe` deliberately does not call this: it must be able to list chats
+/// when no id has been chosen yet. The message includes the exact probe command
+/// with the config path the caller was given.
+pub fn chat_id_for_send(agent: &AgentConfig, ohm_config: &Path) -> Result<String, AgentError> {
+    match agent
+        .chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|chat_id| !chat_id.is_empty())
+    {
+        Some(chat_id) => Ok(chat_id.to_string()),
+        None => Err(AgentError::Refused(format!(
+            "agent {} has no chat_id; run `rakazo-beeper ohm --ohm-config {} agent-probe --agent {}` and read field `chat_id` from the output, then set chat_id in {}",
+            agent.key,
+            ohm_config.display(),
+            agent.key,
+            ohm_config.display()
+        ))),
+    }
+}
+
 /// The real provider for one Beeper chat.
+///
+/// `chat_id` may be absent: poll/reply then fail with the same actionable
+/// refusal rather than a riddle, while `agent-probe` (which never constructs
+/// this transport) still lists chats. The message includes the exact probe
+/// command with the caller's config path.
 pub struct BeeperTransport<H: BeeperHttp = UreqBeeperHttp> {
     client: BeeperClient<H>,
-    chat_id: String,
+    chat_id: Option<String>,
+    missing_chat_error: Option<String>,
     limit: usize,
     last_receipt_id: Option<String>,
 }
@@ -604,34 +637,74 @@ impl<H: BeeperHttp> BeeperTransport<H> {
     pub fn new(client: BeeperClient<H>, chat_id: String, limit: usize) -> Self {
         Self {
             client,
-            chat_id,
+            chat_id: Some(chat_id),
+            missing_chat_error: None,
             limit,
             last_receipt_id: None,
         }
     }
 
-    pub fn chat_id(&self) -> &str {
-        &self.chat_id
+    /// Build from the config entry. A missing/empty `chat_id` is retained as a
+    /// typed error returned by both `poll` and `send`; it is never a silent
+    /// empty-chat request.
+    pub fn from_agent(
+        client: BeeperClient<H>,
+        agent: &AgentConfig,
+        ohm_config: &Path,
+        limit: usize,
+    ) -> Self {
+        match chat_id_for_send(agent, ohm_config) {
+            Ok(chat_id) => Self {
+                client,
+                chat_id: Some(chat_id),
+                missing_chat_error: None,
+                limit,
+                last_receipt_id: None,
+            },
+            Err(error) => Self {
+                client,
+                chat_id: None,
+                missing_chat_error: Some(error.to_string()),
+                limit,
+                last_receipt_id: None,
+            },
+        }
+    }
+
+    pub fn chat_id(&self) -> Option<&str> {
+        self.chat_id.as_deref()
+    }
+
+    fn required_chat_id(&self) -> Result<&str, AgentError> {
+        self.chat_id.as_deref().ok_or_else(|| {
+            AgentError::Refused(
+                self.missing_chat_error
+                    .clone()
+                    .unwrap_or_else(|| "agent has no chat_id".to_string()),
+            )
+        })
     }
 }
 
 impl<H: BeeperHttp> AgentTransport for BeeperTransport<H> {
     fn poll(&mut self) -> Result<Vec<AgentInbound>, AgentError> {
-        let messages = self.client.messages(&self.chat_id, self.limit)?;
+        let chat_id = self.required_chat_id()?.to_string();
+        let messages = self.client.messages(&chat_id, self.limit)?;
         Ok(messages
             .into_iter()
             .map(|message| AgentInbound {
-                conversation_id: self.chat_id.clone(),
+                conversation_id: chat_id.clone(),
                 message: message.into_native(),
             })
             .collect())
     }
 
     fn send(&mut self, outbound: &AgentOutbound) -> Result<AgentSendOutcome, AgentError> {
+        let chat_id = self.required_chat_id()?.to_string();
         if outbound.text.trim().is_empty() {
             return Err(AgentError::Refused("refusing empty reply text".into()));
         }
-        match self.client.send(&self.chat_id, &outbound.text) {
+        match self.client.send(&chat_id, &outbound.text) {
             Ok(id) => {
                 self.last_receipt_id = Some(id);
                 Ok(AgentSendOutcome::Queued)
@@ -645,7 +718,7 @@ impl<H: BeeperHttp> AgentTransport for BeeperTransport<H> {
                 // original typed error, not a fake success.
                 if let Ok(Some(id)) =
                     self.client
-                        .find_recent_self_text(&self.chat_id, &outbound.text, 25)
+                        .find_recent_self_text(&chat_id, &outbound.text, 25)
                 {
                     self.last_receipt_id = Some(id);
                     return Ok(AgentSendOutcome::Queued);
@@ -661,8 +734,13 @@ impl<H: BeeperHttp> AgentTransport for BeeperTransport<H> {
     }
 
     fn reference(&self, _conversation_id: &str, native_id: &str) -> String {
-        // Required shape: rakazo:beeper:<chatID>:<messageID>.
-        format!("rakazo:beeper:{}:{native_id}", self.chat_id)
+        // Required shape: rakazo:beeper:<chatID>:<messageID>. A missing chat id
+        // cannot reach delivery (poll fails first), so the placeholder is only
+        // for a defensive formatting path.
+        format!(
+            "rakazo:beeper:{}:{native_id}",
+            self.chat_id.as_deref().unwrap_or("<chat_id>")
+        )
     }
 }
 
@@ -797,6 +875,56 @@ mod tests {
         .unwrap();
         let error = client.send("chat:1", "hi").unwrap_err();
         assert_eq!(error.code(), "protocol-error");
+    }
+
+    fn agent_with_chat(chat_id: Option<&str>) -> AgentConfig {
+        AgentConfig {
+            key: "muse".into(),
+            kind: "external".into(),
+            transport: super::super::AgentTransportKind::Beeper,
+            base_url: Some("http://127.0.0.1:23373".into()),
+            token_file: Some(PathBuf::from("/tmp/beeper-token")),
+            conversation_id: None,
+            chat_id: chat_id.map(str::to_string),
+            platform: None,
+            remote_id: None,
+            label: Some("Muse".into()),
+            poll_seconds: 10,
+            worker: Some("muse".into()),
+            state_file: None,
+            limit: 50,
+        }
+    }
+
+    #[test]
+    fn missing_chat_id_fails_poll_and_reply_with_the_probe_command() {
+        for chat_id in [None, Some("")] {
+            let client = BeeperClient::new(
+                Some("http://127.0.0.1:23373"),
+                Token::from_test("secret-token"),
+                FakeHttp,
+            )
+            .unwrap();
+            let mut transport = BeeperTransport::from_agent(
+                client,
+                &agent_with_chat(chat_id),
+                Path::new("/tmp/ohm-muse.toml"),
+                50,
+            );
+            let poll = transport.poll().unwrap_err();
+            let poll_text = poll.to_string();
+            assert!(poll_text.contains("run `rakazo-beeper ohm --ohm-config /tmp/ohm-muse.toml agent-probe --agent muse`"), "{poll_text}");
+            assert!(poll_text.contains("field `chat_id`"), "{poll_text}");
+            let reply = transport
+                .send(&AgentOutbound {
+                    conversation_id: "chat-1".into(),
+                    request_id: "req-1".into(),
+                    text: "hi".into(),
+                    identity: None,
+                })
+                .unwrap_err();
+            assert_eq!(reply.to_string(), poll_text);
+        }
     }
 
     #[derive(Clone, Default)]

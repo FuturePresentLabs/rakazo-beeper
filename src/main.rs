@@ -1612,7 +1612,7 @@ async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
             dry_run,
         } => {
             let config = OhmConfig::load(path)?;
-            agent_reply(&config, agent, text, request_id.as_deref(), *dry_run)?;
+            agent_reply(&config, path, agent, text, request_id.as_deref(), *dry_run)?;
         }
         OhmCommand::AgentServe {
             agent,
@@ -1620,7 +1620,7 @@ async fn ohm_command(path: &Path, command: &OhmCommand) -> Result<()> {
             once,
         } => {
             let config = OhmConfig::load(path)?;
-            agent_serve(&config, agent.as_deref(), *interval_seconds, *once).await?;
+            agent_serve(&config, path, agent.as_deref(), *interval_seconds, *once).await?;
         }
     }
     Ok(())
@@ -1682,7 +1682,12 @@ fn agent_probe(config: &rakazo_beeper::ohm::OhmConfig, selected: Option<&str>) -
             println!("{}\t{}\ttransport=beeper", agent.key, token.describe(&path));
             let client = BeeperClient::new(Some(base), token, UreqBeeperHttp::new())
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let report = client.probe(agent.chat_id.as_deref());
+            let report = client.probe(
+                agent
+                    .chat_id
+                    .as_deref()
+                    .filter(|chat_id| !chat_id.trim().is_empty()),
+            );
             for line in report.lines() {
                 println!("{}\t{line}", agent.key);
             }
@@ -1713,6 +1718,7 @@ fn agent_probe(config: &rakazo_beeper::ohm::OhmConfig, selected: Option<&str>) -
 
 fn agent_reply(
     config: &rakazo_beeper::ohm::OhmConfig,
+    config_path: &Path,
     key: &str,
     text: &str,
     request_id: Option<&str>,
@@ -1739,12 +1745,8 @@ fn agent_reply(
         .unwrap_or_else(|| stable_request_id(&agent.key, text));
 
     if agent.transport == AgentTransportKind::Beeper {
-        let chat_id = agent.chat_id.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent {} has no chat_id; read it from GET /v1/chats (agent-probe lists ids)",
-                agent.key
-            )
-        })?;
+        let chat_id = beeper::chat_id_for_send(agent, config_path)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let path = agent.token_path()?;
         let token = agent_token(agent)?;
         println!("{}\t{}", agent.key, token.describe(&path));
@@ -1832,6 +1834,7 @@ fn agent_reply(
 
 async fn agent_serve(
     config: &rakazo_beeper::ohm::OhmConfig,
+    config_path: &Path,
     selected: Option<&str>,
     interval_seconds: Option<u64>,
     once: bool,
@@ -1858,12 +1861,8 @@ async fn agent_serve(
     let interval = interval_seconds.unwrap_or_else(|| agent.poll_seconds());
 
     if agent.transport == AgentTransportKind::Beeper {
-        let chat_id = agent.chat_id.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent {} has no chat_id; read it from GET /v1/chats (agent-probe lists ids)",
-                agent.key
-            )
-        })?;
+        let chat_id = beeper::chat_id_for_send(agent, config_path)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let path = agent.token_path()?;
         let token = agent_token(agent)?;
         // Startup line: path + last 4 only, never the secret. `status()` also
