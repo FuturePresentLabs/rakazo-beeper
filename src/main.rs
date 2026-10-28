@@ -327,6 +327,19 @@ enum OrchCommand {
         #[arg(long)]
         nonce: Option<String>,
     },
+    /// Add one tapback (`threads.react`) to a message in an agent's conversation.
+    React {
+        /// Agent id, spawnKey, or roster name.
+        bot: String,
+        /// Rakazo message id to react to.
+        message: String,
+        /// One of the server's fixed reactions: 👍 👎 ❤️ 😂 🎉 😮.
+        emoji: String,
+        /// Remove the reaction. Rakazo exposes no removal RPC, so this fails
+        /// explicitly rather than pretending locally.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Relay new user messages from the allowlisted conversation to the
     /// orchestrator notification queue (inbound only; no assistant append).
     Watch {
@@ -831,6 +844,28 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
                 ),
             }
         }
+        OrchCommand::React {
+            bot,
+            message,
+            emoji,
+            remove,
+        } => {
+            anyhow::ensure!(
+                !*remove,
+                "Rakazo has no reaction-removal RPC: `threads/unreact` returns 404 and \
+                 `threads.react` rejects an empty reaction. Remove the tapback in the Rakazo UI."
+            );
+            anyhow::ensure!(
+                rakazo_beeper::rich::ALLOWED_REACTIONS.contains(&emoji.as_str()),
+                "unsupported reaction {emoji}; Rakazo accepts {:?}",
+                rakazo_beeper::rich::ALLOWED_REACTIONS
+            );
+            anyhow::ensure!(!message.trim().is_empty(), "message id must not be empty");
+            let id = resolve_id(&orch, bot).await?;
+            let nonce = random_nonce();
+            orch.rakazo.react(&id, message, emoji, &nonce).await?;
+            println!("sent\tok\tbot={id}\tmessage={message}\temoji={emoji}\tnonce={nonce}");
+        }
         OrchCommand::Watch {
             once,
             interval_s,
@@ -866,8 +901,8 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             loop {
                 match watch.poll_once().await {
                     Ok(report) => println!(
-                        "poll\tdelivered={}\tduplicates={}\tignored={}",
-                        report.delivered, report.duplicates, report.ignored
+                        "poll\tdelivered={}\tduplicates={}\tignored={}\treactions={}",
+                        report.delivered, report.duplicates, report.ignored, report.reactions
                     ),
                     Err(error) => {
                         tracing::warn!(error = %error, "watch poll failed; watermark unchanged");
@@ -2082,5 +2117,54 @@ mod serve_cli_tests {
         assert!(
             Cli::try_parse_from(["rakazo-beeper", "bridge", "serve", "--interval-s", "0"]).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod orch_react_cli_tests {
+    use super::{Cli, Command, OrchCommand};
+    use clap::Parser;
+
+    fn react(args: &[&str]) -> (String, String, String, bool) {
+        let cli = Cli::try_parse_from(args).expect("orch react CLI must parse");
+        match cli.command {
+            Command::Orch {
+                command:
+                    OrchCommand::React {
+                        bot,
+                        message,
+                        emoji,
+                        remove,
+                    },
+            } => (bot, message, emoji, remove),
+            _ => panic!("expected orch react"),
+        }
+    }
+
+    #[test]
+    fn orch_react_parses_bot_message_emoji_and_remove() {
+        let (bot, message, emoji, remove) = react(&[
+            "rakazo-beeper",
+            "orch",
+            "react",
+            "fleet-orch-v1",
+            "message-9",
+            "👍",
+        ]);
+        assert_eq!(bot, "fleet-orch-v1");
+        assert_eq!(message, "message-9");
+        assert_eq!(emoji, "👍");
+        assert!(!remove);
+
+        let (_, _, _, remove) = react(&[
+            "rakazo-beeper",
+            "orch",
+            "react",
+            "fleet-orch-v1",
+            "message-9",
+            "👍",
+            "--remove",
+        ]);
+        assert!(remove);
     }
 }

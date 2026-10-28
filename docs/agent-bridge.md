@@ -196,6 +196,25 @@ lifetime, deterministic `seen:<msgid>` nonce, never on duplicates/bot rows). A
 reaction failure is logged (`report.seen_failed`) and never fails the delivery
 or rewinds the watermark. The tapback is not removed when the reply lands.
 
+Inbound tapbacks are state, not transcript rows. Each poll reads the newest
+page's `reactions` field and records
+`rakazo:<conversation>:<message>:<emoji>` in the watch ledger. The first scan is
+a baseline (enabling a watcher never replays existing tapbacks); afterwards a
+new emoji produces exactly one notification line under that stable ref, and a
+re-poll with no change is silent. Count/`mine` changes update the stored state
+without emitting a duplicate line.
+
+Send a tapback explicitly with the agent id, spawnKey, or roster name:
+
+```bash
+$BIN orch react 'PM · Rakazo' <message-id> '👍'
+# sent  ok  bot=…  message=…  emoji=👍  nonce=…
+```
+
+Rakazo has no reaction-removal RPC (`threads/unreact` is 404 and an empty
+`reaction` is rejected), so `orch react … --remove` fails with that limitation
+instead of faking a local removal; remove it in the Rakazo UI.
+
 The reply resolves the agent through the roster, refuses if the requested bot is
 not that agent's, reads exactly that agent's token, and calls
 `threads.appendAssistant`. `threads.send` is never used for a bot reply, and no
