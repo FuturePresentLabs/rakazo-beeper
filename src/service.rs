@@ -567,6 +567,7 @@ mod selection_tests {
             spawn_key: spawn.map(str::to_string),
             archived_at: archived.then(|| "2026-10-26T00:00:00Z".into()),
             capabilities: None,
+            relay_only: None,
         }
     }
 

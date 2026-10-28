@@ -1,0 +1,36 @@
+# AgentSmith roster bridge (Slice A). Copy to config/agentsmith.toml and edit.
+#
+# The roster command is the single source of truth for the visible fleet. It is
+# run once per interval; a non-zero exit or malformed JSON is fatal — the bridge
+# never falls back to "just orch". Rows are read from `.rows[]` when that key is
+# a real array, otherwise from `.workers[]`:
+#
+#   pi-agentsmith once --json
+#
+# (`agentsmith bridge roster --json` was a proposed name that does not exist; the
+# verified command above prints 25+ live rows on the reference host.)
+
+[agentsmith]
+# Read `.rows[]` when the build exposes it, otherwise `.workers[]` (the live
+# binary on Studio exposes `.workers[]` and leaves `.rows` null).
+roster_command = ["pi-agentsmith", "once", "--json"]
+
+[bridge]
+# Explicit local identity, e.g. "averys-mac-studio". A supervisor owns only
+# roster rows whose `host` matches this value. There is NO hostname guess and no
+# default; `PI_AGENT_HOST` is the only alternative source.
+host = "averys-mac-studio"
+# One `<host>/<agent-key>.json` dedupe/watermark state file per agent. The
+# host subdirectory means moving an agent cannot inherit another host's ledger.
+state_dir = "/Users/ajmwagar/.local/share/rakazo/bridge"
+# One owner-only (0600) bot-bound service token per visible bot. Raw tokens are
+# never printed, logged, or placed in argv.
+service_token_dir = "/Users/ajmwagar/.rakazo/tokens"
+# Delivery is always `pi-notify`; `steer` is required for orch (a non-decision
+# `note` is suppressed by the inbox-delivery gate).
+notify_kind = "steer"
+notify_urgent = true
+# Default: orch + every PM + muse, no worker bots and no worker tokens. An
+# upstream `bridge.hide_workers` in the roster payload wins over this value when
+# AgentSmith publishes it.
+hide_workers = true

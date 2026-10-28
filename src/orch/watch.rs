@@ -14,7 +14,7 @@
 //! never advances the watermark.
 
 use crate::orch::Allowlist;
-use crate::rakazo::{Bot, Message, Rakazo};
+use crate::rakazo::{Bot, Message, NewBot, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,10 +38,44 @@ pub fn now_rfc3339() -> String {
 
 /// Read side of a Rakazo conversation. Production is [`Rakazo`]; tests inject a
 /// scripted fake so no live call is ever made.
+/// The create spec for a bot the bridge owns. Owned (no borrowed lifetimes) so
+/// the source trait stays object-free and testable. Every fleet bot created by
+/// Slice A is `relay_only`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewAgentBot {
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub spawn_key: String,
+    pub relay_only: bool,
+}
+
 pub trait RakazoSource {
     fn bots(&self) -> impl Future<Output = Result<Vec<Bot>>> + Send;
     fn fetch_after(&self, bot: &str, seq: i64)
     -> impl Future<Output = Result<Vec<Message>>> + Send;
+
+    /// Idempotent `bots.create`. Sources that cannot create bots (tests,
+    /// read-only clients) inherit a fail-closed default.
+    fn create_bot(&self, bot: NewAgentBot) -> impl Future<Output = Result<Bot>> + Send {
+        let _ = bot;
+        async move { anyhow::bail!("this roster source cannot create bots") }
+    }
+
+    /// Archive a bot we own. Same fail-closed default as [`create_bot`].
+    ///
+    /// [`create_bot`]: RakazoSource::create_bot
+    fn archive_bot(&self, bot: &str) -> impl Future<Output = Result<()>> + Send {
+        let _ = bot;
+        async move { anyhow::bail!("this roster source cannot archive bots") }
+    }
+
+    /// Highest committed sequence in a conversation, used only to seed a fresh
+    /// state file so enabling a supervisor does not replay history into panes.
+    fn latest_seq(&self, bot: &str) -> impl Future<Output = Result<i64>> + Send {
+        let _ = bot;
+        async move { anyhow::bail!("this roster source cannot read a conversation head") }
+    }
 }
 
 impl RakazoSource for Rakazo {
@@ -56,6 +90,37 @@ impl RakazoSource for Rakazo {
     ) -> impl Future<Output = Result<Vec<Message>>> + Send {
         Rakazo::after(self, bot, seq)
     }
+
+    fn create_bot(&self, bot: NewAgentBot) -> impl Future<Output = Result<Bot>> + Send {
+        let client = self.clone();
+        async move {
+            client
+                .create_bot(&NewBot {
+                    name: &bot.name,
+                    title: &bot.title,
+                    description: &bot.description,
+                    instructions: &bot.description,
+                    notify_on_finish: false,
+                    spawn_key: &bot.spawn_key,
+                    // Never take over the deployment's shared computer.
+                    computer_mode: "team",
+                    relay_only: bot.relay_only,
+                })
+                .await
+        }
+    }
+
+    fn archive_bot(&self, bot: &str) -> impl Future<Output = Result<()>> + Send {
+        let client = self.clone();
+        let bot = bot.to_string();
+        async move { client.archive_bot(&bot).await }
+    }
+
+    fn latest_seq(&self, bot: &str) -> impl Future<Output = Result<i64>> + Send {
+        let client = self.clone();
+        let bot = bot.to_string();
+        async move { client.head_seq(&bot).await }
+    }
 }
 
 /// Delivery side effect. The only production impl is [`PiNotify`].
@@ -67,32 +132,83 @@ pub trait Notifier {
 ///
 /// `steer` is the wake kind; a `note` addressed to orch is suppressed by the
 /// inbox-delivery gate as a non-decision. The notifier never pastes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PiNotify;
+#[derive(Clone, Debug)]
+pub struct PiNotify {
+    /// `pi-notify --kind`. Defaults to `steer` (a `note` addressed to orch is
+    /// suppressed as a non-decision).
+    pub kind: String,
+    /// `pi-notify --urgent`. Defaults to on.
+    pub urgent: bool,
+}
+
+impl Default for PiNotify {
+    fn default() -> Self {
+        Self {
+            kind: Self::KIND.to_string(),
+            urgent: true,
+        }
+    }
+}
 
 impl PiNotify {
     pub const KIND: &'static str = "steer";
 
+    /// Configured notifier, as read from `[bridge] notify_kind/notify_urgent`.
+    pub fn configured(kind: &str, urgent: bool) -> Self {
+        Self {
+            kind: kind.to_string(),
+            urgent,
+        }
+    }
+
     /// The full argument vector. `--ref` is `rakazo:<conversation>:<message>`.
     pub fn command_args(worker: &str, reference: &str, text: &str) -> Vec<String> {
-        vec![
+        Self::default().command_args_with(worker, reference, text)
+    }
+
+    pub fn command_args_with(&self, worker: &str, reference: &str, text: &str) -> Vec<String> {
+        self.command_args_for(worker, None, reference, text)
+    }
+
+    /// `target` addresses the row at one pane/session (`--target`). Without it
+    /// a row is addressed to the orchestrator lane, which is only correct for
+    /// the orchestrator itself.
+    pub fn command_args_for(
+        &self,
+        worker: &str,
+        target: Option<&str>,
+        reference: &str,
+        text: &str,
+    ) -> Vec<String> {
+        let mut args = vec![
             "send".to_string(),
             "--kind".to_string(),
-            Self::KIND.to_string(),
+            self.kind.clone(),
             "--worker".to_string(),
             worker.to_string(),
-            "--urgent".to_string(),
+        ];
+        if let Some(target) = target.filter(|target| !target.trim().is_empty()) {
+            args.push("--target".to_string());
+            args.push(target.to_string());
+        }
+        if self.urgent {
+            args.push("--urgent".to_string());
+        }
+        args.extend([
             "--ref".to_string(),
             reference.to_string(),
             "--text".to_string(),
             text.to_string(),
-        ]
+        ]);
+        args
     }
 }
 
 impl Notifier for PiNotify {
     fn notify(&self, worker: &str, reference: &str, text: &str) -> Result<()> {
-        let args = Self::command_args(worker, reference, text);
+        // The single-agent `orch watch` keeps its untargeted (orchestrator lane)
+        // behaviour; the multi-agent supervisor uses `command_args_for`.
+        let args = self.command_args_with(worker, reference, text);
         let output = Command::new("pi-notify")
             .args(&args)
             .output()
@@ -189,11 +305,13 @@ impl WatchState {
         }
     }
 
-    fn delivered(&self, id: &str) -> bool {
+    /// Was this Rakazo message id already handed to a notifier? Public so the
+    /// multi-agent supervisor shares exactly one ledger shape with `Watch`.
+    pub fn delivered(&self, id: &str) -> bool {
         self.delivered_ids.iter().any(|seen| seen == id)
     }
 
-    fn record_delivered(&mut self, id: &str) {
+    pub fn record_delivered(&mut self, id: &str) {
         if !self.delivered(id) {
             self.delivered_ids.push_back(id.to_string());
         }
@@ -202,7 +320,26 @@ impl WatchState {
         }
     }
 
-    fn is_echo(&self, message: &Message) -> bool {
+    /// Bind this ledger to one bot conversation. If the conversation changed
+    /// (a bot was re-created with a new thread), the sequence/dedupe ledger is
+    /// reset: a stale watermark from the old thread would silently drop every
+    /// row of the new one. Counters and our own nonces are kept.
+    pub fn bind_conversation(&mut self, bot_id: &str, thread_id: &str) {
+        let changed = self
+            .thread_id
+            .as_deref()
+            .is_some_and(|previous| previous != thread_id);
+        self.bot_id = bot_id.to_string();
+        self.thread_id = Some(thread_id.to_string());
+        if changed {
+            self.last_seq = 0;
+            self.delivered_ids.clear();
+            self.last_delivered_id = None;
+        }
+    }
+
+    /// Our own service-token send echoed back by the server.
+    pub fn is_echo(&self, message: &Message) -> bool {
         message
             .client_nonce
             .as_deref()
@@ -216,6 +353,8 @@ pub struct Report {
     pub delivered: usize,
     pub duplicates: usize,
     pub ignored: usize,
+    /// Rows the deliverer did not accept yet (watermark retained).
+    pub deferred: usize,
 }
 
 /// Watches exactly one bound agent's conversation.
@@ -475,6 +614,7 @@ mod tests {
             spawn_key: Some("fleet-orch-v1".into()),
             archived_at: None,
             capabilities: None,
+            relay_only: None,
         }
     }
 
@@ -734,6 +874,25 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_to_a_new_conversation_resets_the_ledger() {
+        let mut state = WatchState::default();
+        state.bind_conversation("bot-1", "thread-1");
+        state.last_seq = 42;
+        state.record_delivered("m1");
+        state.delivered_total = 1;
+        // Same conversation: keep the watermark.
+        state.bind_conversation("bot-1", "thread-1");
+        assert_eq!(state.last_seq, 42);
+        assert!(state.delivered("m1"));
+        // New conversation: a stale watermark would drop every new row.
+        state.bind_conversation("bot-1", "thread-2");
+        assert_eq!(state.last_seq, 0);
+        assert!(!state.delivered("m1"));
+        assert_eq!(state.delivered_total, 1, "counters are kept");
+        assert_eq!(state.thread_id.as_deref(), Some("thread-2"));
+    }
+
+    #[test]
     fn notify_command_is_pi_notify_steer_with_ref_and_no_tmux() {
         let args = PiNotify::command_args("fleet-orch-v1", "rakazo:t:m", "body");
         assert_eq!(args[0], "send");
@@ -745,6 +904,22 @@ mod tests {
         let joined = args.join(" ");
         assert!(!joined.contains("pi-tmux"), "{joined}");
         assert!(!joined.contains(concat!("send", "-keys")), "{joined}");
+    }
+
+    #[test]
+    fn a_targeted_row_addresses_exactly_one_pane() {
+        let notifier = PiNotify::default();
+        let args = notifier.command_args_for("pm-fpl", Some("%40"), "rakazo:t:m", "body");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--target", "%40"]),
+            "{args:?}"
+        );
+        // The orchestrator lane is untargeted: the orch pane consumes it.
+        let args = notifier.command_args_for("fleet-orch-v1", None, "rakazo:t:m", "body");
+        assert!(!args.iter().any(|arg| arg == "--target"), "{args:?}");
+        // Empty target is not emitted as an empty --target value.
+        let args = notifier.command_args_for("x", Some("  "), "r", "body");
+        assert!(!args.iter().any(|arg| arg == "--target"), "{args:?}");
     }
 
     #[test]

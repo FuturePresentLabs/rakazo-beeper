@@ -7,8 +7,11 @@
 //!
 //! Design and gaps: `docs/orchestrator-in-rakazo.md`.
 
+pub mod agentsmith;
+pub mod bridge;
 pub mod reply;
 pub mod roster;
+pub mod supervisor;
 pub mod watch;
 
 use crate::fleet::{BotKey, Entry as RouteEntry, Table};
@@ -244,6 +247,8 @@ impl Orch {
                 spawn_key: &entry.key,
                 // A fleet entry must never take over the deployment's shared computer.
                 computer_mode: "team",
+                // Relay-only: append assistant messages, never run a model.
+                relay_only: true,
             })
             .await
     }
@@ -321,6 +326,7 @@ mod tests {
             spawn_key: spawn.map(str::to_string),
             archived_at: archived.map(str::to_string),
             capabilities: None,
+            relay_only: None,
         }
     }
 

@@ -140,6 +140,7 @@ mod tests {
             spawn_key: None,
             archived_at: None,
             capabilities,
+            relay_only: None,
         }
     }
 
