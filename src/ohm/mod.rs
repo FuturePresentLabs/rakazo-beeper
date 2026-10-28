@@ -210,13 +210,10 @@ impl AgentConfig {
                 self.key
             ),
             AgentTransportKind::Beeper => {
-                if let Some(chat_id) = &self.chat_id {
-                    ensure!(
-                        !chat_id.trim().is_empty(),
-                        "agent {} chat_id must not be empty",
-                        self.key
-                    );
-                }
+                // An empty chat_id is allowed at config load so `agent-probe`
+                // can be the first command a human runs after enabling the API:
+                // it lists chats instead of failing before any status. Commands
+                // that actually need a chat (serve/reply) require it explicitly.
             }
         }
         if let Some(base) = &self.base_url {
@@ -364,6 +361,17 @@ limit = 50
         config.validate().unwrap();
         assert_eq!(config.agents[0].transport, AgentTransportKind::Beeper);
         assert_eq!(config.agents[0].chat_id.as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn empty_chat_id_is_allowed_at_config_load_for_probe() {
+        let config: OhmConfig = toml::from_str(
+            &beeper_toml("http://127.0.0.1:23373")
+                .replace("chat_id = \"chat-1\"", "chat_id = \"\""),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agents[0].chat_id.as_deref(), Some(""));
     }
 
     #[test]
