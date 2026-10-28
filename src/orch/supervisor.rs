@@ -143,6 +143,8 @@ pub struct CycleReport {
     pub seen_failed: usize,
     /// New inbound tapbacks delivered from the poller's reaction model.
     pub reactions: usize,
+    /// Inbound tapbacks whose notification failed and was persisted for replay.
+    pub reactions_dropped: usize,
     pub errors: Vec<String>,
 }
 
@@ -155,6 +157,7 @@ impl CycleReport {
         self.seen += report.seen;
         self.seen_failed += report.seen_failed;
         self.reactions += report.reactions;
+        self.reactions_dropped += report.reactions_dropped;
     }
 }
 
@@ -525,6 +528,13 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
         .clone()
         .filter(|thread| !thread.is_empty())
         .context("agent is not bound to a conversation")?;
+    // `<state_dir>/<host>/<key>.json` is the ledger path, so its grandparent is
+    // the configured state dir that owns the drop log.
+    let state_dir = tracked
+        .state_file
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
 
     for message in messages {
         if message.seq <= tracked.state.last_seq {
@@ -639,16 +649,51 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
                 save_tracked(tracked)?;
                 changed = false;
             }
-            let outcome = deliverer
-                .deliver(
-                    &tracked.agent.key,
-                    &tracked.agent.host,
-                    delivery,
-                    delivery_target(&tracked.agent).as_deref(),
-                    &text,
-                    &reference,
-                )
-                .with_context(|| format!("deliver {reference}"))?;
+            let outcome = match deliverer.deliver(
+                &tracked.agent.key,
+                &tracked.agent.host,
+                delivery,
+                delivery_target(&tracked.agent).as_deref(),
+                &text,
+                &reference,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Tapbacks are state, not the message path: a transport error
+                    // here must not abort the agent's cycle. Mark the ref seen so
+                    // it is not retried every interval, and persist a replay row.
+                    let rendered = format!("{error:#}");
+                    tracing::warn!(
+                        agent = %tracked.agent.key,
+                        reference = %reference,
+                        message = %message.id,
+                        emoji = %reaction.emoji,
+                        error = %rendered,
+                        "reaction notify failed; recording drop"
+                    );
+                    if let Err(drop_error) = crate::orch::watch::append_reaction_drop(
+                        state_dir,
+                        &conversation,
+                        &reference,
+                        &message.id,
+                        &reaction.emoji,
+                        reaction.count,
+                        &rendered,
+                    ) {
+                        tracing::error!(
+                            agent = %tracked.agent.key,
+                            reference = %reference,
+                            error = %drop_error,
+                            "could not persist dropped reaction"
+                        );
+                    }
+                    tracked.state.record_reaction(&reference, reaction);
+                    tracked.state.reactions_dropped_total += 1;
+                    save_tracked(tracked)?;
+                    report.reactions_dropped += 1;
+                    continue;
+                }
+            };
             if outcome == Delivery::Deferred {
                 report.deferred += 1;
                 continue;

@@ -347,6 +347,9 @@ pub struct WatchState {
     /// Total reaction lines handed to the notifier since this state was created.
     #[serde(default)]
     pub reactions_total: u64,
+    /// Total reaction notifications that failed and were recorded as drops.
+    #[serde(default)]
+    pub reactions_dropped_total: u64,
 }
 
 /// Last observed state of one tapback ref.
@@ -465,6 +468,69 @@ pub fn reaction_ref(conversation: &str, message_id: &str, emoji: &str) -> String
     format!("rakazo:{conversation}:{message_id}:{emoji}")
 }
 
+/// One dropped tapback notification, persisted so it can be replayed later.
+#[derive(Debug, Serialize)]
+struct ReactionDrop<'a> {
+    ts: String,
+    #[serde(rename = "ref")]
+    reference: &'a str,
+    message_id: &'a str,
+    emoji: &'a str,
+    count: u64,
+    error: String,
+}
+
+/// Append one failed tapback to `<state_dir>/<conversation>.reactions-dropped.jsonl`.
+///
+/// The drop log is idempotent by `ref`: a lost watch-state file must not turn one
+/// failure into two replay rows. It is deliberately separate from the state
+/// ledger so the row survives even when the reaction itself is marked seen.
+pub fn append_reaction_drop(
+    state_dir: &Path,
+    conversation: &str,
+    reference: &str,
+    message_id: &str,
+    emoji: &str,
+    count: u64,
+    error: &str,
+) -> Result<()> {
+    let stem = crate::orch::agentsmith::safe_key(conversation)?;
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create reaction drop dir {}", state_dir.display()))?;
+    let path = state_dir.join(format!("{stem}.reactions-dropped.jsonl"));
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("read reaction drops {}", path.display()))?;
+        for line in existing.lines() {
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if row.get("ref").and_then(serde_json::Value::as_str) == Some(reference) {
+                return Ok(());
+            }
+        }
+    }
+    let row = ReactionDrop {
+        ts: now_rfc3339(),
+        reference,
+        message_id,
+        emoji,
+        count,
+        error: error.to_string(),
+    };
+    let mut line = serde_json::to_string(&row)?;
+    line.push('\n');
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open reaction drops {}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("append reaction drop {}", path.display()))?;
+    Ok(())
+}
+
 /// One poll's outcome.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -479,6 +545,8 @@ pub struct Report {
     pub seen_failed: usize,
     /// New inbound tapbacks delivered through the notifier.
     pub reactions: usize,
+    /// New inbound tapbacks whose notification failed and was persisted.
+    pub reactions_dropped: usize,
 }
 
 /// Watches exactly one bound agent's conversation.
@@ -487,6 +555,9 @@ pub struct Watch<S: RakazoSource, N: Notifier> {
     notifier: N,
     worker: String,
     state_file: Option<PathBuf>,
+    /// Where failed tapbacks are appended. Defaults to the watch state file's
+    /// directory; callers with a separately configured state dir can override it.
+    reaction_drop_dir: Option<PathBuf>,
     allowlist: Allowlist,
     state: WatchState,
     bound: Option<Bot>,
@@ -508,15 +579,27 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
             "orchestrator worker name is empty"
         );
         let state = WatchState::load(state_file.as_deref())?;
+        let reaction_drop_dir = state_file
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
         Ok(Self {
             source,
             notifier,
             worker: worker.to_string(),
             state_file,
+            reaction_drop_dir,
             allowlist,
             state,
             bound: None,
         })
+    }
+
+    /// Override where dropped tapbacks are persisted (`<state_dir>`).
+    pub fn with_reaction_drop_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.reaction_drop_dir = Some(state_dir.into());
+        self
     }
 
     pub fn state(&self) -> &WatchState {
@@ -705,9 +788,42 @@ impl<S: RakazoSource, N: Notifier> Watch<S, N> {
                     self.save()?;
                     changed = false;
                 }
-                self.notifier
-                    .notify(&self.worker, &reference, &text)
-                    .with_context(|| format!("notify {reference}"))?;
+                if let Err(error) = self.notifier.notify(&self.worker, &reference, &text) {
+                    // A tapback is cosmetic: a transport failure must never abort
+                    // message delivery or the rest of the cycle. Record it as seen
+                    // so the next poll does not retry it every interval, and keep
+                    // a replayable drop row with the event id.
+                    let rendered = format!("{error:#}");
+                    tracing::warn!(
+                        reference = %reference,
+                        message = %message.id,
+                        emoji = %reaction.emoji,
+                        error = %rendered,
+                        "reaction notify failed; recording drop"
+                    );
+                    if let Some(state_dir) = self.reaction_drop_dir.as_deref()
+                        && let Err(drop_error) = append_reaction_drop(
+                            state_dir,
+                            &conversation,
+                            &reference,
+                            &message.id,
+                            &reaction.emoji,
+                            reaction.count,
+                            &rendered,
+                        )
+                    {
+                        tracing::error!(
+                            reference = %reference,
+                            error = %drop_error,
+                            "could not persist dropped reaction"
+                        );
+                    }
+                    self.state.record_reaction(&reference, reaction);
+                    self.state.reactions_dropped_total += 1;
+                    self.save()?;
+                    report.reactions_dropped += 1;
+                    continue;
+                }
                 self.state.record_reaction(&reference, reaction);
                 self.state.reactions_total += 1;
                 self.state.last_delivered_id = Some(message.id.clone());
@@ -883,6 +999,33 @@ mod tests {
         allowlist: Allowlist,
     ) -> Watch<FakeSource, FakeNotifier> {
         Watch::new(source, notifier, "fleet-orch-v1", state_file, allowlist).unwrap()
+    }
+
+    /// Delivers messages normally but always fails for tapback refs, the exact
+    /// regression that used to abort a whole cycle.
+    #[derive(Default)]
+    struct ReactionFailingNotifier {
+        calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl ReactionFailingNotifier {
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Notifier for ReactionFailingNotifier {
+        fn notify(&self, worker: &str, reference: &str, text: &str) -> Result<()> {
+            if reference.starts_with("rakazo:thread-b1:m1:") {
+                anyhow::bail!("scripted reaction transport failure");
+            }
+            self.calls.lock().unwrap().push((
+                worker.to_string(),
+                reference.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -1093,6 +1236,72 @@ mod tests {
         assert!(!state.delivered("m1"));
         assert_eq!(state.delivered_total, 1, "counters are kept");
         assert_eq!(state.thread_id.as_deref(), Some("thread-2"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_reaction_notify_never_aborts_message_delivery_or_duplicates_the_drop() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("watch.json");
+        let plain = message("m1", 7, "user", "hello despite tapbacks");
+        let mut reacted = plain.clone();
+        reacted.reactions = vec![reaction("👍", 1, false)];
+        let source = FakeSource::new(
+            vec![bot("b1", "Orch")],
+            vec![Vec::new(), vec![plain], vec![reacted.clone()]],
+        )
+        .with_recent(vec![Vec::new(), vec![reacted.clone()], vec![reacted]]);
+        let mut watcher = Watch::new(
+            source,
+            ReactionFailingNotifier::default(),
+            "fleet-orch-v1",
+            Some(state_path),
+            allowlist("b1"),
+        )
+        .unwrap();
+        watcher.bind().await.unwrap();
+
+        // First poll establishes the tapback baseline without notifying.
+        watcher.poll_once().await.unwrap();
+
+        // The message still arrives even though its tapback notify fails.
+        let polled = watcher.poll_once().await.unwrap();
+        assert_eq!(polled.delivered, 1, "message delivery survives");
+        assert_eq!(polled.reactions, 0);
+        assert_eq!(polled.reactions_dropped, 1);
+        let calls = watcher.notifier.calls();
+        assert_eq!(calls.len(), 1, "only the user message was delivered");
+        assert_eq!(calls[0].1, "rakazo:thread-b1:m1");
+
+        let drop_path = dir.path().join("thread-b1.reactions-dropped.jsonl");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&drop_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one drop row");
+        assert_eq!(rows[0]["ref"], "rakazo:thread-b1:m1:👍");
+        assert_eq!(rows[0]["message_id"], "m1");
+        assert_eq!(rows[0]["emoji"], "👍");
+        assert_eq!(rows[0]["count"], 1);
+        assert!(
+            rows[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("scripted reaction transport failure"))
+        );
+        assert!(rows[0]["ts"].as_str().is_some_and(|ts| !ts.is_empty()));
+
+        // A second poll neither re-delivers the message nor duplicates the drop.
+        let again = watcher.poll_once().await.unwrap();
+        assert_eq!(again.delivered, 0);
+        assert_eq!(again.duplicates, 1);
+        assert_eq!(again.reactions_dropped, 0);
+        assert_eq!(watcher.notifier.calls().len(), 1);
+        let rows_again = std::fs::read_to_string(&drop_path).unwrap();
+        assert_eq!(
+            rows_again.lines().count(),
+            1,
+            "the drop row must not be appended twice"
+        );
     }
 
     #[tokio::test]

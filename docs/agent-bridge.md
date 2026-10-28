@@ -204,6 +204,13 @@ new emoji produces exactly one notification line under that stable ref, and a
 re-poll with no change is silent. Count/`mine` changes update the stored state
 without emitting a duplicate line.
 
+Inbound tapback notification is best-effort: a notifier failure is logged with
+the stable ref and never aborts the cycle or the user-message delivery in the
+same poll. The ref is still recorded as seen (so it is not retried every
+interval), and the drop is appended once to
+`<state_dir>/<conversation>.reactions-dropped.jsonl` as
+`{ts, ref, message_id, emoji, count, error}` for replay.
+
 Send a tapback explicitly with the agent id, spawnKey, or roster name:
 
 ```bash
