@@ -4,10 +4,18 @@ Status: **Proposed — evidence and decision only.** No bridge, daemon, transcri
 or production path was added by this document. Repo placement is a human
 decision and is not recorded as accepted here.
 
-Reconciled against `origin/main` `41a2144` (after PR #19 "auto-add orchestrator,
-PMs and Muse" and PR #20 "Muse via the self-hosted ohmOS agent-conversation
-API"). This revision only corrects statements that became stale when those two
-changes merged; no claim was added beyond code that exists on that commit.
+Reconciled against `origin/main` `ef050a3` for this revision; the original text
+was written against `41a2144` (after PR #19 "auto-add orchestrator, PMs and Muse"
+and PR #20 "Muse via the self-hosted ohmOS agent-conversation API"). The
+`41a2144` references in §7 and §12 are kept as the original evidence base and
+are labelled as such. This revision adds confidence grades and corrections only;
+no claim was added beyond code that exists on `ef050a3`.
+
+Grade legend and per-row evidence: `[C]` confirmed by an executed command,
+`[I]` read-only inference, `[?]` not checkable from this checkout. The grades for
+every factual row live in
+[`irc-bridge-inventory.md`](irc-bridge-inventory.md); the tables repeated here
+carry the same tag and a short form of the command.
 
 Companion evidence: [`irc-bridge-inventory.md`](irc-bridge-inventory.md).
 Related: [`irc-client.md`](irc-client.md),
@@ -151,11 +159,21 @@ notify/outbox.jsonl
         ▼
 pi.sendUserMessage(...)  → the target pane is woken
 
-reply direction (committed base):
-src/orch/reply.rs
-  only conversationAttachments.directSend on exactly one linked attachment
-  no assistant-append RPC; normal Agent bot = unsupported
+reply direction (two surfaces on `ef050a3`):
+  bridge reply  (src/orch/bridge.rs:378 → src/orch/mod.rs:296)
+                threads.appendAssistant with a bot-bound service token
+  orch reply    (src/orch/reply.rs)
+                only conversationAttachments.directSend on exactly one linked
+                attachment; normal Agent bot = unsupported
 ```
+
+**Correction (was stale):** the earlier revision said "no assistant-append RPC".
+`threads.appendAssistant` exists (`src/rakazo.rs:398-409`) and is the path used
+by `bridge reply`; `orch reply` remains the attachment-only surface. Verified
+with `git grep -n "appendAssistant\|append_assistant" -- src/rakazo.rs src/orch/mod.rs src/orch/bridge.rs`
+(`:409`, `:296`, `:378`). `docs/orchestrator-in-rakazo.md:77` still carries the
+old sentence and needs a separate docs fix; `docs/agent-bridge.md:181` and
+`docs/ohm-client.md:177` already describe the real path.
 
 Writers: `src/orch/watch.rs` writes only the notify row and its state file;
 `src/orch/reply.rs` writes through `directSend`; `bin/pi-notify` writes the
@@ -209,15 +227,15 @@ Writers: `bin/pi-bus` (bus rows), `bin/pi-bus-ircd.lua` (transcript/DM rows),
 
 | Ledger | Writer(s) | Primary identity |
 | --- | --- | --- |
-| `rakazo-beeper` `bridge.db` `inbox` | `src/transport.rs`, `src/service.rs` | `(tenant,event_id)` |
-| `bridge.db` `message_links`, `send_receipts`, `event_nonces` | `src/service.rs`, `src/store.rs` | `(tenant,bot,rakazo_id,part)`, `(tenant,bot,event_id)`, `(tenant,nonce)` |
-| Rakazo `messages` | Rakazo API (`threads.send`), `conversation-bots.ts::synchronize` | `clientNonce`; `native:<sha256([botId,native_id])>` |
-| `irc-inbox.sqlite` `irc_messages` | `src/irc/run.rs`, `src/irc/client.rs`, `src/irc/inbox.rs` | `msgid:` / `src:` / `chunk:` / `out:` |
-| `fleet-bus/irc/transcript-*.jsonl` | `bin/pi-bus-ircd.lua`, `bin/pi-bus-unibus`, `bin/pi-note` | FNV-1a row id; note `msg_id` |
-| `fleet-bus/notes/*.jsonl` | `bin/pi-note` | `msg_id` |
-| `notify/outbox.jsonl` | `bin/pi-notify`, `bin/pi-bus-ircd.lua`, `bin/pi-note` | row `id` + `--ref` |
-| ohmOS phone store / outbox | ohmOS messaging pump, `agent_conversation.rs` | `(owner,device,request_id)`, native id |
-| Beeper/Matrix timeline | `src/matrix.rs` | Matrix event id; `event_nonces` |
+| `rakazo-beeper` `bridge.db` `inbox` | `src/transport.rs`, `src/service.rs` | `[C]` `(tenant,event_id)`; `src/store.rs:115-120`, writer `src/service.rs:148` |
+| `bridge.db` `message_links`, `send_receipts`, `event_nonces` | `src/service.rs`, `src/store.rs` | `[C]` `(tenant,bot,rakazo_id,part)`, `(tenant,bot,event_id)`, `(tenant,nonce)`; `src/store.rs:106-109` |
+| Rakazo `messages` | Rakazo API (`threads.send`), `conversation-bots.ts::synchronize` | `[C]` `clientNonce` (`src/rakazo.rs:420`); `native:<sha256([botId,native_id])>` (`conversation-bots.ts:72-73`) |
+| `irc-inbox.sqlite` `irc_messages` | `src/irc/run.rs`, `src/irc/client.rs`, `src/irc/inbox.rs` | `[C]` `src/irc/inbox.rs:22`, `:152`, `:231`; `cargo test --offline irc::inbox::tests::` (pass) |
+| `fleet-bus/irc/transcript-*.jsonl` | `bin/pi-bus-ircd.lua`, `bin/pi-bus-unibus`, `bin/pi-note` | `[C]` FNV-1a row id `~/.pi/agent/bin/pi-bus-ircd.lua:173-182`; note `msg_id` `bin/pi-note:384` |
+| `fleet-bus/notes/*.jsonl` | `bin/pi-note` | `[C]` `msg_id` `bin/pi-note:384`; path `:25` |
+| `notify/outbox.jsonl` | `bin/pi-notify`, `bin/pi-bus-ircd.lua`, `bin/pi-note` | `[C]` row `id` + `--ref` `bin/pi-notify:54`, `:434` |
+| ohmOS phone store / outbox | ohmOS messaging pump, `agent_conversation.rs` | `[I]` `(owner,device,request_id)` read at `849e49c:crates/ohmos-msg-host/src/agent_conversation.rs:179-190`, native id `:60`; `settle with:` `cargo test -p ohmos-msg-host` |
+| Beeper/Matrix timeline | `src/matrix.rs` | `[C]` Matrix event id (`send_event :404`); `event_nonces` `src/store.rs:109` |
 
 ## 3. The Muse answer (do not conflate the two paths)
 
@@ -376,10 +394,10 @@ removed only after parity evidence.
 
 - Inventory and this ADR. No production change, no new daemon, no second
   transcript.
-- Reconciled against `origin/main` `41a2144`, which includes PR #19 (auto-add
-  orchestrator, PMs and Muse) and PR #20 (the ohmOS agent-conversation
-  provider). Rebase target and component facts in this revision are those of
-  that commit.
+- Reconciled against `origin/main` `ef050a3` in this grading pass (the original
+text used `41a2144`, which was the first commit with PR #19 "auto-add
+orchestrator, PMs and Muse" and PR #20 "the ohmOS agent-conversation
+provider"). Component facts in this revision are those of `ef050a3`; see §12.
 - Human decision on repo placement. If the decision is “new repo”, create it
   empty; do not move code yet.
 
@@ -394,8 +412,9 @@ removed only after parity evidence.
   nothing; an unknown/ambiguous outbound is never automatically resent; our own
   echo does not create an inbound row; chunk reassembly is stable.
 - This slice does **not** touch `src/orch/**` or `src/fleet/route.rs`.
-- Base: current `origin/main` (`41a2144`, which already includes the derived
-  roster, the auto-fleet selection and the ohmOS agent provider). If another
+- Base: current `origin/main` (`ef050a3` at the time of the grading pass, which
+  already includes the derived roster, the auto-fleet selection, the ohmOS
+  agent provider and the agent-bridge supervisor slice). If another
   roster/provider branch is still open in another checkout, rebase on it rather
   than duplicating its files.
 
@@ -504,11 +523,16 @@ removed only after parity evidence.
 
 ## 12. Evidence basis for this revision
 
-- Branch `pi/irc-bridge-extraction` rebased onto `origin/main` `41a2144`.
-  `git diff --stat origin/main...HEAD` shows only `docs/*.md`.
-- Every file:line citation added or corrected in this revision was checked with
-  `git grep -n` against that commit; the commands are listed in
-  `irc-bridge-inventory.md` §9.
+- Grading pass: branch `pi/bridge-inventory-confidence` on `ef050a3`.
+  `git rev-parse --short HEAD` → `ef050a3`; `git diff --stat origin/main...HEAD`
+  shows only `docs/*.md`. `cargo test --offline` → 243 passed, 0 failed.
+- Every file:line citation added or corrected in the grading pass was checked by
+  an executed `git grep`/`rg`, `git show <pin>:<path>`, or `cargo test`; the
+  commands are listed in `irc-bridge-inventory.md` §10 (the original revision's
+  commands are kept there as a second block).
+- Original evidence base: branch `pi/irc-bridge-extraction` rebased onto
+  `origin/main` `41a2144`; `git diff --stat origin/main...HEAD` showed only
+  `docs/*.md`.
 - No code, test, config, daemon, deploy, transcript or secret was added by this
   PR. No live network call, Rakazo session, ohmOS request or phone contact was
   made while writing it.
@@ -522,6 +546,8 @@ removed only after parity evidence.
   the fleet panes. The documents describe code and configuration, not uptime.
 - Whether a real Muse message currently reaches `pi-notify` end to end; the
   code path and its offline tests exist, the production invocation does not.
-- Cross-repo commits other than the pinned `rakazo-beeper` `41a2144`
-  (`fpl-agents`, `ohmos`, `agentsmith` pins are unchanged from the original
-  inventory).
+- Cross-repo commits other than `rakazo-beeper`: `fpl-agents` `826bc019`,
+  `agentsmith` `cef1e41` (both equal local HEAD), and `ohmos` `849e49c`,
+  `shared-infra` `8916e0a` (both read at the pinned commit; local HEADs have
+  moved on). The ohmOS msg-host runtime is `[I]` here (`settle with:`
+  `cargo test -p ohmos-msg-host` in `~/src/fpl/ohmos`).
