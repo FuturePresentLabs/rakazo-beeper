@@ -901,8 +901,12 @@ async fn orch_command(command: &OrchCommand) -> Result<()> {
             loop {
                 match watch.poll_once().await {
                     Ok(report) => println!(
-                        "poll\tdelivered={}\tduplicates={}\tignored={}\treactions={}",
-                        report.delivered, report.duplicates, report.ignored, report.reactions
+                        "poll\tdelivered={}\tduplicates={}\tignored={}\treactions={}\treactions_dropped={}",
+                        report.delivered,
+                        report.duplicates,
+                        report.ignored,
+                        report.reactions,
+                        report.reactions_dropped
                     ),
                     Err(error) => {
                         tracing::warn!(error = %error, "watch poll failed; watermark unchanged");
@@ -1165,7 +1169,7 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 match load(&config, &host) {
                     Ok(agents) => match supervisor.cycle(&agents).await {
                         Ok(report) => println!(
-                            "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\terrors={}",
+                            "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\treactions={}\treactions_dropped={}\terrors={}",
                             host,
                             report.agents,
                             report.owned,
@@ -1177,6 +1181,8 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                             report.deferred,
                             report.duplicates,
                             report.ignored,
+                            report.reactions,
+                            report.reactions_dropped,
                             report.errors.join(" | ")
                         ),
                         Err(error) if resident => {
