@@ -652,7 +652,9 @@ impl TenantRuntime {
             message_id: event.event_id.clone(),
             seq,
             busy,
-            // A channel the agent cannot answer is never acknowledged.
+            // A channel the agent cannot answer is never acknowledged. The
+            // room check above already failed closed when the bridge bot was
+            // no longer joined, so a selected agent here can answer here.
             can_reply: self.selected(&binding.bot),
             run_id: self
                 .store
