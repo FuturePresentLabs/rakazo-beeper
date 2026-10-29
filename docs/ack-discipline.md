@@ -1,6 +1,14 @@
 # Acknowledgement discipline
 
-Status: **implemented** (`src/fleet/ack.rs`, `src/store.rs`, `src/service.rs`).
+Status: **implemented** (`src/fleet/ack.rs`, `src/store.rs`, `src/service.rs`,
+`src/orch/supervisor.rs`).
+
+Two surfaces carry a tapback to the human, and both now obey the same policy:
+
+| surface | the tapback | the ledger | the visible admission |
+| --- | --- | --- | --- |
+| Beeper bridge (`agents.fpl.dev`) | a 👍 reaction on the human's message | `ack_obligations` in the bridge database | a message in the Beeper room |
+| agent bridge (`bridge serve`) | `threads.react` on the human's Rakazo message | `<state_dir>/<host>/<key>.acks.json` | the agent's own message in the conversation (`threads.appendAssistant`) |
 
 ## The policy in three sentences
 
@@ -22,7 +30,9 @@ says the message landed and then nothing happens.
 
 ## The policy is explicit and configurable
 
-`ack_policy` is a tenant-level setting. The default is `mid_thread_only`.
+`ack_policy` is a setting of the bridge that owns the tapback: a `[tenants]`
+entry for the Beeper bridge, a `[bridge]` entry for the agent bridge. The
+default is `mid_thread_only`.
 
 | value | behaviour |
 | --- | --- |
@@ -39,15 +49,24 @@ ack_due_seconds = 900   # when an acknowledged message is due for its follow-up
 ack_grace_seconds = 300 # grace period before the broken promise is admitted
 ```
 
+```toml
+[bridge]
+# ...
+ack_policy = "mid_thread_only"
+ack_due_seconds = 900
+ack_grace_seconds = 300
+```
+
 An unknown policy name is a configuration error, not a guess between `never`
 and `always`. Every decision is logged with the reason it was allowed or
 blocked (`acknowledgement considered` in the bridge log).
 
 ## The obligation ledger
 
-An acknowledgement creates a row in `ack_obligations` in the bridge database —
-the same place as the rest of the bridge state, so a promise survives a restart
-with everything else.
+An acknowledgement creates a row in the ledger of its surface: `ack_obligations`
+in the Beeper bridge database (the same place as the rest of the bridge state),
+or `<state_dir>/<host>/<key>.acks.json` beside the agent bridge's watch state.
+Either way a promise survives a restart with everything else.
 
 | column | meaning |
 | --- | --- |
@@ -74,14 +93,16 @@ nothing is owed.
 
 ## The hook
 
-The sweep runs on the bridge's existing cadence (`Runtime::tick`, the same
-interval as the rest of the bridge). It is not a new daemon.
+The sweep runs on the bridge's existing cadence (`Runtime::tick` for the Beeper
+bridge, the supervisor cycle for the agent bridge). It is not a new daemon.
 
 For every `open` obligation past `due_by`:
 
-1. **One nudge.** The agent is reminded once, in its own thread. The nudge is
-   the bridge's message, never the human's: it is recorded in
-   `bridge_outbound` and is never relayed back into the human's room.
+1. **One nudge.** The agent is reminded once, in its own thread: a `pi-notify`
+   steer to the agent's pane, or a message in the agent's conversation. On the
+   Beeper bridge the nudge is the bridge's message, never the human's: it is
+   recorded in `bridge_outbound` and is never relayed back into the human's
+   room.
 2. **After the grace period, one visible admission.** The obligation becomes
    `expired` and the human is told, in the thread:
 
@@ -101,7 +122,9 @@ than retried forever.
 ## Fulfilment
 
 When the agent replies in the thread, the matching obligations are closed and
-the reply's message id and run id are recorded.
+the reply's message id and run id are recorded. The agent bridge reads the
+agent's own reply in the conversation; the Beeper bridge reads it when the
+reply is relayed into the human's room.
 
 **The thread and the ordering are enough.** The reply does not have to quote
 the acknowledged message: any reply in the same thread that comes after the
@@ -116,3 +139,5 @@ room (`thread`), the agent (`agent`) and the agent-thread position (`seq`).
 - A message that was already acknowledged: one message, one promise, one
   tapback.
 - Anything at all when `ack_policy = "never"`.
+- Anything at all when the tapback is disabled (`seen_reaction = ""` on the
+  agent bridge): no tapback, no promise, nothing owed.

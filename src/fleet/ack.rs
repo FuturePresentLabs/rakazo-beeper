@@ -17,10 +17,11 @@
 //! never mint a second row for the same promise, and the admission notice is a
 //! pure function of the obligation so it is byte-identical on every attempt.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 
 /// The tapback used for an acknowledgement. It is one of Rakazo's six
 /// server-validated reactions; the allowlist itself is never widened here.
@@ -322,8 +323,178 @@ impl ObligationLedger for MemoryLedger {
     }
 }
 
-/// The side effects an acknowledgement needs.
+/// A durable ledger in one JSON file.
 ///
+/// This is the agent-bridge ledger: the promises of one agent live beside that
+/// agent's watch state, so they survive a restart with it. The file is written
+/// atomically and one row per `ack_id`, so a sweep can never mint a row per
+/// tick.
+#[derive(Clone, Debug, Default)]
+pub struct FileLedger {
+    path: PathBuf,
+    rows: BTreeMap<String, Obligation>,
+}
+
+impl FileLedger {
+    /// Open (or start) the ledger at `path`.
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let rows = match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let rows: Vec<Obligation> = serde_json::from_str(&text).with_context(|| {
+                    format!("invalid acknowledgement ledger {}", path.display())
+                })?;
+                rows.into_iter()
+                    .map(|row| (row.ack_id.clone(), row))
+                    .collect()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read acknowledgement ledger {}", path.display()));
+            }
+        };
+        Ok(Self { path, rows })
+    }
+
+    /// The ledger path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Every obligation, open or closed.
+    pub fn all(&self) -> Vec<Obligation> {
+        self.rows.values().cloned().collect()
+    }
+
+    /// The open obligations.
+    pub fn open(&self) -> Vec<Obligation> {
+        self.rows
+            .values()
+            .filter(|obligation| obligation.status == ObligationStatus::Open)
+            .cloned()
+            .collect()
+    }
+
+    /// Write the ledger atomically. A ledger that cannot be written is an
+    /// error: an unrecordable promise must not be made.
+    fn save(&self) -> Result<()> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create acknowledgement ledger dir {}", parent.display())
+            })?;
+        }
+        let rows: Vec<Obligation> = self.rows.values().cloned().collect();
+        let text = serde_json::to_string_pretty(&rows)
+            .with_context(|| format!("encode acknowledgement ledger {}", self.path.display()))?;
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, text)
+            .with_context(|| format!("write acknowledgement ledger {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replace acknowledgement ledger {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+impl ObligationLedger for FileLedger {
+    fn record(&mut self, obligation: &Obligation) -> Result<()> {
+        if self.rows.contains_key(&obligation.ack_id) {
+            return Ok(());
+        }
+        self.rows
+            .insert(obligation.ack_id.clone(), obligation.clone());
+        self.save()
+    }
+
+    fn obligation(&self, ack_id: &str) -> Result<Option<Obligation>> {
+        Ok(self.rows.get(ack_id).cloned())
+    }
+
+    fn open_in_thread(&self, agent: &str, thread: &str) -> Result<Vec<Obligation>> {
+        Ok(self
+            .rows
+            .values()
+            .filter(|obligation| {
+                obligation.status == ObligationStatus::Open
+                    && obligation.agent == agent
+                    && obligation.thread == thread
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn due(&self, now: i64) -> Result<Vec<Obligation>> {
+        Ok(self
+            .rows
+            .values()
+            .filter(|obligation| {
+                obligation.status == ObligationStatus::Open && obligation.due_by <= now
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn mark_nudged(&mut self, ack_id: &str, at: i64) -> Result<()> {
+        if let Some(obligation) = self.rows.get_mut(ack_id) {
+            obligation.nudged_at = Some(at);
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn mark_fulfilled(&mut self, ack_id: &str, reply: &str, run_id: Option<&str>) -> Result<()> {
+        if let Some(obligation) = self.rows.get_mut(ack_id)
+            && obligation.status == ObligationStatus::Open
+        {
+            obligation.status = ObligationStatus::Fulfilled;
+            obligation.fulfilled_by = Some(reply.to_string());
+            obligation.run_id = run_id.map(str::to_string);
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn mark_expired(&mut self, ack_id: &str) -> Result<bool> {
+        let Some(obligation) = self.rows.get_mut(ack_id) else {
+            return Ok(false);
+        };
+        if obligation.status != ObligationStatus::Open {
+            return Ok(false);
+        }
+        obligation.status = ObligationStatus::Expired;
+        self.save()?;
+        Ok(true)
+    }
+
+    fn mark_noticed(&mut self, ack_id: &str, at: i64) -> Result<()> {
+        if let Some(obligation) = self.rows.get_mut(ack_id) {
+            obligation.noticed_at = Some(at);
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn mark_notice_attempt(&mut self, ack_id: &str) -> Result<()> {
+        if let Some(obligation) = self.rows.get_mut(ack_id) {
+            obligation.notice_attempts += 1;
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, ack_id: &str) -> Result<()> {
+        if self.rows.remove(ack_id).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
+}
+
+/// The side effects an acknowledgement needs.
 /// `acknowledge` is the visible tapback, `nudge` is the single reminder and
 /// `admit` is the visible admission that a promise was broken.
 pub trait AckEffects {
@@ -440,7 +611,7 @@ pub struct SweepReport {
 }
 
 /// The acknowledgement keeper: the policy, the ledger and the hook.
-pub struct Keeper<L: ObligationLedger, E: AckEffects> {
+pub struct Keeper<L: ObligationLedger, E: AckEffects + Sync> {
     ledger: L,
     effects: E,
     policy: AckPolicy,
@@ -451,7 +622,7 @@ pub struct Keeper<L: ObligationLedger, E: AckEffects> {
     notice_attempts: u32,
 }
 
-impl<L: ObligationLedger, E: AckEffects> Keeper<L, E> {
+impl<L: ObligationLedger, E: AckEffects + Sync> Keeper<L, E> {
     /// The keeper with the default schedule: a promise is due after
     /// `due_seconds` and is admitted after `grace_seconds` more.
     pub fn new(
@@ -1078,6 +1249,48 @@ mod tests {
         assert_eq!(rows[0].status, ObligationStatus::Expired);
         assert_eq!(rows[0].notice_attempts, 3);
         assert!(keeper.effects.notices().is_empty());
+    }
+
+    #[test]
+    fn the_file_ledger_keeps_an_open_promise_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orch.acks.json");
+        let obligation = Obligation {
+            ack_id: "ack-0123456789abcdef01234567".into(),
+            message_id: "m-1".into(),
+            thread: "thread-a".into(),
+            agent: "fleet-orch-v1".into(),
+            created_at: 1_000,
+            due_by: 1_900,
+            seq: 12,
+            status: ObligationStatus::Open,
+            fulfilled_by: None,
+            run_id: None,
+            nudged_at: None,
+            noticed_at: None,
+            notice_attempts: 0,
+        };
+        {
+            let mut ledger = FileLedger::load(&path).unwrap();
+            ledger.record(&obligation).unwrap();
+            ledger.record(&obligation).unwrap();
+        }
+        // Restart: the same file, a new ledger.
+        let mut ledger = FileLedger::load(&path).unwrap();
+        assert_eq!(ledger.all().len(), 1, "one row per promise");
+        assert_eq!(ledger.open().len(), 1);
+        assert_eq!(ledger.due(1_900).unwrap().len(), 1);
+        assert_eq!(ledger.due(1_899).unwrap().len(), 0);
+        ledger
+            .mark_fulfilled(&obligation.ack_id, "m-2", None)
+            .unwrap();
+        let reopened = FileLedger::load(&path).unwrap();
+        assert_eq!(reopened.open().len(), 0);
+        assert_eq!(
+            reopened.all()[0].status,
+            ObligationStatus::Fulfilled,
+            "the closing update is durable too"
+        );
     }
 
     #[tokio::test]

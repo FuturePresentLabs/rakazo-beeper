@@ -67,7 +67,10 @@ service_token_dir = "/Users/ajmwagar/.rakazo/tokens"
 notify_kind = "steer"
 notify_urgent = true
 hide_workers = true
-seen_reaction = "👍"   # "" disables; 👍 means "received, working"
+seen_reaction = "👍"   # "" disables; 👍 means "I saw this and I will follow up"
+# ack_policy = "mid_thread_only"   # never | mid_thread_only | always
+# ack_due_seconds = 900
+# ack_grace_seconds = 300
 ```
 
 `host` is mandatory: `[bridge] host` first, then `PI_AGENT_HOST`. There is no
@@ -190,11 +193,20 @@ and posts it. It refuses (`pane-missing`, `pane-empty`, `pane-no-answer`,
 (agent, reply-to, text), so a retry is a replay rather than a second reply.
 `--text` and `--from-pane` are mutually exclusive.
 
-On every first delivery the supervisor also posts the configured
+On a first delivery the supervisor may also post the configured
 `[bridge] seen_reaction` tapback on the inbound message (one add per message
-lifetime, deterministic `seen:<msgid>` nonce, never on duplicates/bot rows). A
-reaction failure is logged (`report.seen_failed`) and never fails the delivery
+lifetime, an idempotent nonce from the promise identity, never on
+duplicates/bot rows). A reaction failure is logged and never fails the delivery
 or rewinds the watermark. The tapback is not removed when the reply lands.
+
+**The tapback is an acknowledgement, not a receipt.** It says "I saw this and I
+will follow up", so it is only posted when `[bridge] ack_policy` allows it:
+`mid_thread_only` (the default) posts it only while the agent is still working
+on a prior task — an idle agent answers instead — and `never`/`always` are the
+explicit alternatives. Every acknowledgement is a recorded promise in
+`<state_dir>/<host>/<key>.acks.json`, and the supervisor's own cycle enforces
+it: one nudge, then one visible admission in the agent's conversation if the
+follow-up never comes. See [`ack-discipline.md`](ack-discipline.md).
 
 Inbound tapbacks are state, not transcript rows. Each poll reads the newest
 page's `reactions` field and records
