@@ -79,6 +79,25 @@ Read the lines, not just the exit code:
 3. Only then consider restart (see below). A restart that drops queued work or
    replays deliveries is worse than a brief outage.
 
+## Acknowledgement promises
+
+The bridge acknowledges an inbound message only while the agent is mid-thread
+(`ack_policy = "mid_thread_only"`, the default), and every acknowledgement is a
+recorded promise. See [`ack-discipline.md`](ack-discipline.md).
+
+Operator notes:
+
+- An open promise is a row in `ack_obligations` in the bridge database; it
+  survives a restart. A promise past its due time is nudged once and then
+  admitted in the thread — a visible message saying the acknowledgement was
+  not followed up. That notice is the intended behaviour, not a bug.
+- To stop acknowledging entirely, set `ack_policy = "never"` and restart. To
+  give slow agents more room, raise `ack_due_seconds` (and `ack_grace_seconds`)
+  rather than removing the hook.
+- Bridge logs carry `acknowledgement considered` with the reason a tapback was
+  allowed or blocked, `acknowledged:` when a promise was made, and
+  `acknowledgement sweep failed` when the hook could not do its work.
+
 ## Restart
 
 Personal/self-hosted unit:

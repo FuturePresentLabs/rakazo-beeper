@@ -1,9 +1,12 @@
 use crate::{
     config::{Config, Tenant},
+    fleet::ack::{
+        ACK_REACTION, AckEffects, AckPolicy, AckRequest, Keeper, Obligation, SweepReport,
+    },
     matrix::Matrix,
     rakazo::Rakazo,
     stable_id,
-    store::{Binding, Inbound, MessageLink, Store},
+    store::{Binding, Inbound, MessageLink, SqliteObligations, Store},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -424,20 +427,36 @@ impl TenantRuntime {
             let bindings = self.store.bindings(&self.config.id)?;
             let binding = bindings.iter().find(|b| b.room == pending.event.room && self.selected(&b.bot))
                 .context("queued message belongs to a disabled bot; restore configuration before delivery")?;
+            // The mid-thread test reads the agent's state *before* this message
+            // starts a run: an idle agent answers, it does not acknowledge.
             let result = async {
                 self.matrix
                     .check_room(&binding.room, &binding.ghost, &self.config.owner)
                     .await?;
                 self.bootstrap_links(binding).await?;
-                self.inbound_content(binding, &pending.event).await
+                let busy = self.agent_busy(binding).await;
+                self.inbound_content(binding, &pending.event)
+                    .await
+                    .map(|seq| (seq, busy))
             }
             .await;
             match result {
-                Ok(Some(seq)) => {
+                Ok((Some(seq), busy)) => {
                     self.store
-                        .complete_send(binding, pending.id, &pending.event.event_id, seq)?
+                        .complete_send(binding, pending.id, &pending.event.event_id, seq)?;
+                    // An acknowledgement is a promise, so it is only made when
+                    // the policy allows it and the promise can be recorded.
+                    if let Err(error) = self.consider_ack(binding, &pending.event, seq, busy).await
+                    {
+                        tracing::warn!(
+                            tenant = %self.config.id,
+                            bot = %binding.bot,
+                            error = %error,
+                            "acknowledgement failed; the message was still delivered"
+                        );
+                    }
                 }
-                Ok(None) => self.store.complete(&self.config.id, pending.id)?,
+                Ok((None, _)) => self.store.complete(&self.config.id, pending.id)?,
                 Err(error) if error.downcast_ref::<crate::media::Rejected>().is_some() => {
                     self.matrix
                         .check_room(&binding.room, &binding.ghost, &self.config.owner)
@@ -582,9 +601,127 @@ impl TenantRuntime {
         self.bootstrap_links(binding).await?;
         for message in messages.into_iter().filter(|m| m.seq <= through) {
             self.relay_message(binding, &message, true).await?;
+            if message.role == "bot" {
+                // The agent answered in this thread: every promise it owed
+                // here is kept.
+                self.fulfil_obligations(binding, &message).await?;
+            }
             self.store.cursor(binding, message.seq)?;
         }
         Ok(())
+    }
+
+    /// True when the agent is already working on a prior task.
+    ///
+    /// This is the mid-thread signal: an agent with a live run cannot answer
+    /// a new message yet, so an acknowledgement is a promise instead of a
+    /// receipt. An unreadable state is treated as idle: no acknowledgement is
+    /// the safe answer.
+    pub async fn agent_busy(&self, binding: &Binding) -> bool {
+        if self.config.ack_policy != AckPolicy::MidThreadOnly {
+            return false;
+        }
+        match self.rakazo.snapshot(&binding.bot).await {
+            Ok(snapshot) => snapshot.busy(),
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %self.config.id,
+                    bot = %binding.bot,
+                    error = %error,
+                    "agent state unknown; no acknowledgement"
+                );
+                false
+            }
+        }
+    }
+
+    /// Consider acknowledging one delivered message.
+    ///
+    /// The promise is recorded before the tapback is sent, so a promise that
+    /// cannot be stored is never made.
+    async fn consider_ack(
+        &self,
+        binding: &Binding,
+        event: &Inbound,
+        seq: i64,
+        busy: bool,
+    ) -> Result<()> {
+        let request = AckRequest {
+            agent: binding.bot.clone(),
+            thread: binding.room.clone(),
+            message_id: event.event_id.clone(),
+            seq,
+            busy,
+            // A channel the agent cannot answer is never acknowledged.
+            can_reply: self.selected(&binding.bot),
+            run_id: self
+                .store
+                .runs_for_event(binding, &event.event_id)?
+                .into_iter()
+                .next(),
+        };
+        let mut keeper = self.ack_keeper();
+        let outcome = keeper.consider(&request, now() as i64).await;
+        tracing::debug!(
+            tenant = %self.config.id,
+            agent = %request.agent,
+            thread = %request.thread,
+            message = %request.message_id,
+            ack_id = ?outcome.ack_id,
+            reason = %outcome.reason,
+            "acknowledgement considered"
+        );
+        Ok(())
+    }
+
+    /// Close the promises an agent reply kept.
+    ///
+    /// The thread and the ordering are enough: the reply does not have to
+    /// quote the acknowledged message.
+    async fn fulfil_obligations(
+        &self,
+        binding: &Binding,
+        message: &crate::rakazo::Message,
+    ) -> Result<()> {
+        let mut keeper = self.ack_keeper();
+        keeper
+            .fulfil(
+                &binding.bot,
+                &binding.room,
+                &message.id,
+                message.run_id.as_deref(),
+                message.seq,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The hook: enforce every acknowledgement promise that is due.
+    ///
+    /// One nudge per promise, then one visible admission in the thread. The
+    /// sweep runs on the bridge's existing cadence; it is not a new daemon.
+    pub async fn sweep_obligations(&self, now: i64) -> Result<SweepReport> {
+        let mut keeper = self.ack_keeper();
+        let report = keeper.sweep(now).await?;
+        for error in &report.errors {
+            tracing::warn!(
+                tenant = %self.config.id,
+                error = %error,
+                "acknowledgement sweep failed"
+            );
+        }
+        Ok(report)
+    }
+
+    /// The acknowledgement keeper of this tenant.
+    fn ack_keeper(&self) -> Keeper<SqliteObligations, BridgeAckEffects<'_>> {
+        Keeper::new(
+            SqliteObligations::new(self.store.clone(), self.config.id.clone()),
+            BridgeAckEffects { runtime: self },
+            self.config.ack_policy,
+            self.config.ack_due_seconds as i64,
+            self.config.ack_grace_seconds as i64,
+        )
     }
 
     pub async fn backfill_binding(&self, binding: &Binding) -> Result<()> {
@@ -639,10 +776,94 @@ impl TenantRuntime {
                 failure = Some(error);
             }
         }
+        // The acknowledgement hook runs on the same cadence as everything
+        // else: one nudge per broken promise, then one visible admission.
+        if let Err(error) = self.sweep_obligations(now() as i64).await {
+            tracing::warn!(tenant=%self.config.id,error=%error,"acknowledgement sweep failed; obligations retained");
+            failure = Some(error);
+        }
         if let Some(error) = failure {
             return Err(error);
         }
         self.last_success.store(now(), Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The visible side of an acknowledgement promise.
+///
+/// * the tapback says "I saw this and I will follow up",
+/// * the nudge reminds the agent once,
+/// * the admission tells the human, in the thread, that the promise was
+///   broken.
+///
+/// Every write is idempotent: the transaction or nonce is derived from the
+/// obligation's `ack_id`, so a retry is a replay and never a second message.
+struct BridgeAckEffects<'a> {
+    runtime: &'a TenantRuntime,
+}
+
+impl BridgeAckEffects<'_> {
+    fn binding_for(&self, agent: &str) -> Result<Binding> {
+        self.runtime
+            .store
+            .bindings(&self.runtime.config.id)?
+            .into_iter()
+            .find(|binding| binding.bot == agent)
+            .with_context(|| format!("no bridge room for agent {agent}"))
+    }
+}
+
+impl AckEffects for BridgeAckEffects<'_> {
+    async fn acknowledge(&self, obligation: &Obligation) -> Result<()> {
+        let binding = self.binding_for(&obligation.agent)?;
+        let txn = stable_id(&["ack", &obligation.ack_id]);
+        self.runtime
+            .matrix
+            .send_event(
+                &binding.room,
+                &binding.ghost,
+                &txn,
+                "m.reaction",
+                serde_json::json!({
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": obligation.message_id,
+                        "key": ACK_REACTION,
+                    }
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn nudge(&self, obligation: &Obligation) -> Result<()> {
+        let binding = self.binding_for(&obligation.agent)?;
+        let nonce = stable_id(&["ack-nudge", &obligation.ack_id]);
+        // The bridge wrote this message, so it is never the human's: it must
+        // not be relayed back into the human's room.
+        self.runtime
+            .store
+            .record_bridge_outbound(&binding, &nonce, "ack-nudge")?;
+        let text = format!(
+            "[bridge] follow-up reminder: the human's message {} was acknowledged and has \
+             not been answered yet. Please follow up in this thread.",
+            obligation.message_id
+        );
+        self.runtime
+            .rakazo
+            .send_content(&binding.bot, &text, &[], None, &nonce)
+            .await?;
+        Ok(())
+    }
+
+    async fn admit(&self, obligation: &Obligation, notice: &str) -> Result<()> {
+        let binding = self.binding_for(&obligation.agent)?;
+        let txn = stable_id(&["ack-admission", &obligation.ack_id]);
+        self.runtime
+            .matrix
+            .send(&binding.room, &binding.ghost, &txn, notice)
+            .await?;
         Ok(())
     }
 }

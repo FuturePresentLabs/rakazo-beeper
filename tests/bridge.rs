@@ -9,6 +9,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rakazo_beeper::{
     config::{RegistrationBundle, Tenant},
+    fleet::ack::AckPolicy,
     matrix::Matrix,
     rakazo::Rakazo,
     service::{Runtime, TenantRuntime, text_chunks},
@@ -53,6 +54,7 @@ struct Remote {
     power_levels: Value,
     rakazo_nonces: HashSet<String>,
     matrix_transactions: HashMap<String, String>,
+    reactions: Vec<Value>,
     incoming_events: HashMap<String, Value>,
     artifacts: HashMap<String, Value>,
     thread_cursor: i64,
@@ -487,6 +489,15 @@ async fn mock(
         }
         return ok(json!({"event_id":"$delivered"}));
     }
+    if method == Method::PUT && path.contains("/send/m.reaction/") {
+        state
+            .reactions
+            .push(json!({"path":path,"content":input.clone()}));
+        if std::mem::take(&mut state.fail_matrix_send) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+        }
+        return ok(json!({"event_id":"$reaction"}));
+    }
     panic!("unexpected mock request: {method} {path}");
 }
 
@@ -503,6 +514,15 @@ impl Drop for Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(AckPolicy::MidThreadOnly, 900, 300).await
+}
+
+/// The same bridge with an explicit acknowledgement schedule.
+async fn fixture_with(
+    ack_policy: AckPolicy,
+    ack_due_seconds: u64,
+    ack_grace_seconds: u64,
+) -> Fixture {
     let remote: Shared = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -531,6 +551,9 @@ async fn fixture() -> Fixture {
         auto_bots: false,
         auto_named_bots: vec![],
         websocket: false,
+        ack_policy,
+        ack_due_seconds,
+        ack_grace_seconds,
     };
     let bundle = json!({"homeserver_url":base,"homeserver_domain":"beeper.local","your_user_id":config.owner,
         "registration":{"id":"registration-a","sender_localpart":"sh-rakazobot","as_token":"appservice-token-at-least-20-chars","hs_token":"homeserver-token-at-least-20-chars",
@@ -2767,5 +2790,221 @@ async fn mobile_permission_upgrade_invalidates_legacy_profile_cache_without_reup
             .filter(|(path, _, _)| path.contains("/media/v3/upload"))
             .count(),
         uploads
+    );
+}
+
+// --- Acknowledgement discipline -------------------------------------------
+//
+// An acknowledgement is a promise, not a receipt. The bridge may only make
+// one mid-thread, and the promise is recorded in the durable ledger before the
+// tapback is sent.
+
+/// Deliver one human message into the agent's room.
+async fn deliver_human_message(f: &Fixture, event_id: &str, body: &str) {
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    let raw = json!({"event_id":event_id,"room_id":binding.room,"sender":"@owner:beeper.com","type":"m.room.message","content":{"msgtype":"m.text","body":body}});
+    f.runtime
+        .ingest("ack-txn", &json!({"events":[raw]}))
+        .unwrap();
+    f.runtime.deliver_inbound().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_idle_agent_is_not_acknowledged_the_reply_is_the_response() {
+    let f = fixture().await;
+    f.remote.lock().unwrap().busy = false;
+    f.runtime.discover().await.unwrap();
+    deliver_human_message(&f, "$steer-1", "what is the status?").await;
+
+    let remote = f.remote.lock().unwrap();
+    assert!(
+        remote.reactions.is_empty(),
+        "an idle agent must not be acknowledged"
+    );
+    assert!(
+        remote
+            .requests
+            .iter()
+            .all(|(path, _, _)| !path.contains("/send/m.reaction/")),
+        "no tapback may be sent to an idle agent"
+    );
+    drop(remote);
+    assert!(
+        f.runtime.store.obligations("tenant-a").unwrap().is_empty(),
+        "no promise may be recorded for an idle agent"
+    );
+}
+
+#[tokio::test]
+async fn a_busy_agent_is_acknowledged_once_and_owes_one_obligation() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    // The agent is already working on a prior task when the steer arrives.
+    f.remote.lock().unwrap().busy = true;
+    deliver_human_message(&f, "$steer-1", "also check the deploy").await;
+
+    let remote = f.remote.lock().unwrap();
+    assert_eq!(remote.reactions.len(), 1, "exactly one tapback");
+    assert_eq!(remote.reactions[0]["content"]["m.relates_to"]["key"], "👍");
+    assert_eq!(
+        remote.reactions[0]["content"]["m.relates_to"]["event_id"],
+        "$steer-1"
+    );
+    assert_eq!(
+        remote.reactions[0]["content"]["m.relates_to"]["rel_type"],
+        "m.annotation"
+    );
+    drop(remote);
+
+    let obligations = f.runtime.store.obligations("tenant-a").unwrap();
+    assert_eq!(obligations.len(), 1, "exactly one open promise");
+    let obligation = &obligations[0];
+    assert_eq!(obligation.message_id, "$steer-1");
+    assert_eq!(obligation.agent, "agent-a");
+    assert_eq!(obligation.thread, "!agent-a:beeper.local");
+    assert_eq!(
+        obligation.status,
+        rakazo_beeper::fleet::ack::ObligationStatus::Open
+    );
+    assert!(obligation.due_by > obligation.created_at);
+}
+
+#[tokio::test]
+async fn an_agent_reply_keeps_the_promise_without_quoting_the_message() {
+    let f = fixture().await;
+    f.runtime.discover().await.unwrap();
+    // The agent is already working on a prior task when the steer arrives.
+    f.remote.lock().unwrap().busy = true;
+    deliver_human_message(&f, "$steer-1", "also check the deploy").await;
+
+    // The agent answers in the same thread, without quoting the steer.
+    {
+        let mut remote = f.remote.lock().unwrap();
+        remote.busy = false;
+        let mut reply = message(9, "bot", "the deploy is green");
+        reply["runId"] = json!("run-9");
+        remote.messages.push(reply);
+    }
+    let binding = f.runtime.store.bindings("tenant-a").unwrap().remove(0);
+    f.runtime.poll_binding(&binding).await.unwrap();
+
+    let obligations = f.runtime.store.obligations("tenant-a").unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(
+        obligations[0].status,
+        rakazo_beeper::fleet::ack::ObligationStatus::Fulfilled
+    );
+    assert_eq!(obligations[0].fulfilled_by.as_deref(), Some("message-9"));
+    assert_eq!(obligations[0].run_id.as_deref(), Some("run-9"));
+}
+
+#[tokio::test]
+async fn a_broken_promise_is_nudged_once_then_admitted_once() {
+    let f = fixture_with(AckPolicy::MidThreadOnly, 0, 60).await;
+    f.runtime.discover().await.unwrap();
+    f.remote.lock().unwrap().busy = true;
+    deliver_human_message(&f, "$steer-1", "also check the deploy").await;
+
+    let created = f.runtime.store.obligations("tenant-a").unwrap()[0].created_at;
+
+    // Due, but inside the grace period: one nudge, no admission.
+    let first = f.runtime.sweep_obligations(created).await.unwrap();
+    assert_eq!(first.nudged, 1);
+    assert_eq!(first.admitted, 0);
+    {
+        let remote = f.remote.lock().unwrap();
+        let nudges: Vec<_> = remote
+            .messages
+            .iter()
+            .filter(|message| {
+                message["blocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("follow-up reminder"))
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1, "exactly one nudge");
+        // The nudge is the bridge's message, never the human's.
+        assert!(
+            remote
+                .history_events
+                .values()
+                .all(|event| !event["content"]["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("follow-up reminder"))),
+            "the nudge must never be relayed into the human's room"
+        );
+    }
+
+    // A second sweep inside the grace period never nudges twice.
+    let second = f.runtime.sweep_obligations(created + 30).await.unwrap();
+    assert_eq!(second.nudged, 0);
+    assert_eq!(second.admitted, 0);
+
+    // Past the grace period: one visible admission.
+    let third = f.runtime.sweep_obligations(created + 61).await.unwrap();
+    assert_eq!(third.admitted, 1);
+    assert_eq!(third.expired, 1);
+    let notice = {
+        let remote = f.remote.lock().unwrap();
+        remote
+            .matrix_transactions
+            .values()
+            .filter(|body| body.contains("did not follow up"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(notice.len(), 1, "exactly one visible admission");
+    assert!(notice[0].contains("ack-"));
+
+    // A later sweep admits nothing more: the notice is raised once.
+    let fourth = f.runtime.sweep_obligations(created + 3_600).await.unwrap();
+    assert_eq!(fourth.admitted, 0);
+    {
+        let remote = f.remote.lock().unwrap();
+        assert_eq!(
+            remote
+                .matrix_transactions
+                .values()
+                .filter(|body| body.contains("did not follow up"))
+                .count(),
+            1
+        );
+    }
+    let obligations = f.runtime.store.obligations("tenant-a").unwrap();
+    assert_eq!(
+        obligations.len(),
+        1,
+        "one row per promise, not one per tick"
+    );
+    assert_eq!(
+        obligations[0].status,
+        rakazo_beeper::fleet::ack::ObligationStatus::Expired
+    );
+}
+
+#[tokio::test]
+async fn the_never_policy_never_acknowledges_and_the_always_policy_always_does() {
+    let never = fixture_with(AckPolicy::Never, 900, 300).await;
+    never.runtime.discover().await.unwrap();
+    never.remote.lock().unwrap().busy = true;
+    deliver_human_message(&never, "$steer-1", "hello").await;
+    assert!(never.remote.lock().unwrap().reactions.is_empty());
+    assert!(
+        never
+            .runtime
+            .store
+            .obligations("tenant-a")
+            .unwrap()
+            .is_empty()
+    );
+
+    let always = fixture_with(AckPolicy::Always, 900, 300).await;
+    always.runtime.discover().await.unwrap();
+    always.remote.lock().unwrap().busy = false;
+    deliver_human_message(&always, "$steer-2", "hello").await;
+    assert_eq!(always.remote.lock().unwrap().reactions.len(), 1);
+    assert_eq!(
+        always.runtime.store.obligations("tenant-a").unwrap().len(),
+        1
     );
 }

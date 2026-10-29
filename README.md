@@ -28,6 +28,15 @@ reactions are displayed as native Matrix annotations attached to their target; e
 historical reaction events remain untouched. If a reply targets source content that has no visible Beeper
 message, the reply is delivered without a quote.
 
+The bridge does not tap back every message. An acknowledgement is a promise —
+"I saw this and I will follow up" — and it is only made while the agent is
+already mid-thread on a prior task, because an idle agent answers instead. Every
+acknowledgement is recorded as a promise in the bridge database, and a hook on
+the bridge's own cadence enforces it: one nudge, then one visible admission in
+the thread if the follow-up never comes. The policy is configurable per tenant
+(`ack_policy`, default `mid_thread_only`); see
+[`docs/ack-discipline.md`](docs/ack-discipline.md).
+
 Agent messages render Markdown as sanitized Matrix HTML: headings, emphasis,
 links, lists, quotes, tables and fenced code blocks. The original Markdown remains
 the plain-text fallback. Large messages split within the event size budget,
@@ -105,6 +114,10 @@ when one is required, the template, and the index of past incidents.
 
 [`docs/fleet-contract.md`](docs/fleet-contract.md) is the proposed fleet contract:
 bot tiers, conversation→pane mapping, tapbacks, and the A2A envelope.
+
+[`docs/ack-discipline.md`](docs/ack-discipline.md) is the acknowledgement
+discipline: an ack is a promise, it is only allowed mid-thread, and a broken
+promise is nudged once and then admitted in the thread.
 
 The implementation and runtime are Rust. SQLite is bundled through its existing
 Rust binding; TLS and authenticated payload encryption use established libraries.

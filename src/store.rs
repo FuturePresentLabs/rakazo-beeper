@@ -117,7 +117,17 @@ impl Store {
               payload BLOB, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
               next_at INTEGER NOT NULL DEFAULT 0, error TEXT,
               UNIQUE(tenant,event_id));
-            CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(tenant,state,id);")?;
+            CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(tenant,state,id);
+            CREATE TABLE IF NOT EXISTS ack_obligations (
+              tenant TEXT NOT NULL, ack_id TEXT NOT NULL, message_id TEXT NOT NULL, thread TEXT NOT NULL,
+              agent TEXT NOT NULL, created_at INTEGER NOT NULL, due_by INTEGER NOT NULL, seq INTEGER NOT NULL,
+              status TEXT NOT NULL, fulfilled_by TEXT, run_id TEXT, nudged_at INTEGER, noticed_at INTEGER,
+              notice_attempts INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(tenant,ack_id));
+            CREATE INDEX IF NOT EXISTS ack_obligations_due ON ack_obligations(tenant,status,due_by);
+            CREATE TABLE IF NOT EXISTS bridge_outbound (
+              tenant TEXT NOT NULL, bot TEXT NOT NULL, nonce TEXT NOT NULL, purpose TEXT NOT NULL,
+              PRIMARY KEY(tenant,bot,nonce));")?;
         let store = Self {
             db: Mutex::new(db),
             cipher: XChaCha20Poly1305::new_from_slice(&decoded).unwrap(),
@@ -331,6 +341,18 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+    /// The runs started by one inbound event, oldest first.
+    pub fn runs_for_event(&self, binding: &Binding, event: &str) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT run_id FROM run_routes WHERE tenant=?1 AND bot=?2 AND event_id=?3 ORDER BY run_id",
+        )?;
+        Ok(query
+            .query_map(params![binding.tenant, binding.bot, event], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn complete_send(&self, binding: &Binding, id: i64, event: &str, seq: i64) -> Result<()> {
         let mut db = self.db.lock().unwrap();
@@ -607,5 +629,403 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// Record an acknowledgement promise. The `ack_id` is the identity: a
+    /// replay is ignored, never a second promise.
+    pub fn record_obligation(
+        &self,
+        tenant: &str,
+        obligation: &crate::fleet::ack::Obligation,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO ack_obligations
+             (tenant,ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                tenant,
+                obligation.ack_id,
+                obligation.message_id,
+                obligation.thread,
+                obligation.agent,
+                obligation.created_at,
+                obligation.due_by,
+                obligation.seq,
+                obligation.status.as_str(),
+                obligation.fulfilled_by,
+                obligation.run_id,
+                obligation.nudged_at,
+                obligation.noticed_at,
+                obligation.notice_attempts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One promise by identity.
+    pub fn obligation(
+        &self,
+        tenant: &str,
+        ack_id: &str,
+    ) -> Result<Option<crate::fleet::ack::Obligation>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
+             FROM ack_obligations WHERE tenant=?1 AND ack_id=?2",
+        )?;
+        Ok(query
+            .query_row(params![tenant, ack_id], obligation_row)
+            .optional()?)
+    }
+
+    /// Every open promise for one agent in one thread.
+    pub fn open_obligations(
+        &self,
+        tenant: &str,
+        agent: &str,
+        thread: &str,
+    ) -> Result<Vec<crate::fleet::ack::Obligation>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
+             FROM ack_obligations WHERE tenant=?1 AND agent=?2 AND thread=?3 AND status='open' ORDER BY created_at, ack_id",
+        )?;
+        Ok(query
+            .query_map(params![tenant, agent, thread], obligation_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every open promise whose due time has passed.
+    pub fn due_obligations(
+        &self,
+        tenant: &str,
+        now: i64,
+    ) -> Result<Vec<crate::fleet::ack::Obligation>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
+             FROM ack_obligations WHERE tenant=?1 AND status='open' AND due_by<=?2 ORDER BY due_by, ack_id",
+        )?;
+        Ok(query
+            .query_map(params![tenant, now], obligation_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Close a promise that was kept.
+    pub fn fulfil_obligation(
+        &self,
+        tenant: &str,
+        ack_id: &str,
+        reply: &str,
+        run_id: Option<&str>,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ack_obligations SET status='fulfilled', fulfilled_by=?3, run_id=COALESCE(?4,run_id)
+             WHERE tenant=?1 AND ack_id=?2 AND status='open'",
+            params![tenant, ack_id, reply, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Close a promise that was broken. `false` means it was already closed.
+    pub fn expire_obligation(&self, tenant: &str, ack_id: &str) -> Result<bool> {
+        let changed = self.db.lock().unwrap().execute(
+            "UPDATE ack_obligations SET status='expired' WHERE tenant=?1 AND ack_id=?2 AND status='open'",
+            params![tenant, ack_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Record the single nudge.
+    pub fn nudge_obligation(&self, tenant: &str, ack_id: &str, at: i64) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ack_obligations SET nudged_at=?3 WHERE tenant=?1 AND ack_id=?2 AND nudged_at IS NULL",
+            params![tenant, ack_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the admission notice was delivered.
+    pub fn notice_obligation(&self, tenant: &str, ack_id: &str, at: i64) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ack_obligations SET noticed_at=?3 WHERE tenant=?1 AND ack_id=?2",
+            params![tenant, ack_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed admission attempt.
+    pub fn notice_attempt(&self, tenant: &str, ack_id: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE ack_obligations SET notice_attempts=notice_attempts+1 WHERE tenant=?1 AND ack_id=?2",
+            params![tenant, ack_id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a promise that was never made.
+    pub fn remove_obligation(&self, tenant: &str, ack_id: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "DELETE FROM ack_obligations WHERE tenant=?1 AND ack_id=?2",
+            params![tenant, ack_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every promise of one tenant, open or closed. Used by the status output.
+    pub fn obligations(&self, tenant: &str) -> Result<Vec<crate::fleet::ack::Obligation>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT ack_id,message_id,thread,agent,created_at,due_by,seq,status,fulfilled_by,run_id,nudged_at,noticed_at,notice_attempts
+             FROM ack_obligations WHERE tenant=?1 ORDER BY created_at, ack_id",
+        )?;
+        Ok(query
+            .query_map([tenant], obligation_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Remember a message the bridge itself wrote into an agent's thread.
+    ///
+    /// A bridge-originated message is never the human's: it must not be
+    /// relayed back into the human's room as if the human had sent it.
+    pub fn record_bridge_outbound(
+        &self,
+        binding: &Binding,
+        nonce: &str,
+        purpose: &str,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO bridge_outbound VALUES (?1,?2,?3,?4)",
+            params![binding.tenant, binding.bot, nonce, purpose],
+        )?;
+        Ok(())
+    }
+
+    /// True when a message in the agent's thread was written by the bridge.
+    pub fn bridge_outbound(&self, binding: &Binding, nonce: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_outbound WHERE tenant=?1 AND bot=?2 AND nonce=?3)",
+            params![binding.tenant, binding.bot, nonce],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+/// Read one acknowledgement promise row.
+fn obligation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fleet::ack::Obligation> {
+    use crate::fleet::ack::ObligationStatus;
+    let status: String = row.get(7)?;
+    Ok(crate::fleet::ack::Obligation {
+        ack_id: row.get(0)?,
+        message_id: row.get(1)?,
+        thread: row.get(2)?,
+        agent: row.get(3)?,
+        created_at: row.get(4)?,
+        due_by: row.get(5)?,
+        seq: row.get(6)?,
+        status: ObligationStatus::parse(&status).unwrap_or(ObligationStatus::Open),
+        fulfilled_by: row.get(8)?,
+        run_id: row.get(9)?,
+        nudged_at: row.get(10)?,
+        noticed_at: row.get(11)?,
+        notice_attempts: row.get(12)?,
+    })
+}
+
+/// The durable acknowledgement ledger of one tenant.
+///
+/// The bridge store is where the rest of the bridge state lives, so a promise
+/// survives a restart with everything else.
+pub struct SqliteObligations {
+    store: std::sync::Arc<Store>,
+    tenant: String,
+}
+
+impl SqliteObligations {
+    pub fn new(store: std::sync::Arc<Store>, tenant: impl Into<String>) -> Self {
+        Self {
+            store,
+            tenant: tenant.into(),
+        }
+    }
+}
+
+impl crate::fleet::ack::ObligationLedger for SqliteObligations {
+    fn record(&mut self, obligation: &crate::fleet::ack::Obligation) -> Result<()> {
+        self.store.record_obligation(&self.tenant, obligation)
+    }
+
+    fn obligation(&self, ack_id: &str) -> Result<Option<crate::fleet::ack::Obligation>> {
+        self.store.obligation(&self.tenant, ack_id)
+    }
+
+    fn open_in_thread(
+        &self,
+        agent: &str,
+        thread: &str,
+    ) -> Result<Vec<crate::fleet::ack::Obligation>> {
+        self.store.open_obligations(&self.tenant, agent, thread)
+    }
+
+    fn due(&self, now: i64) -> Result<Vec<crate::fleet::ack::Obligation>> {
+        self.store.due_obligations(&self.tenant, now)
+    }
+
+    fn mark_nudged(&mut self, ack_id: &str, at: i64) -> Result<()> {
+        self.store.nudge_obligation(&self.tenant, ack_id, at)
+    }
+
+    fn mark_fulfilled(&mut self, ack_id: &str, reply: &str, run_id: Option<&str>) -> Result<()> {
+        self.store
+            .fulfil_obligation(&self.tenant, ack_id, reply, run_id)
+    }
+
+    fn mark_expired(&mut self, ack_id: &str) -> Result<bool> {
+        self.store.expire_obligation(&self.tenant, ack_id)
+    }
+
+    fn mark_noticed(&mut self, ack_id: &str, at: i64) -> Result<()> {
+        self.store.notice_obligation(&self.tenant, ack_id, at)
+    }
+
+    fn mark_notice_attempt(&mut self, ack_id: &str) -> Result<()> {
+        self.store.notice_attempt(&self.tenant, ack_id)
+    }
+
+    fn remove(&mut self, ack_id: &str) -> Result<()> {
+        self.store.remove_obligation(&self.tenant, ack_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::ack::{Obligation, ObligationStatus};
+
+    fn key() -> String {
+        STANDARD.encode([7u8; 32])
+    }
+
+    fn obligation() -> Obligation {
+        Obligation {
+            ack_id: "ack-0123456789abcdef01234567".into(),
+            message_id: "$steer-1".into(),
+            thread: "!agent-a:beeper.local".into(),
+            agent: "agent-a".into(),
+            created_at: 1_000,
+            due_by: 1_900,
+            seq: 12,
+            status: ObligationStatus::Open,
+            fulfilled_by: None,
+            run_id: Some("run-1".into()),
+            nudged_at: None,
+            noticed_at: None,
+            notice_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn an_open_promise_survives_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bridge.db");
+        {
+            let store = Store::open(&path, &key()).unwrap();
+            store.record_obligation("tenant-a", &obligation()).unwrap();
+            assert_eq!(
+                store
+                    .open_obligations("tenant-a", "agent-a", "!agent-a:beeper.local")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        // Restart: a new process, the same database.
+        let store = Store::open(&path, &key()).unwrap();
+        let rows = store.obligations("tenant-a").unwrap();
+        assert_eq!(rows.len(), 1, "the promise survived the restart");
+        assert_eq!(rows[0].ack_id, "ack-0123456789abcdef01234567");
+        assert_eq!(rows[0].message_id, "$steer-1");
+        assert_eq!(rows[0].status, ObligationStatus::Open);
+        assert_eq!(rows[0].due_by, 1_900);
+        assert_eq!(rows[0].seq, 12);
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-1"));
+        // The hook still sees it as due.
+        assert_eq!(store.due_obligations("tenant-a", 1_900).unwrap().len(), 1);
+        assert_eq!(store.due_obligations("tenant-a", 1_899).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_same_promise_is_recorded_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("bridge.db"), &key()).unwrap();
+        store.record_obligation("tenant-a", &obligation()).unwrap();
+        store.record_obligation("tenant-a", &obligation()).unwrap();
+        assert_eq!(store.obligations("tenant-a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_promise_is_closed_once_and_never_reopened() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("bridge.db"), &key()).unwrap();
+        store.record_obligation("tenant-a", &obligation()).unwrap();
+        assert!(
+            store
+                .expire_obligation("tenant-a", "ack-0123456789abcdef01234567")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .expire_obligation("tenant-a", "ack-0123456789abcdef01234567")
+                .unwrap()
+        );
+        assert_eq!(
+            store.obligations("tenant-a").unwrap()[0].status,
+            ObligationStatus::Expired
+        );
+        assert_eq!(
+            store
+                .open_obligations("tenant-a", "agent-a", "!agent-a:beeper.local")
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_kept_promise_records_the_reply_and_its_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("bridge.db"), &key()).unwrap();
+        store.record_obligation("tenant-a", &obligation()).unwrap();
+        store
+            .fulfil_obligation(
+                "tenant-a",
+                "ack-0123456789abcdef01234567",
+                "message-13",
+                Some("run-2"),
+            )
+            .unwrap();
+        let row = &store.obligations("tenant-a").unwrap()[0];
+        assert_eq!(row.status, ObligationStatus::Fulfilled);
+        assert_eq!(row.fulfilled_by.as_deref(), Some("message-13"));
+        assert_eq!(row.run_id.as_deref(), Some("run-2"));
+    }
+
+    #[test]
+    fn a_bridge_originated_message_is_never_relayed_as_the_humans() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("bridge.db"), &key()).unwrap();
+        let binding = Binding {
+            tenant: "tenant-a".into(),
+            bot: "agent-a".into(),
+            room: "!agent-a:beeper.local".into(),
+            ghost: "@sh-rakazo_agent-a:beeper.local".into(),
+            cursor: 0,
+        };
+        assert!(!store.bridge_outbound(&binding, "nonce-1").unwrap());
+        store
+            .record_bridge_outbound(&binding, "nonce-1", "ack-nudge")
+            .unwrap();
+        assert!(store.bridge_outbound(&binding, "nonce-1").unwrap());
+        assert!(!store.bridge_outbound(&binding, "nonce-2").unwrap());
     }
 }
