@@ -2,12 +2,20 @@
 //!
 //! M0 is intentionally local: no Rakazo RPC, no bot creation and no
 //! credentials. `main.rs` is not wired to this module until M1.
+//!
+//! `ack` is the exception: the acknowledgement discipline is live policy, so
+//! the bridge configuration and the bridge runtime both use it.
 
 pub mod a2a;
+pub mod ack;
 pub mod route;
 pub mod tapback;
 
 pub use a2a::{Dedupe, DedupeResult, Message};
+pub use ack::{
+    ACK_REACTION, AckBlock, AckDecision, AckEffects, AckOutcome, AckPolicy, AckRequest, Obligation,
+    ObligationLedger, ObligationStatus, SweepReport,
+};
 pub use route::{BotKey, Entry, Resolution, Table, TableError, Vertical};
 pub use tapback::{AnswerLedger, Ask, InMemoryLedger, RecordOutcome, Signal, Verb};
 

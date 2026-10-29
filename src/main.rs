@@ -3,6 +3,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use rakazo_beeper::{
     config::{Config, secret},
+    orch::{
+        bridge::{RakazoAppender, ServiceAppender, TokenStore},
+        supervisor::Admitter,
+    },
     service::Runtime,
     store::Store,
     transport,
@@ -1159,7 +1163,22 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 &host,
             )?
             .with_seen_reaction(config.bridge.seen_reaction.clone())
-            .with_reply_hint_config(config_path);
+            .with_reply_hint_config(config_path)
+            .with_ack_policy(
+                config.bridge.ack_policy,
+                config.bridge.ack_due_seconds as i64,
+                config.bridge.ack_grace_seconds as i64,
+            )
+            // The admission of a broken promise is posted in the agent's own
+            // conversation, with that agent's own service token. Without a
+            // token there is no visible admission, and the log says so.
+            .with_admitter(TokenAdmitter {
+                store: TokenStore::new(&config.bridge.service_token_dir),
+                appender: RakazoAppender {
+                    base: orch.rakazo.base().clone(),
+                    space: orch.space.clone(),
+                },
+            });
             loop {
                 // Re-read the roster every interval so added/removed agents are
                 // reconciled. In resident mode a roster or cycle failure is a
@@ -1169,7 +1188,7 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                 match load(&config, &host) {
                     Ok(agents) => match supervisor.cycle(&agents).await {
                         Ok(report) => println!(
-                            "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\treactions={}\treactions_dropped={}\terrors={}",
+                            "cycle\thost={}\tagents={}\towned={}\tforeign={}\tcreated={}\tarchived={}\tmissing={}\tdelivered={}\tdeferred={}\tduplicates={}\tignored={}\treactions={}\treactions_dropped={}\tacked={}\tack_blocked={}\tack_nudged={}\tack_expired={}\terrors={}",
                             host,
                             report.agents,
                             report.owned,
@@ -1183,6 +1202,10 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
                             report.ignored,
                             report.reactions,
                             report.reactions_dropped,
+                            report.seen,
+                            report.ack_blocked,
+                            report.ack_nudged,
+                            report.ack_expired,
                             report.errors.join(" | ")
                         ),
                         Err(error) if resident => {
@@ -1482,6 +1505,44 @@ async fn bridge_command(config_path: &Path, command: &BridgeCommand) -> Result<(
     }
     Ok(())
 }
+/// Posts the visible admission of a broken promise in the agent's own
+/// conversation.
+///
+/// One bot-bound service token per agent, exactly like `bridge reply`: the
+/// admission is the agent speaking, never the bridge and never the human. A
+/// missing token is an error, not a fallback.
+struct TokenAdmitter {
+    store: TokenStore,
+    appender: RakazoAppender,
+}
+
+impl Admitter for TokenAdmitter {
+    fn admit(
+        &self,
+        bot_id: &str,
+        agent_key: &str,
+        text: &str,
+        nonce: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let token = match self.store.read(agent_key) {
+            Ok(token) => token,
+            Err(error) => {
+                return Box::pin(async move { Err(error) });
+            }
+        };
+        let appender = self.appender.clone();
+        let bot_id = bot_id.to_string();
+        let text = text.to_string();
+        let nonce = nonce.to_string();
+        Box::pin(async move {
+            appender
+                .append(&token, &bot_id, &text, &nonce, None)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
 /// Read the allowlist and fail unless it names the same space as the session.
 fn allowlist(orch: &rakazo_beeper::orch::Orch) -> Result<rakazo_beeper::orch::Allowlist> {
     let allowlist = rakazo_beeper::orch::Allowlist::from_env()?;

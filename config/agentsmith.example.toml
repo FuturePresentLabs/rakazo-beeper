@@ -34,12 +34,23 @@ notify_urgent = true
 # upstream `bridge.hide_workers` in the roster payload wins over this value when
 # AgentSmith publishes it.
 hide_workers = true
-# Tapback posted on an inbound message the moment `pi-notify` accepts it:
-# "received, working". One add per message lifetime (duplicates/replays never
-# react), idempotent nonce from the message id, and a failure never fails or
-# rewinds the delivery. Must be one the server advertises
-# (👍 👎 ❤️ 😂 🎉 😮), or "" to disable. It stays in place after the answer.
+# Tapback posted on an inbound message the moment `pi-notify` accepts it.
+# It is an acknowledgement, not a receipt: it says "I saw this and I will
+# follow up", and it is only posted when `ack_policy` allows it. One add per
+# message lifetime (duplicates/replays never react), an idempotent nonce from
+# the promise identity, and a failure never fails or rewinds the delivery.
+# Must be one the server advertises (👍 👎 ❤️ 😂 🎉 😮), or "" to disable.
 seen_reaction = "👍"
+# When the supervisor may acknowledge an inbound message with a tapback.
+#   mid_thread_only (default) - only while the agent is still working on a
+#                              prior task; an idle agent answers instead.
+#   never                    - never acknowledge.
+#   always                   - acknowledge every inbound message.
+# ack_policy = "mid_thread_only"
+# Seconds before an acknowledged message is due for its follow-up, and the
+# grace period after that before the broken promise is admitted in the thread.
+# ack_due_seconds = 900
+# ack_grace_seconds = 300
 # Optional `[[agent]]` provider config (same file the hidden `ohm` commands use).
 # When set, `bridge status --json` reports each matching roster agent's real
 # `transport` and makes one live `GET /v1/info` for a Beeper agent, so

@@ -7,6 +7,8 @@ use std::{
 };
 use url::Url;
 
+use crate::fleet::ack::AckPolicy;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -47,9 +49,29 @@ pub struct Tenant {
     pub auto_named_bots: Vec<String>,
     #[serde(default = "websocket_default")]
     pub websocket: bool,
+    /// When the bridge may acknowledge an inbound message.
+    ///
+    /// `mid_thread_only` (the default) acknowledges only while the agent is
+    /// already working on a prior task: an idle agent answers instead. The
+    /// other values are `never` and `always`.
+    #[serde(default)]
+    pub ack_policy: AckPolicy,
+    /// Seconds before an acknowledged message is due for its follow-up.
+    #[serde(default = "ack_due_default")]
+    pub ack_due_seconds: u64,
+    /// Seconds after the due time before the broken promise is admitted to
+    /// the human in the thread.
+    #[serde(default = "ack_grace_default")]
+    pub ack_grace_seconds: u64,
 }
 fn websocket_default() -> bool {
     true
+}
+fn ack_due_default() -> u64 {
+    900
+}
+fn ack_grace_default() -> u64 {
+    300
 }
 
 #[derive(Clone, Deserialize)]
@@ -219,6 +241,7 @@ pub fn validate_url(url: &Url) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::Tenant;
+    use crate::fleet::ack::AckPolicy;
 
     #[test]
     fn tenant_accepts_configurable_named_bots() {
@@ -237,5 +260,45 @@ auto_named_bots = ["Muse"]
 "#,
         );
         assert!(tenant.is_ok());
+    }
+
+    const ACK_TENANT: &str = r#"
+id = "personal"
+owner = "@owner:example.com"
+registration = "/tmp/registration.json"
+homeserver = "https://matrix.example.com"
+rakazo_url = "https://rakazo.example.com"
+rakazo_token_env = "RAKAZO_TOKEN"
+rakazo_space_id = "space-a"
+bot_ids = []
+"#;
+
+    #[test]
+    fn the_acknowledgement_policy_defaults_to_mid_thread_only() {
+        let tenant: Tenant = toml::from_str(ACK_TENANT).unwrap();
+        assert_eq!(tenant.ack_policy, AckPolicy::MidThreadOnly);
+        assert_eq!(tenant.ack_due_seconds, 900);
+        assert_eq!(tenant.ack_grace_seconds, 300);
+    }
+
+    #[test]
+    fn the_acknowledgement_policy_is_explicit_when_it_is_set() {
+        let tenant: Tenant = toml::from_str(&format!(
+            "{ACK_TENANT}ack_policy = \"never\"\nack_due_seconds = 60\nack_grace_seconds = 30\n"
+        ))
+        .unwrap();
+        assert_eq!(tenant.ack_policy, AckPolicy::Never);
+        assert_eq!(tenant.ack_due_seconds, 60);
+        assert_eq!(tenant.ack_grace_seconds, 30);
+    }
+
+    #[test]
+    fn an_unknown_acknowledgement_policy_is_a_configuration_error() {
+        let error =
+            match toml::from_str::<Tenant>(&format!("{ACK_TENANT}ack_policy = \"sometimes\"\n")) {
+                Ok(_) => panic!("an unknown policy must not parse"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("sometimes"), "{error}");
     }
 }

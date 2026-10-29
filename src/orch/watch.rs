@@ -329,6 +329,13 @@ pub struct WatchState {
     /// Message id of the most recent successful delivery.
     #[serde(default)]
     pub last_delivered_id: Option<String>,
+    /// The message this agent was last asked about and has not answered yet.
+    ///
+    /// While this is set the agent is mid-thread: a new inbound message is a
+    /// steer, not a new task, and it is the only case in which an
+    /// acknowledgement (a promise) is allowed.
+    #[serde(default)]
+    pub awaiting_reply: Option<String>,
     /// `None` before the first poll; explicit so an unstarted watcher is not healthy.
     #[serde(default)]
     pub last_poll_ok: Option<bool>,
@@ -543,6 +550,13 @@ pub struct Report {
     pub seen: usize,
     /// Seen tapbacks that failed. Best-effort: delivery still counts.
     pub seen_failed: usize,
+    /// Acknowledgements the policy refused (the agent was idle, or the policy
+    /// forbids it). No tapback was sent and no promise was made.
+    pub ack_blocked: usize,
+    /// Broken promises nudged once by the hook.
+    pub ack_nudged: usize,
+    /// Broken promises expired and admitted in the thread.
+    pub ack_expired: usize,
     /// New inbound tapbacks delivered through the notifier.
     pub reactions: usize,
     /// New inbound tapbacks whose notification failed and was persisted.

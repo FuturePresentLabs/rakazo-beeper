@@ -600,6 +600,15 @@ impl TenantRuntime {
         if !matches!(message.role.as_str(), "user" | "bot") {
             return Ok(Prepared::default());
         }
+        if message.role == "user"
+            && let Some(nonce) = message.client_nonce.as_deref()
+            && self.store.bridge_outbound(binding, nonce)?
+        {
+            // The bridge wrote this message into the agent's thread (an
+            // acknowledgement nudge). It is not the human's message, so it is
+            // never relayed back into the human's room.
+            return Ok(Prepared::default());
+        }
         if message.role == "user" {
             let event = if let Some(nonce) = message.client_nonce.as_deref() {
                 self.store.event_for_nonce(binding, nonce)?

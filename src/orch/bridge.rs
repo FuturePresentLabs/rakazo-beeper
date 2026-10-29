@@ -31,6 +31,7 @@
 //! ```
 
 use super::agentsmith::{Agent, AgentRole, Roster, resolve_bot};
+use crate::fleet::ack::AckPolicy;
 use crate::rakazo::{AppendReceipt, Bot, Rakazo};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -132,13 +133,38 @@ pub struct BridgeSection {
     /// Tapback posted on an inbound message once it was actually delivered to a
     /// pane (`👍` by default, which the server advertises). Empty disables the
     /// tapback; a reaction failure never fails or rewinds a delivery.
+    ///
+    /// The tapback is now an acknowledgement: it is posted only when
+    /// `ack_policy` allows it, and it is a promise with a follow-up.
     #[serde(default = "seen_reaction_default")]
     pub seen_reaction: String,
+    /// When the supervisor may acknowledge an inbound message with a tapback.
+    ///
+    /// `mid_thread_only` (the default) acknowledges only while the agent is
+    /// still working on a prior task; an idle agent answers instead. The other
+    /// values are `never` and `always`.
+    #[serde(default)]
+    pub ack_policy: AckPolicy,
+    /// Seconds before an acknowledged message is due for its follow-up.
+    #[serde(default = "ack_due_default")]
+    pub ack_due_seconds: u64,
+    /// Seconds after the due time before the broken promise is admitted to the
+    /// human in the thread.
+    #[serde(default = "ack_grace_default")]
+    pub ack_grace_seconds: u64,
     /// Optional ohm/beeper `[[agent]]` config. When set, `bridge status` reports
     /// each matching agent's real transport and a live Beeper probe instead of
     /// assuming Rakazo-only polling. No URL, no token value: a path only.
     #[serde(default)]
     pub agent_config: Option<PathBuf>,
+}
+
+fn ack_due_default() -> u64 {
+    900
+}
+
+fn ack_grace_default() -> u64 {
+    300
 }
 
 impl Default for BridgeSection {
@@ -151,6 +177,9 @@ impl Default for BridgeSection {
             notify_urgent: notify_urgent_default(),
             hide_workers: hide_workers_default(),
             seen_reaction: seen_reaction_default(),
+            ack_policy: AckPolicy::MidThreadOnly,
+            ack_due_seconds: ack_due_default(),
+            ack_grace_seconds: ack_grace_default(),
             agent_config: None,
         }
     }

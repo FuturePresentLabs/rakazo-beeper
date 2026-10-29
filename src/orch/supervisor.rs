@@ -30,11 +30,17 @@ use super::watch::{
     NewAgentBot, PiNotify, RakazoSource, Report, WatchState, now_rfc3339, reaction_ref, summarize,
     summarize_reaction, write_state,
 };
+use crate::fleet::ack::{
+    AckDecision, AckEffects, AckPolicy, AckRequest, FileLedger, Keeper, Obligation,
+};
 use crate::rakazo::Bot;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Delivery outcome. `Accepted` advances the watermark; `Deferred` does not, so
@@ -141,6 +147,12 @@ pub struct CycleReport {
     pub seen: usize,
     /// Seen tapbacks that failed; delivery is unaffected.
     pub seen_failed: usize,
+    /// Acknowledgements the policy refused (the agent was idle).
+    pub ack_blocked: usize,
+    /// Broken promises nudged once by the hook.
+    pub ack_nudged: usize,
+    /// Broken promises expired and admitted in the thread.
+    pub ack_expired: usize,
     /// New inbound tapbacks delivered from the poller's reaction model.
     pub reactions: usize,
     /// Inbound tapbacks whose notification failed and was persisted for replay.
@@ -156,14 +168,147 @@ impl CycleReport {
         self.deferred += report.deferred;
         self.seen += report.seen;
         self.seen_failed += report.seen_failed;
+        self.ack_blocked += report.ack_blocked;
+        self.ack_nudged += report.ack_nudged;
+        self.ack_expired += report.ack_expired;
         self.reactions += report.reactions;
         self.reactions_dropped += report.reactions_dropped;
     }
 }
 
-pub struct Supervisor<S: RakazoSource, D: Deliverer> {
+/// The visible side of one agent's acknowledgement promises.
+///
+/// * the tapback says "I saw this and I will follow up",
+/// * the nudge reminds the agent once, in its own pane,
+/// * the admission tells the human, in the agent's thread, that the promise
+///   was broken.
+pub trait Admitter: Send + Sync {
+    /// Post one message in the agent's own conversation.
+    fn admit(
+        &self,
+        bot_id: &str,
+        agent_key: &str,
+        text: &str,
+        nonce: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+/// The default: no admission surface.
+///
+/// A bridge without a service token cannot post in the agent's voice, so a
+/// broken promise is closed without a visible notice and the log says why. It
+/// never falls back to posting as the human.
+pub struct NoAdmitter;
+
+impl Admitter for NoAdmitter {
+    fn admit(
+        &self,
+        _bot_id: &str,
+        _agent_key: &str,
+        _text: &str,
+        _nonce: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { bail!("no admission surface is configured for this agent") })
+    }
+}
+
+/// Unix seconds, for the promise schedule.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Everything one poll of one agent needs besides the agent itself.
+struct PollContext<'a> {
+    /// The local delivery target (the `pi-notify` worker).
+    delivery: &'a str,
+    /// The agent's live bot id.
+    bot_id: &'a str,
+    /// The tapback used for an acknowledgement; empty disables it.
+    seen_reaction: &'a str,
+    /// The `--bridge-config` path appended to the delivered reply hint.
+    reply_hint_config: Option<&'a Path>,
+    /// The acknowledgement policy and its schedule.
+    ack: AckSettings,
+    /// The surface that posts the visible admission.
+    admitter: &'a dyn Admitter,
+    /// The instant the promise schedule is measured against.
+    now: i64,
+}
+
+/// The acknowledgement settings of one supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckSettings {
+    pub policy: AckPolicy,
+    pub due_seconds: i64,
+    pub grace_seconds: i64,
+}
+
+impl Default for AckSettings {
+    fn default() -> Self {
+        Self {
+            policy: AckPolicy::MidThreadOnly,
+            due_seconds: 900,
+            grace_seconds: 300,
+        }
+    }
+}
+
+/// The visible side of one agent's promises, bound to that agent.
+struct AgentAckEffects<'a, S: RakazoSource + Sync, D: Deliverer + Sync> {
+    source: &'a S,
+    deliverer: &'a D,
+    admitter: &'a dyn Admitter,
+    agent: &'a Agent,
+    bot_id: &'a str,
+    conversation: &'a str,
+    delivery: &'a str,
+    reaction: &'a str,
+}
+
+impl<S: RakazoSource + Sync, D: Deliverer + Sync> AckEffects for AgentAckEffects<'_, S, D> {
+    async fn acknowledge(&self, obligation: &Obligation) -> Result<()> {
+        // One deterministic nonce per promise: a retry is a replay, never a
+        // second tapback.
+        let nonce = format!("ack:{}", obligation.ack_id);
+        self.source
+            .react(self.bot_id, &obligation.message_id, self.reaction, &nonce)
+            .await
+    }
+
+    async fn nudge(&self, obligation: &Obligation) -> Result<()> {
+        let reference = format!("ack-nudge:{}:{}", self.conversation, obligation.message_id);
+        let text = format!(
+            "[{reference}] follow-up reminder: the human's message {} was acknowledged and has \
+             not been answered yet. Please follow up.",
+            obligation.message_id
+        );
+        let outcome = self.deliverer.deliver(
+            &self.agent.key,
+            &self.agent.host,
+            self.delivery,
+            delivery_target(self.agent).as_deref(),
+            &text,
+            &reference,
+        )?;
+        ensure!(outcome == Delivery::Accepted, "the nudge was not accepted");
+        Ok(())
+    }
+
+    async fn admit(&self, obligation: &Obligation, notice: &str) -> Result<()> {
+        let nonce = format!("ack-admission:{}", obligation.ack_id);
+        self.admitter
+            .admit(self.bot_id, &self.agent.key, notice, &nonce)
+            .await
+    }
+}
+
+pub struct Supervisor<S: RakazoSource + Sync, D: Deliverer + Sync> {
     source: S,
     deliverer: D,
+    admitter: Box<dyn Admitter>,
     state_dir: PathBuf,
     host: String,
     tracked: BTreeMap<String, Tracked>,
@@ -171,9 +316,18 @@ pub struct Supervisor<S: RakazoSource, D: Deliverer> {
     seen_reaction: String,
     /// `--bridge-config` path appended to the delivered reply hint.
     reply_hint_config: Option<PathBuf>,
+    /// When a tapback may be posted: `never`, `mid_thread_only` or `always`.
+    ack_policy: AckPolicy,
+    /// Seconds before an acknowledged message is due for its follow-up.
+    ack_due_seconds: i64,
+    /// Seconds after the due time before the broken promise is admitted.
+    ack_grace_seconds: i64,
+    /// The clock for the promise schedule. `None` is the system clock; an
+    /// explicit instant is how a test moves the deadline without waiting.
+    ack_now: Option<i64>,
 }
 
-impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
+impl<S: RakazoSource + Sync, D: Deliverer + Sync> Supervisor<S, D> {
     /// `state_dir/<host>/<safe-key>.json` holds one ledger per agent owned by
     /// this box. `host` is explicit (config or `PI_AGENT_HOST`); it is never
     /// guessed from the machine name.
@@ -191,19 +345,51 @@ impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
         Ok(Self {
             source,
             deliverer,
+            admitter: Box::new(NoAdmitter),
             state_dir: state_dir.into(),
             host: host.trim().to_string(),
             tracked: BTreeMap::new(),
             seen_reaction: String::new(),
             reply_hint_config: None,
+            ack_policy: AckPolicy::MidThreadOnly,
+            ack_due_seconds: 900,
+            ack_grace_seconds: 300,
+            ack_now: None,
         })
     }
+}
 
+impl<S: RakazoSource + Sync, D: Deliverer + Sync> Supervisor<S, D> {
     /// Enable the seen tapback (`[bridge] seen_reaction`). Empty disables it and
     /// makes zero `threads.react` calls.
     pub fn with_seen_reaction(mut self, reaction: impl Into<String>) -> Self {
         self.seen_reaction = reaction.into();
         self
+    }
+
+    /// The acknowledgement policy and its schedule.
+    pub fn with_ack_policy(
+        mut self,
+        policy: AckPolicy,
+        due_seconds: i64,
+        grace_seconds: i64,
+    ) -> Self {
+        self.ack_policy = policy;
+        self.ack_due_seconds = due_seconds.max(0);
+        self.ack_grace_seconds = grace_seconds.max(0);
+        self
+    }
+
+    /// The surface that posts the visible admission in the agent's thread.
+    pub fn with_admitter(mut self, admitter: impl Admitter + 'static) -> Self {
+        self.admitter = Box::new(admitter);
+        self
+    }
+
+    /// Move the clock of the promise schedule. The system clock is used when
+    /// this is never called.
+    pub fn set_ack_now(&mut self, now: i64) {
+        self.ack_now = Some(now);
     }
 
     /// Enable the reply hint line in delivered text with this `--bridge-config`.
@@ -376,10 +562,19 @@ impl<S: RakazoSource, D: Deliverer> Supervisor<S, D> {
                 &self.source,
                 &self.deliverer,
                 tracked,
-                &agent.delivery,
-                &bot_id,
-                &self.seen_reaction,
-                self.reply_hint_config.as_deref(),
+                &PollContext {
+                    delivery: &agent.delivery,
+                    bot_id: &bot_id,
+                    seen_reaction: &self.seen_reaction,
+                    reply_hint_config: self.reply_hint_config.as_deref(),
+                    ack: AckSettings {
+                        policy: self.ack_policy,
+                        due_seconds: self.ack_due_seconds,
+                        grace_seconds: self.ack_grace_seconds,
+                    },
+                    admitter: self.admitter.as_ref(),
+                    now: self.ack_now.unwrap_or_else(now_unix),
+                },
             )
             .await
             {
@@ -508,15 +703,21 @@ pub fn delivery_target(agent: &Agent) -> Option<String> {
 
 /// Drain one agent's thread. Each user message is notified at most once, even
 /// across polls and restarts. A failure leaves the watermark untouched.
-async fn poll_one<S: RakazoSource, D: Deliverer>(
+async fn poll_one<S: RakazoSource + Sync, D: Deliverer + Sync>(
     source: &S,
     deliverer: &D,
     tracked: &mut Tracked,
-    delivery: &str,
-    bot_id: &str,
-    seen_reaction: &str,
-    reply_hint_config: Option<&Path>,
+    context: &PollContext<'_>,
 ) -> Result<Report> {
+    let PollContext {
+        delivery,
+        bot_id,
+        seen_reaction,
+        reply_hint_config,
+        ack,
+        admitter,
+        now,
+    } = *context;
     tracked.state.last_poll_at = Some(now_rfc3339());
     let mut messages = source.fetch_after(bot_id, tracked.state.last_seq).await?;
     messages.sort_by_key(|message| message.seq);
@@ -535,6 +736,27 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
         .parent()
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new("."));
+    // The promises of this agent live beside its watch state, so they survive
+    // a restart with it.
+    let ledger_path = tracked.state_file.with_extension("acks.json");
+    let ledger = FileLedger::load(&ledger_path)?;
+    let effects = AgentAckEffects {
+        source,
+        deliverer,
+        admitter,
+        agent: &tracked.agent,
+        bot_id,
+        conversation: &conversation,
+        delivery,
+        reaction: seen_reaction,
+    };
+    let mut keeper = Keeper::new(
+        ledger,
+        effects,
+        ack.policy,
+        ack.due_seconds,
+        ack.grace_seconds,
+    );
 
     for message in messages {
         if message.seq <= tracked.state.last_seq {
@@ -553,12 +775,30 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
             || tracked.state.is_echo(&message)
             || message.text().trim().is_empty();
         if ignored {
+            if message.role == "bot" {
+                // The agent answered in this thread: every promise it owed
+                // here is kept, and it is no longer mid-thread.
+                keeper
+                    .fulfil(
+                        &tracked.agent.key,
+                        &conversation,
+                        &message.id,
+                        message.run_id.as_deref(),
+                        message.seq,
+                    )
+                    .await?;
+                tracked.state.awaiting_reply = None;
+            }
             report.ignored += 1;
             tracked.state.last_seq = message.seq;
             changed = true;
             continue;
         }
         let reference = format!("rakazo:{conversation}:{}", message.id);
+        // The agent is mid-thread when it still owes an answer to a prior task.
+        // This is read before this message is delivered, so it describes the
+        // state the human steered into.
+        let was_busy = tracked.state.awaiting_reply.is_some();
         let mut text = format!("[{reference}] {}", summarize(&tracked.agent.name, &message));
         if let Some(config) = reply_hint_config {
             text.push('\n');
@@ -588,26 +828,37 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
         }
         // "Received, working": only the first delivery ever adds it, and the
         // deterministic nonce makes a retry a replay rather than a second add.
+        //
+        // The tapback is now an acknowledgement, not a receipt: it is only
+        // posted when the policy allows it (mid-thread by default), and the
+        // promise it makes is recorded before the tapback is sent.
         if !seen_reaction.is_empty() {
-            let nonce = format!("seen:{}", message.id);
-            match source
-                .react(bot_id, &message.id, seen_reaction, &nonce)
-                .await
-            {
-                Ok(()) => report.seen += 1,
-                Err(error) => {
-                    // Best-effort: log and keep the delivery and the watermark.
-                    report.seen_failed += 1;
-                    tracing::warn!(
-                        agent = %tracked.agent.key,
-                        message = %message.id,
-                        "seen tapback failed: {error:#}"
-                    );
-                }
+            let request = AckRequest {
+                agent: tracked.agent.key.clone(),
+                thread: conversation.clone(),
+                message_id: message.id.clone(),
+                seq: message.seq,
+                busy: was_busy,
+                can_reply: true,
+                run_id: message.run_id.clone(),
+            };
+            let outcome = keeper.consider(&request, now).await;
+            match &outcome.decision {
+                AckDecision::Allowed => report.seen += 1,
+                AckDecision::Blocked(_) => report.ack_blocked += 1,
             }
+            tracing::debug!(
+                agent = %tracked.agent.key,
+                message = %message.id,
+                ack_id = ?outcome.ack_id,
+                reason = %outcome.reason,
+                "acknowledgement considered"
+            );
         }
         tracked.state.record_delivered(&message.id);
         tracked.state.last_delivered_id = Some(message.id.clone());
+        // The agent is now mid-thread on this message until it answers.
+        tracked.state.awaiting_reply = Some(message.id.clone());
         tracked.state.delivered_total += 1;
         tracked.state.last_seq = message.seq;
         tracked.state.last_poll_ok = Some(true);
@@ -618,6 +869,20 @@ async fn poll_one<S: RakazoSource, D: Deliverer>(
 
     if changed {
         save_tracked(tracked)?;
+    }
+
+    // The hook: enforce the promises that are due. One nudge per promise,
+    // then one visible admission in the thread. It runs on the supervisor's
+    // existing cycle; it is not a new daemon.
+    let sweep = keeper.sweep(now).await?;
+    report.ack_nudged += sweep.nudged;
+    report.ack_expired += sweep.expired;
+    for error in &sweep.errors {
+        tracing::warn!(
+            agent = %tracked.agent.key,
+            error = %error,
+            "acknowledgement sweep failed"
+        );
     }
 
     // Tapbacks are state, not rows: fetch the newest page (which still includes
@@ -847,7 +1112,7 @@ mod tests {
     use crate::orch::agentsmith::{Row, agents};
     use crate::rakazo::{Message, Reaction};
     use serde_json::json;
-    use std::{collections::HashMap, future::Future, sync::Mutex};
+    use std::{collections::HashMap, future::Future, pin::Pin, sync::Mutex};
     use tempfile::TempDir;
 
     const STUDIO: &str = "averys-mac-studio";
@@ -1068,6 +1333,43 @@ mod tests {
                 reference.to_string(),
             ));
             Ok(Delivery::Accepted)
+        }
+    }
+
+    /// One visible admission: bot, agent, text, nonce.
+    type Admission = (String, String, String, String);
+
+    /// Records the visible admissions the bridge posts in an agent's thread.
+    #[derive(Clone, Default)]
+    struct FakeAdmitter {
+        calls: std::sync::Arc<Mutex<Vec<Admission>>>,
+        fail: bool,
+    }
+
+    impl FakeAdmitter {
+        fn calls(&self) -> Vec<Admission> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Admitter for FakeAdmitter {
+        fn admit(
+            &self,
+            bot_id: &str,
+            agent_key: &str,
+            text: &str,
+            nonce: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            if self.fail {
+                return Box::pin(async { anyhow::bail!("scripted admission failure") });
+            }
+            self.calls.lock().unwrap().push((
+                bot_id.to_string(),
+                agent_key.to_string(),
+                text.to_string(),
+                nonce.to_string(),
+            ));
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -1470,8 +1772,21 @@ mod tests {
             .with_reply_hint_config("/etc/rakazo/agentsmith.toml")
     }
 
+    /// The acknowledgement ledger of one agent, read back from disk.
+    fn ledger_rows(
+        supervisor: &Supervisor<FakeSource, FakeDeliverer>,
+        key: &str,
+    ) -> Vec<Obligation> {
+        let path = supervisor
+            .tracked(key)
+            .unwrap()
+            .state_file
+            .with_extension("acks.json");
+        FileLedger::load(path).unwrap().all()
+    }
+
     #[tokio::test]
-    async fn a_first_delivery_posts_exactly_one_seen_tapback() {
+    async fn an_idle_agent_is_not_acknowledged_the_reply_is_the_response() {
         let (agents, bots) = fixture();
         let mut pages = HashMap::new();
         pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
@@ -1479,22 +1794,140 @@ mod tests {
         let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍");
         let report = supervisor.cycle(&agents).await.unwrap();
         assert_eq!(report.delivered, 1);
-        assert_eq!(report.seen, 1);
-        assert_eq!(report.seen_failed, 0);
+        assert_eq!(
+            report.seen, 0,
+            "an idle agent answers; it does not acknowledge"
+        );
+        assert_eq!(report.ack_blocked, 1);
+        assert!(supervisor.source.reacts().is_empty(), "no tapback at all");
+        assert!(
+            ledger_rows(&supervisor, "fleet-orch-v1").is_empty(),
+            "no promise was made"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steer_that_arrives_mid_thread_is_acknowledged_once() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍");
+        supervisor.cycle(&agents).await.unwrap();
+
+        // The agent is mid-thread on the first message: the next one is a
+        // steer, and it is acknowledged as a promise.
+        supervisor.source.pages.lock().unwrap().insert(
+            "orch-bot".to_string(),
+            vec![message("m2", 8, "user", "also this")],
+        );
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.delivered, 1, "the steer was delivered");
+        assert_eq!(report.seen, 1, "exactly one tapback");
         let reacts = supervisor.source.reacts();
         assert_eq!(reacts.len(), 1, "one add per message lifetime");
         assert_eq!(reacts[0].0, "orch-bot");
-        assert_eq!(reacts[0].1, "m1");
+        assert_eq!(reacts[0].1, "m2");
         assert_eq!(reacts[0].2, "👍");
-        assert_eq!(
-            reacts[0].3, "seen:m1",
-            "idempotent nonce from the message id"
+        assert!(
+            reacts[0].3.starts_with("ack:"),
+            "the nonce is the promise identity, not the message id"
         );
+
+        let rows = ledger_rows(&supervisor, "fleet-orch-v1");
+        assert_eq!(rows.len(), 1, "exactly one open promise");
+        assert_eq!(rows[0].message_id, "m2");
+        assert_eq!(rows[0].agent, "fleet-orch-v1");
+        assert_eq!(rows[0].status, crate::fleet::ack::ObligationStatus::Open);
 
         // A replay of the same row is a duplicate and must not react again.
         let report = supervisor.cycle(&agents).await.unwrap();
         assert_eq!(report.duplicates, 1);
         assert_eq!(supervisor.source.reacts().len(), 1);
+        assert_eq!(ledger_rows(&supervisor, "fleet-orch-v1").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_agent_reply_keeps_the_promise() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍");
+        supervisor.cycle(&agents).await.unwrap();
+        supervisor.source.pages.lock().unwrap().insert(
+            "orch-bot".to_string(),
+            vec![message("m2", 8, "user", "also this")],
+        );
+        supervisor.cycle(&agents).await.unwrap();
+
+        // The agent answers in the thread: the promise is kept.
+        supervisor.source.pages.lock().unwrap().insert(
+            "orch-bot".to_string(),
+            vec![message("m3", 9, "bot", "the answer")],
+        );
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.ignored, 1);
+        let rows = ledger_rows(&supervisor, "fleet-orch-v1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status,
+            crate::fleet::ack::ObligationStatus::Fulfilled
+        );
+        assert_eq!(rows[0].fulfilled_by.as_deref(), Some("m3"));
+    }
+
+    #[tokio::test]
+    async fn a_broken_promise_is_nudged_once_then_admitted_once() {
+        let (agents, bots) = fixture();
+        let mut pages = HashMap::new();
+        pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
+        let dir = TempDir::new().unwrap();
+        let admitter = FakeAdmitter::default();
+        let recorder = admitter.clone();
+        let mut supervisor = seen_supervisor(&dir, FakeSource::with(bots, pages), "👍")
+            .with_ack_policy(AckPolicy::MidThreadOnly, 0, 60)
+            .with_admitter(admitter);
+        supervisor.set_ack_now(1_000);
+        supervisor.cycle(&agents).await.unwrap();
+        supervisor.source.pages.lock().unwrap().insert(
+            "orch-bot".to_string(),
+            vec![message("m2", 8, "user", "also this")],
+        );
+        // The acknowledgement is already due (due_seconds = 0) but inside the
+        // grace period: one nudge, no admission.
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.seen, 1);
+        assert_eq!(report.ack_nudged, 1);
+        assert_eq!(report.ack_expired, 0);
+        let nudges: Vec<_> = supervisor
+            .deliverer
+            .calls()
+            .into_iter()
+            .filter(|call| call.4.contains("follow-up reminder"))
+            .collect();
+        assert_eq!(nudges.len(), 1, "exactly one nudge");
+        assert!(recorder.calls().is_empty());
+
+        // A later sweep inside the grace period never nudges twice.
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.ack_nudged, 0);
+        assert_eq!(report.ack_expired, 0);
+
+        // Past the grace period: one visible admission.
+        supervisor.set_ack_now(1_061);
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.ack_expired, 1);
+        let admissions = recorder.calls();
+        assert_eq!(admissions.len(), 1, "exactly one visible admission");
+        assert!(admissions[0].2.contains("did not follow up"));
+
+        // A later sweep admits nothing more.
+        supervisor.set_ack_now(9_999);
+        let report = supervisor.cycle(&agents).await.unwrap();
+        assert_eq!(report.ack_expired, 0);
+        assert_eq!(recorder.calls().len(), 1);
+        assert_eq!(ledger_rows(&supervisor, "fleet-orch-v1").len(), 1);
     }
 
     #[tokio::test]
@@ -1515,12 +1948,15 @@ mod tests {
         assert_eq!(report.delivered, 1);
         assert_eq!(report.duplicates, 1);
         assert_eq!(report.ignored, 1);
-        assert_eq!(supervisor.source.reacts().len(), 1);
-        assert_eq!(supervisor.source.reacts()[0].1, "m1");
+        assert!(
+            supervisor.source.reacts().is_empty(),
+            "an idle agent is never acknowledged"
+        );
+        assert!(ledger_rows(&supervisor, "fleet-orch-v1").is_empty());
     }
 
     #[tokio::test]
-    async fn a_reaction_failure_does_not_change_counters_or_the_watermark() {
+    async fn a_reaction_failure_leaves_no_promise_behind() {
         let (agents, bots) = fixture();
         let mut pages = HashMap::new();
         pages.insert("orch-bot".to_string(), vec![message("m1", 7, "user", "x")]);
@@ -1533,14 +1969,16 @@ mod tests {
         let report = supervisor.cycle(&agents).await.unwrap();
         assert_eq!(report.delivered, 1, "delivery still counts");
         assert_eq!(report.duplicates, 0);
-        assert_eq!(report.seen, 0);
-        assert_eq!(report.seen_failed, 1);
         assert_eq!(
             supervisor.tracked("fleet-orch-v1").unwrap().state.last_seq,
             7,
             "a failed tapback never rewinds the watermark"
         );
         assert_eq!(supervisor.deliverer.calls().len(), 1);
+        assert!(
+            ledger_rows(&supervisor, "fleet-orch-v1").is_empty(),
+            "a tapback that never landed is not a promise"
+        );
     }
 
     #[tokio::test]

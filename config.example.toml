@@ -23,6 +23,16 @@ bot_ids = []
 # Optionally select active bots by case-insensitive exact display name.
 # auto_named_bots = ["Muse"]
 websocket = true
+# When the bridge may acknowledge an inbound message with a tapback.
+#   mid_thread_only (default) - only while the agent is already working on a
+#                              prior task; an idle agent answers instead.
+#   never                    - never acknowledge.
+#   always                   - acknowledge every inbound message.
+# ack_policy = "mid_thread_only"
+# Seconds before an acknowledged message is due for its follow-up, and the
+# grace period after that before the broken promise is admitted in the thread.
+# ack_due_seconds = 900
+# ack_grace_seconds = 300
 
 # For FPL hosting, append another [[tenants]] with a distinct id, registration,
 # owner, session token env name, and explicit space. Each gets its own worker and
