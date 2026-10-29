@@ -194,6 +194,74 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+    pub fn all_links(&self, binding: &Binding) -> Result<Vec<MessageLink>> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 ORDER BY rakazo_id,part")?;
+        Ok(query
+            .query_map(params![binding.tenant, binding.bot], |row| {
+                Ok(MessageLink {
+                    rakazo_id: row.get(0)?,
+                    matrix_id: row.get(1)?,
+                    part: row.get(2)?,
+                    role: row.get(3)?,
+                    kind: row.get(4)?,
+                    hash: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn commit_thread_clear(
+        &self,
+        binding: &Binding,
+        event_cursor: i64,
+        preserved: &[MessageLink],
+        preserved_runs: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM message_links WHERE tenant=?1 AND bot=?2",
+            params![binding.tenant, binding.bot],
+        )?;
+        for link in preserved {
+            tx.execute(
+                "INSERT INTO message_links VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    binding.tenant,
+                    binding.bot,
+                    link.rakazo_id,
+                    link.part,
+                    link.matrix_id,
+                    link.role,
+                    link.kind,
+                    link.hash
+                ],
+            )?;
+        }
+        let run_ids = {
+            let mut query =
+                tx.prepare("SELECT run_id FROM run_routes WHERE tenant=?1 AND bot=?2")?;
+            query
+                .query_map(params![binding.tenant, binding.bot], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for run_id in run_ids {
+            if !preserved_runs.contains(&run_id) {
+                tx.execute(
+                    "DELETE FROM run_routes WHERE tenant=?1 AND bot=?2 AND run_id=?3",
+                    params![binding.tenant, binding.bot, run_id],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO sync_cursors VALUES(?1,?2,'thread-events',?3) ON CONFLICT(tenant,bot,kind) DO UPDATE SET cursor=excluded.cursor",
+            params![binding.tenant, binding.bot, event_cursor],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn matrix_link(&self, binding: &Binding, id: &str) -> Result<Option<MessageLink>> {
         Ok(self.db.lock().unwrap().query_row("SELECT rakazo_id,matrix_id,part,role,kind,hash FROM message_links WHERE tenant=?1 AND bot=?2 AND matrix_id=?3 LIMIT 1",params![binding.tenant,binding.bot,id],|row|Ok(MessageLink {rakazo_id:row.get(0)?,matrix_id:row.get(1)?,part:row.get(2)?,role:row.get(3)?,kind:row.get(4)?,hash:row.get(5)?})).optional()?)
     }
@@ -230,6 +298,13 @@ impl Store {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT COUNT(*) FROM inbox WHERE tenant=?1 AND room=?2 AND state='pending'",
             params![binding.tenant, binding.room],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn sent_event(&self, binding: &Binding, event: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE tenant=?1 AND room=?2 AND event_id=?3 AND state='sent')",
+            params![binding.tenant, binding.room, event],
             |row| row.get(0),
         )?)
     }

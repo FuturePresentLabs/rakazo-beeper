@@ -97,6 +97,15 @@ pub struct Reaction {
     pub mine: bool,
 }
 
+#[derive(Deserialize)]
+pub struct SpaceNavigation {
+    pub current: CurrentSpace,
+}
+#[derive(Deserialize)]
+pub struct CurrentSpace {
+    pub id: String,
+    pub name: String,
+}
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -196,11 +205,37 @@ pub struct Page {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    pub thread_id: String,
+    pub cursor: i64,
     pub messages: Vec<Message>,
     pub run: Option<Value>,
     #[serde(default)]
     pub active_runs: Vec<Value>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHead {
+    pub thread_id: String,
+    pub cursor: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductEvent {
+    pub id: String,
+    pub space_id: String,
+    pub thread_id: String,
+    pub bot_id: String,
+    pub seq: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
 impl Snapshot {
     pub fn busy(&self) -> bool {
         self.run.iter().chain(self.active_runs.iter()).any(|r| {
@@ -393,8 +428,125 @@ impl Rakazo {
         );
         Ok(me)
     }
+    pub async fn current_space(&self) -> Result<CurrentSpace> {
+        let navigation: SpaceNavigation = self.rpc(&["spaces", "list"], Value::Null).await?;
+        ensure!(
+            !navigation.current.name.trim().is_empty(),
+            "Rakazo Space name is empty"
+        );
+        Ok(navigation.current)
+    }
     pub async fn snapshot(&self, bot: &str) -> Result<Snapshot> {
         self.rpc(&["threads", "get"], json!({"botId": bot})).await
+    }
+    pub async fn thread_head(&self, bot: &str) -> Result<ThreadHead> {
+        self.rpc(&["threads", "head"], json!({"botId": bot})).await
+    }
+    pub async fn thread_events(
+        &self,
+        bot: &str,
+        cursor: i64,
+        through: i64,
+    ) -> Result<Vec<ProductEvent>> {
+        if through <= cursor {
+            return Ok(Vec::new());
+        }
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid RPC base"))?
+            .pop_if_empty()
+            .extend(["rpc", "threads", "subscribe"]);
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&json!({"json":{"botId":bot,"cursor":cursor}}))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Rakazo event stream failed: {}", e.without_url()))?;
+        if response.status().as_u16() == 401 {
+            return Err(Unauthorized.into());
+        }
+        ensure!(
+            response.status().is_success(),
+            "Rakazo event stream returned HTTP {}",
+            response.status()
+        );
+        ensure!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream")),
+            "Rakazo event stream returned the wrong content type"
+        );
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut events = Vec::new();
+        let mut last_seen = cursor;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("Rakazo event stream failed"))?;
+            buffer.extend_from_slice(&chunk);
+            loop {
+                let lf = buffer.windows(2).position(|window| window == b"\n\n");
+                let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+                let delimiter = match (lf, crlf) {
+                    (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
+                    (Some(_), Some(crlf)) => Some((crlf, 4)),
+                    (Some(lf), None) => Some((lf, 2)),
+                    (None, Some(crlf)) => Some((crlf, 4)),
+                    (None, None) => None,
+                };
+                let Some((end, delimiter_len)) = delimiter else {
+                    ensure!(
+                        buffer.len() <= 4 * 1024 * 1024,
+                        "Rakazo event frame is too large"
+                    );
+                    break;
+                };
+                ensure!(end <= 4 * 1024 * 1024, "Rakazo event frame is too large");
+                let frame = String::from_utf8(buffer[..end].to_vec())
+                    .context("invalid Rakazo event stream")?
+                    .replace("\r\n", "\n");
+                buffer.drain(..end + delimiter_len);
+                let data = frame
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<String>();
+                if data.is_empty() {
+                    continue;
+                }
+                let envelope: Value =
+                    serde_json::from_str(&data).context("invalid Rakazo event stream envelope")?;
+                let event: ProductEvent = serde_json::from_value(
+                    envelope
+                        .get("json")
+                        .context("missing oRPC event json envelope")?
+                        .clone(),
+                )
+                .context("Rakazo event contract mismatch")?;
+                if event.kind == "heartbeat" {
+                    ensure!(
+                        last_seen >= through,
+                        "Rakazo event stream ended before the requested cursor"
+                    );
+                    return Ok(events);
+                }
+                last_seen = event.seq;
+                let complete = last_seen >= through;
+                events.push(event);
+                if complete {
+                    return Ok(events);
+                }
+            }
+        }
+        ensure!(
+            last_seen >= through,
+            "Rakazo event stream ended before the requested cursor"
+        );
+        Ok(events)
     }
     pub async fn send_content(
         &self,
