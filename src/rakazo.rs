@@ -127,6 +127,16 @@ pub struct Message {
     /// the poller observes transitions rather than a one-shot event.
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    /// Transport-neutral group id. `None` means a 1:1 thread (backward compat).
+    #[serde(default)]
+    pub group_id: Option<crate::group::GroupId>,
+    /// Canonical sender key (e.g. "fleet-orch-v1", "human:alice"). None for
+    /// legacy rows that predate group routing.
+    #[serde(default)]
+    pub sender_key: Option<String>,
+    /// Canonical agent keys explicitly @mentioned in this message.
+    #[serde(default)]
+    pub mentions: Vec<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
