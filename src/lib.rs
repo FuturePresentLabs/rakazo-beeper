@@ -1,5 +1,6 @@
 pub mod config;
 pub mod fleet;
+pub mod group;
 pub mod irc;
 pub mod login;
 pub mod markdown;

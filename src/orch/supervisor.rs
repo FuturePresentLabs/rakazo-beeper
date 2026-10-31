@@ -1149,6 +1149,9 @@ mod tests {
             reply_quote: None,
             run_id: None,
             reactions: Vec::new(),
+            group_id: None,
+            sender_key: None,
+            mentions: Vec::new(),
         }
     }
 
